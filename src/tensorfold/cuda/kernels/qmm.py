@@ -18,7 +18,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_qmm_v5", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
+    return load(name="tensorfold_qmm_v6", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
                                                    str(here / "qmm_group.cu"), str(here / "qmm_prefill.cu"),
                                                    str(here / "qmm_prefill8.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
@@ -155,8 +155,10 @@ def group_sums(x: torch.Tensor, gs: int = 64) -> torch.Tensor:
 
 
 def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, sk: int | None = None, f32: bool = False,
-           out: torch.Tensor | None = None, part: torch.Tensor | None = None, reduce: bool = True) -> torch.Tensor:
-    """x @ q.T as (M, n) bf16, or unrounded fp32 with ``f32``; ``reduce=False`` returns K slices to add in order."""
+           out: torch.Tensor | None = None, part: torch.Tensor | None = None, reduce: bool = True,
+           variant: int | None = None) -> torch.Tensor:
+    """x @ q.T as (M, n) bf16, or unrounded fp32 with ``f32``; ``reduce=False`` returns K slices to add in order;
+    ``variant``: decode rows (up to 16, groups of 64) on another tile config (``qmm_cfg``: the same bits)."""
 
     if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != q.k:
         raise ValueError(f"matmul: x must be (M, {q.k}) bf16")
@@ -168,6 +170,9 @@ def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, sk: int | 
     sk = sk or split_k(q.n, q.k, q.gs)
     if out is None:
         out = torch.empty((m, q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
+    if variant is not None and reduce and m <= 16 and q.gs == 64:
+        _ext().qmm_cfg(x, xs, q.weight, q.scales, q.biases, out, part, q.n, sk, f32, int(variant))
+        return out
     if q.gs == 64 and reduce and grouped(x.device.index):
         _ext().qmm_group(x, xs, [q.weight], [q.scales], [q.biases], [out], [q.n], [sk], f32,
                          group_tile(m, *_chip(x.device.index)), -1)
