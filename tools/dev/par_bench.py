@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 
-BENCH = "/Users/nvm/Documents/projects/home-cluster/.wt-dev/namespaces/llm/base/glm53/bench"
+BENCH = __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "bench")
 sys.path.insert(0, BENCH)
 import drafter_ab as ab  # noqa: E402
 import quiet_bench as qb  # noqa: E402

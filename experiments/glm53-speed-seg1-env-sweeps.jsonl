@@ -1,0 +1,10 @@
+{"kind":"protocol","metric":"pooled single-stream decode tok/s (mean of prose and code medians), lean_bench regime blocks, loaded-embedder regime (quiet values divided by 1.038)","direction":"higher","threshold":{"value":1.5,"relative":true},"budget":"lean_bench: 4+ blocks of 5 alternating prose/code pairs in one embedder regime, 400 tokens, temp 0, thinking off, fresh server start per arm; block-to-block spread 0.4%, boot-to-boot 0.4%","stop":{"trials":12,"no_improve":4}}
+{"id":"01","mutation":"baseline: 0.6.1 + MiaAI 53-patch port (1aaef41), P=4 MULTI_LONE=0 CACHE_ENTRIES=32 policy fnc7:0.3, loaded regime (14 blocks, base2)","metric":50.69,"delta":null,"kept":"base"}
+{"id":"02","mutation":"TF_GLM_DFLASH_POLICY fnc7:0.3 -> fnc7:0.25 (prose 48.52 code 52.53)","metric":50.528,"delta":-0.16199999999999903,"kept":"revert"}
+{"id":"03","mutation":"TF_GLM_DFLASH_POLICY fnc7:0.3 -> fnc7:0.4 (prose 49.44 code 54.19)","metric":51.817,"delta":1.1270000000000024,"kept":"KEEP"}
+{"id":"04","mutation":"TF_GLM_EXL3_LOADS nc -> nc2 (prose 49.60 code 52.12; vs the 0.3 baseline 50.69)","metric":50.858,"delta":-0.9590000000000032,"kept":"revert"}
+{"id":"05","mutation":"TF_GLM_EXL3_LOADS nc -> nc4 (prose 49.30 code 52.06; vs the 0.3 baseline 50.69)","metric":50.676,"delta":-1.1409999999999982,"kept":"revert"}
+{"id":"06","mutation":"taskset -c 5-9,15-19 (X925 cores) on both ranks (prose 49.38 code 51.93; vs the 0.3 baseline 50.69)","metric":50.657,"delta":-1.1600000000000037,"kept":"revert"}
+{"id":"07","mutation":"ablation TF_GLM_L2PF 1 -> 0 (prose 48.95 code 51.61): L2 prefetch is worth about 0.8 percent","metric":50.282,"delta":-1.5350000000000037,"kept":"revert"}
+{"id":"08","mutation":"TF_GLM_DFLASH_POLICY fnc7:0.4 -> fnc7:0.5 (prose 49.28 code 53.03)","metric":51.153,"delta":-0.6640000000000015,"kept":"revert"}
+{"id":"09","mutation":"TF_GLM_DFLASH_POLICY fnc7:0.4 -> fnc7:0.6 (prose 46.63 code 50.94)","metric":48.784,"delta":-3.0330000000000013,"kept":"revert"}
