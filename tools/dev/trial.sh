@@ -2,7 +2,7 @@
 # trial.sh <name> ["K=V K2=V2"] [src-dir]   restart the dev server (optionally with env overrides / a source overlay),
 # then run lean_bench (20 pairs). Prints the LEAN line; log in /tmp/glm-trials/<name>.out
 set -euo pipefail
-D=$(cd "$(dirname "$0")" && pwd); name=$1; export TRIAL_ENV="TF_GLM_DFLASH_POLICY=fnc7:0.4 ${2:-}"; mkdir -p /tmp/glm-trials
+D=$(cd "$(dirname "$0")" && pwd); name=$1; export TRIAL_ENV="TF_GLM_DFLASH_POLICY=fnc7:0.4 TF_GLM_L2PF_BLOCKS=8 TF_GLM_L2PF_MB=16 ${2:-}"; mkdir -p /tmp/glm-trials
 [ -n "${3:-}" ] && "$D/devctl.sh" sync "$3"
 "$D/devctl.sh" stop >/dev/null 2>&1 || true
 "$D/devctl.sh" start >/dev/null

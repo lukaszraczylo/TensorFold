@@ -13,7 +13,7 @@ args=(serve "$MODEL_PATH" --tp 2 --rank "$RANK" --master "$MASTER" --master-port
 mkdir -p /cache/dev/log
 find "${TORCH_EXTENSIONS_DIR:-/cache/torch_extensions}" -maxdepth 3 -type f -name lock -delete 2>/dev/null || true
 echo "tensorfold ${args[*]}" > /cache/dev/log/rank$RANK.log
-PRE="${TRIAL_PRE:-}"; [ -n "${NSYS:-}" ] && [ "$RANK" = 0 ] && PRE="nsys launch -t cuda,nvtx,osrt --cuda-graph-trace=node --session-new=prof"
+PRE="${TRIAL_PRE:-}"; [ -n "${NSYS:-}" ] && [ "$RANK" = 0 ] && PRE="nsys launch -t cuda,nvtx,osrt --cuda-graph-trace=node ${NSYS_FLAGS:-} --session-new=prof"
 setsid nohup $PRE tensorfold "${args[@]}" >> /cache/dev/log/rank$RANK.log 2>&1 < /dev/null &
 echo started rank $RANK'
 
@@ -27,8 +27,8 @@ case "$cmd" in
     done
     echo "synced $src" ;;
   start)
-    "${K[@]}" exec "${PODS[1]}" -c tensorfold -- bash -c "export NSYS=${NSYS:-} TRIAL_ENV=\"${TRIAL_ENV:-}\" TRIAL_PRE=\"${TRIAL_PRE:-}\"; $SERVE"
-    "${K[@]}" exec "${PODS[0]}" -c tensorfold -- bash -c "export NSYS=${NSYS:-} TRIAL_ENV=\"${TRIAL_ENV:-}\" TRIAL_PRE=\"${TRIAL_PRE:-}\"; $SERVE" ;;
+    "${K[@]}" exec "${PODS[1]}" -c tensorfold -- bash -c "export NSYS=${NSYS:-} NSYS_FLAGS=\"${NSYS_FLAGS:-}\" TRIAL_ENV=\"${TRIAL_ENV:-}\" TRIAL_PRE=\"${TRIAL_PRE:-}\"; $SERVE"
+    "${K[@]}" exec "${PODS[0]}" -c tensorfold -- bash -c "export NSYS=${NSYS:-} NSYS_FLAGS=\"${NSYS_FLAGS:-}\" TRIAL_ENV=\"${TRIAL_ENV:-}\" TRIAL_PRE=\"${TRIAL_PRE:-}\"; $SERVE" ;;
   stop)
     for p in "${PODS[@]}"; do
       "${K[@]}" exec "$p" -c tensorfold -- bash -c 'for s in $(nsys sessions list 2>/dev/null | awk "NR>1{print \$1}"); do nsys shutdown --session=$s 2>/dev/null || true; done; pkill -f "tensorfold serve" || true' >/dev/null 2>&1 || true
