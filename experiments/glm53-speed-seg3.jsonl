@@ -1,0 +1,6 @@
+{"kind":"protocol","metric":"pooled single-stream decode tok/s (mean of prose and code medians), lean_bench regime blocks, fnc7:0.4","direction":"higher","threshold":{"value":1.5,"relative":true},"budget":"lean_bench: 4+ blocks of 5 prose/code pairs in one embedder regime, 400 tokens, temp 0, thinking off, fresh start per arm; gates: exact_check identical, 4-stream identical, agg4 not below baseline; noise 0.4 percent","stop":{"trials":8,"no_improve":4}}
+{"id":"01","mutation":"baseline segment 3: port 1aaef41 + fnc7:0.4, dev pods, loaded regime (prose 49.23 code 54.17)","metric":51.697,"delta":null,"kept":"base"}
+{"id":"02","mutation":"M2 RoCE gathers pad non-16-byte sizes instead of NCCL fallback (prose 49.33 code 54.17) - null: gaps are rank skew, not transport","metric":51.754,"delta":0.056999999999995055,"kept":"revert"}
+{"id":"03","mutation":"TF_GLM_MULTI_ASYNC=1 (prose 49.16 code 53.86)","metric":51.507,"delta":-0.19000000000000483,"kept":"revert"}
+{"id":"04","mutation":"TF_GLM_MULTI_SAMPLER=packed (prose 49.23 code 54.11)","metric":51.672,"delta":-0.025000000000005684,"kept":"revert"}
+{"id":"05","mutation":"ASYNC=1 + SAMPLER=packed (prose 49.10 code 53.98)","metric":51.539,"delta":-0.15800000000000125,"kept":"revert"}
