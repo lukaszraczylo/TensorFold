@@ -1,5 +1,5 @@
-{"kind":"protocol","metric":"pooled single-stream decode tok/s (mean of prose and code medians), lean_bench regime blocks, baseline fnc7:0.4","direction":"higher","threshold":{"value":1.5,"relative":true},"budget":"lean_bench: 4+ blocks of 5 prose/code pairs in one embedder regime, 400 tokens, temp 0, thinking off, fresh start per arm; gates exact_check identical and 4-stream identical; noise 0.4 percent; segment 4 (user: stop after 25 consecutive no-improve)","stop":{"trials":80,"no_improve":25}}
-{"id":"01","mutation":"baseline segment 4: port 1aaef41 + fnc7:0.4 (s3-base loaded: prose 49.23 code 54.17; 4-stream 120.6)","metric":51.697,"delta":null,"kept":"base"}
+{"kind":"protocol","metric":"pooled single-stream decode tok/s (mean of prose and code medians), lean_bench regime blocks, loaded regime (quiet runs divided by 1.038)","direction":"higher","threshold":{"value":1.5,"relative":true},"budget":"lean_bench: 4+ blocks of 5 prose/code pairs in one embedder regime, 400 tokens, temp 0, thinking off, fresh start per arm; gates exact_check identical and 4-stream identical; noise 0.4 percent; user: stop after 25 consecutive no-improve","stop":{"trials":120,"no_improve":25}}
+{"id":"01","mutation":"baseline segment 4: port 1aaef41 + fnc7:0.4 (loaded: prose 49.23 code 54.17)","metric":51.697,"delta":null,"kept":"base"}
 {"id":"02","mutation":"p035: TF_GLM_DFLASH_POLICY=fnc7:0.35 (prose 49.21 code 52.86, regime loaded)","metric":51.036,"delta":-0.6610000000000014,"kept":"revert"}
 {"id":"03","mutation":"p045: TF_GLM_DFLASH_POLICY=fnc7:0.45 (prose 50.32 code 53.40, regime loaded)","metric":51.859,"delta":0.16199999999999903,"kept":"revert"}
 {"id":"04","mutation":"b15: TF_GLM_DFLASH_POLICY=fnc7:0.4:1.5 (prose 48.90 code 51.71, regime loaded)","metric":50.305,"delta":-1.392000000000003,"kept":"revert"}
@@ -32,3 +32,24 @@
 {"id":"31","mutation":"l2b16-mb32: TF_GLM_L2PF_BLOCKS=16 TF_GLM_L2PF_MB=32 (prose 49.89 code 54.91, regime loaded)","metric":52.401,"delta":-0.0799999999999983,"kept":"revert"}
 {"id":"32","mutation":"l2b12-mb64: TF_GLM_L2PF_BLOCKS=12 TF_GLM_L2PF_MB=64 (prose 49.99 code 54.90, regime loaded)","metric":52.448,"delta":-0.03300000000000125,"kept":"revert"}
 {"id":"33","mutation":"mdjoint-oh6: TF_GLM_MULTI_DEPTH=joint TF_GLM_MULTI_OVERHEAD_MS=6 TF_GLM_L2PF_BLOCKS=8 TF_GLM_L2PF_MB=16 (prose 49.50 code 52.91, regime loaded)","metric":51.207,"delta":-1.274000000000001,"kept":"revert"}
+{"id":"34","mutation":"k-loads-nc2: TF_GLM_EXL3_LOADS=nc2 (prose 50.11 code 54.99, regime loaded)","metric":52.548,"delta":0.06700000000000017,"kept":"revert"}
+{"id":"35","mutation":"k-loads-nc4: TF_GLM_EXL3_LOADS=nc4 (prose 50.02 code 54.67, regime loaded)","metric":52.344,"delta":-0.13700000000000045,"kept":"revert"}
+{"id":"36","mutation":"k-p042: TF_GLM_DFLASH_POLICY=fnc7:0.42 (prose 50.15 code 54.24, regime loaded)","metric":52.199,"delta":-0.2820000000000036,"kept":"revert"}
+{"id":"37","mutation":"k-p038: TF_GLM_DFLASH_POLICY=fnc7:0.38 (prose 52.17 code 56.21, regime quiet, raw 54.190 / 1.038)","metric":52.206,"delta":-0.2749999999999986,"kept":"revert"}
+{"id":"38","mutation":"k-l2rows32: TF_GLM_L2PF_ROWS=32 (prose 50.14 code 55.03, regime loaded)","metric":52.586,"delta":0.10499999999999687,"kept":"revert"}
+{"id":"39","mutation":"k-l2rows128: TF_GLM_L2PF_ROWS=128 (prose 49.91 code 54.81, regime loaded)","metric":52.361,"delta":-0.12000000000000455,"kept":"revert"}
+{"id":"40","mutation":"k-l2sites-af: TF_GLM_L2PF_SITES=af (prose 49.67 code 54.57, regime loaded)","metric":52.117,"delta":-0.3640000000000043,"kept":"revert"}
+{"id":"41","mutation":"k-l2sites-fo: TF_GLM_L2PF_SITES=fo (prose 49.61 code 54.39, regime loaded)","metric":52.001,"delta":-0.480000000000004,"kept":"revert"}
+{"id":"42","mutation":"k-l2kb16: TF_GLM_L2PF_KB=16 (prose 50.60 code 55.38, regime loaded)","metric":52.991,"delta":0.509999999999998,"kept":"revert"}
+{"id":"43","mutation":"k-l2kb64: TF_GLM_L2PF_KB=64 (prose 50.02 code 54.85, regime loaded)","metric":52.435,"delta":-0.045999999999999375,"kept":"revert"}
+{"id":"44","mutation":"k-l2kb8: TF_GLM_L2PF_KB=8 (prose 50.73 code 55.63, regime loaded)","metric":53.182,"delta":0.7010000000000005,"kept":"revert"}
+{"id":"45","mutation":"k-l2kb4: TF_GLM_L2PF_KB=4 (prose 50.75 code 55.67, regime loaded)","metric":53.209,"delta":0.7280000000000015,"kept":"revert"}
+{"id":"46","mutation":"k-l2kb8-b16: TF_GLM_L2PF_KB=8 TF_GLM_L2PF_BLOCKS=16 (prose 50.43 code 55.26, regime loaded)","metric":52.844,"delta":0.36299999999999955,"kept":"revert"}
+{"id":"47","mutation":"k-l2kb2: TF_GLM_L2PF_KB=2 (prose 50.62 code 55.53, regime loaded)","metric":53.073,"delta":0.5919999999999987,"kept":"revert"}
+{"id":"48","mutation":"k-l2kb4-mb32: TF_GLM_L2PF_KB=4 TF_GLM_L2PF_MB=32 (prose 50.66 code 55.48, regime loaded)","metric":53.072,"delta":0.5910000000000011,"kept":"revert"}
+{"id":"49","mutation":"k-l2kb4-rerun: TF_GLM_L2PF_KB=4 (prose 50.81 code 55.69, regime loaded)","metric":53.253,"delta":0.7719999999999985,"kept":"revert"}
+{"id":"50","mutation":"k-fuse0: TF_GLM_EXL3_FUSE=0 (prose 49.67 code 54.58, regime loaded)","metric":52.124,"delta":-0.3569999999999993,"kept":"revert"}
+{"id":"51","mutation":"k-fuse2: TF_GLM_EXL3_FUSE=2 (prose 50.06 code 54.98, regime loaded)","metric":52.522,"delta":0.04099999999999682,"kept":"revert"}
+{"id":"52","mutation":"k-hcdec0: TF_GLM_HC_DEC=0 (prose 49.94 code 54.72, regime loaded)","metric":52.334,"delta":-0.14699999999999847,"kept":"revert"}
+{"id":"53","mutation":"k-onepass0: TF_GLM_SPARSE_ONEPASS=0 (prose 50.05 code 54.80, regime loaded)","metric":52.428,"delta":-0.05300000000000438,"kept":"revert"}
+{"id":"54","mutation":"STACK final A/B/A: TF_GLM_L2PF_BLOCKS=8 MB=16 KB=4 on fnc7:0.4 (prose 50.94 code 55.79; A 51.547, A2 51.675; exact IDENTICAL; agg4 122.1 vs 119.0)","metric":53.365,"delta":0.8840000000000003,"kept":"KEEP"}

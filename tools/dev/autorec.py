@@ -13,8 +13,11 @@ for line in open("/tmp/glm-trials/queue.log"):
     m = re.match(r"LEAN (\S+) regime=(\S+) blocks=(\d+)/(\d+) POOLED ([\d.]+) prose ([\d.]+) code ([\d.]+)", line)
     if m and m.group(1) not in done:
         name, regime, _, _, pooled, prose, code = m.groups()
+        raw = pooled
+        if regime == "quiet":                       # one regime for the whole journal: loaded; quiet runs are 3.8 percent faster
+            pooled = f"{float(pooled) / 1.038:.3f}"
         env = cur[1] if cur and cur[0] == name else ""
-        txt = f"{name}: {env} (prose {prose} code {code}, regime {regime})"
+        txt = f"{name}: {env} (prose {prose} code {code}, regime {regime}{', raw ' + raw + ' / 1.038' if regime == 'quiet' else ''})"
         out = subprocess.run(["python3", SK, "record", "--journal", J, "--mutation", txt, "--metric", pooled], capture_output=True, text=True).stdout
         print(name, pooled, prose, code, regime, "->", out.strip().splitlines()[0] if out.strip() else "?")
         done.add(name); open(done_f, "a").write(name + "\n")
