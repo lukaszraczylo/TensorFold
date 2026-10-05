@@ -347,7 +347,7 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
 //      ld.global.nc.L1::no_allocate.v4 (lane l: bytes 16 l .. of each 512 B of a step, NT / 4 loads a lane), PD
 //      steps in flight, through a 1 KB staging area in the warp's own slice of `red` (two __syncwarp a step), read
 //      back as word `lane` of each tile.
-template <int NT, int W, int STEPS, int FUSE, bool XROW, int LD = 0, int PD = 1>
+template <int NT, int W, int STEPS, int FUSE, bool XROW, int LD = 0, int PD = 1, int SWZ = 0>
 __global__ void __launch_bounds__(W * 32) dec_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
     const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
@@ -356,7 +356,14 @@ __global__ void __launch_bounds__(W * 32) dec_kernel(
     float limit, int* __restrict__ done) {
     static_assert(FUSE == 0 || NT * 16 == 128, "a fused epilogue needs one 128-column Hadamard block a program");
     static_assert(LD == 0 || (NT % 4 == 0 && PD >= 1 && STEPS % PD == 0), "LD 1: NT a multiple of 4, PD | STEPS");
-    const int item = blockIdx.x, nblock = blockIdx.y;
+    int item = blockIdx.x, nblock = blockIdx.y, zz = blockIdx.z;
+    if constexpr (SWZ != 0) {                            // launch order only: the blocks of one k slice run together
+        const unsigned lid = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+        nblock = (int)(lid % gridDim.y);
+        const unsigned r = lid / gridDim.y;
+        if (SWZ == 1) { item = (int)(r % gridDim.x); zz = (int)(r / gridDim.x); }
+        else { zz = (int)(r % gridDim.z); item = (int)(r / gridDim.z); }
+    }
     int e, first, cnt;
     if constexpr (LD == 0) {
         if (item >= counts[0]) return;
@@ -367,7 +374,7 @@ __global__ void __launch_bounds__(W * 32) dec_kernel(
         if (item >= total) return;
     }
     if (e >= E) return;                                  // the shared expert (id E) is not EXL3
-    const int mat = blockIdx.z / SK, split = blockIdx.z % SK;
+    const int mat = zz / SK, split = zz % SK;
     const half* X = mat ? X1 : X0;
     const uint32_t* T = mat ? T1 : T0;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -998,6 +1005,9 @@ void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor&
                    int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
                    const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld) {
     constexpr int NT = 8, W = 4, STEPS = 16;
+    const int swz = (int)(ld >> 2);                      // launch order: 0 as launched, 1 / 2 a k slice's blocks together
+    ld &= 3;
+    TORCH_CHECK(swz >= 0 && swz <= 2, "decode expert kernel: launch order 0, 1 or 2");
     TORCH_CHECK(ld >= 0 && ld <= 3, "decode expert kernel: loads 0 (32-bit), 1 / 2 / 3 (16-byte, 1 / 2 / 4 steps ahead)");
     TORCH_CHECK(K % (16 * SK * W) == 0 && K / (16 * SK * W) == STEPS && N % (16 * NT) == 0,
                 "decode expert kernel: 16 k steps a warp");
@@ -1007,11 +1017,15 @@ void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor&
     auto stream = at::cuda::getCurrentCUDAStream();
     auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
     auto w = [](const at::Tensor& t) { return reinterpret_cast<const uint32_t*>(t.data_ptr()); };
-#define DEC1(F_, XR_, LD_, PD_)                                                                                   \
-    dec_kernel<NT, W, STEPS, F_, XR_, LD_, PD_><<<grid, W * 32, 0, stream>>>(                                     \
+#define DEC1S(F_, XR_, LD_, PD_, SW_)                                                                             \
+    dec_kernel<NT, W, STEPS, F_, XR_, LD_, PD_, SW_><<<grid, W * 32, 0, stream>>>(                                \
         h(X0), h(X1), w(T0), w(T1), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),       \
         Z.data_ptr<float>(), (int)K, (int)N, (int)P, (int)SK, (int)E, (int)slots, h(sv0), h(sv1), h(su2),         \
         out.data_ptr(), (float)limit, done.data_ptr<int>())
+#define DEC1(F_, XR_, LD_, PD_)                                                                                   \
+    if (swz == 0) DEC1S(F_, XR_, LD_, PD_, 0);                                                                    \
+    else if (swz == 1) DEC1S(F_, XR_, LD_, PD_, 1);                                                               \
+    else DEC1S(F_, XR_, LD_, PD_, 2)
 #define DEC(F_, XR_)                                                                                              \
     if (ld == 0) DEC1(F_, XR_, 0, 1);                                                                             \
     else if (ld == 1) DEC1(F_, XR_, 1, 1);                                                                        \
@@ -1022,6 +1036,7 @@ void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor&
     else { if (xrow) { DEC(2, true); } else { DEC(2, false); } }
 #undef DEC
 #undef DEC1
+#undef DEC1S
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

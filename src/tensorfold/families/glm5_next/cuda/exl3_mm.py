@@ -46,6 +46,17 @@ def dec_settings() -> tuple[bool, int, bool]:
     return on, fuse, os.environ.get("TF_GLM_EXL3_XROW", "1") != "0"
 
 
+def dec_order() -> int:
+    """TF_GLM_EXL3_ORDER: the decode kernel's block launch order (the same bits for every value). ``0`` (default):
+    items fastest; ``1`` / ``2``: the 128-column blocks of one k slice first, then the items (1) or the matrices and
+    splits (2)."""
+
+    v = os.environ.get("TF_GLM_EXL3_ORDER", "0").strip()
+    if v not in ("0", "1", "2"):
+        raise ValueError(f"TF_GLM_EXL3_ORDER: 0, 1 or 2, not {v!r}")
+    return int(v)
+
+
 LOADS = {"0": 0, "ldg": 0, "1": 1, "nc": 1, "nc1": 1, "nc2": 2, "nc4": 3}
 
 
@@ -212,7 +223,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
         else:
             ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
             xg, xu = s.xg, s.xu
-        ld = dec_loads()
+        ld = dec_loads() | (dec_order() << 2)
         ext.dec(xg, xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, 4, items, slots,
                 2 if fuse & 2 else 0, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done, ld)
         if not fuse & 2:
