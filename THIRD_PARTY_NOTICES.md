@@ -591,3 +591,10 @@ in `image_processing_inkling2.py` at the same commit for its 40-pixel patches an
 `Inkling2DSparkDecoder.mix`, `Inkling2DraftSelfAttention`, `Inkling2DraftMLP` and the recurrent `Inkling2MarkovHead`.
 The drafter's weights ship in Thinking Machines' Inkling 2 Small release under Apache-2.0. The kernels are TensorFold's
 own.
+
+## Inkling 2 reply blocks
+
+`zig/src/server/inkling_reply.zig` and `zig/src/server/chat_inkling.zig` follow the state table of vLLM's Inkling
+parser, `vllm/parser/inkling.py` at commit `abb8194dc35e` of [vllm-project/vllm](https://github.com/vllm-project/vllm)
+(Apache-2.0). The table says which marker opens which block in each state, which markers stay text, and that a block
+header's text counts as content only when the header closes without a block. The code is TensorFold's own.
