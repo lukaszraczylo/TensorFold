@@ -72,6 +72,13 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, hidden: u32, l
     return parse(gpa, bytes, hidden, layers);
 }
 
+const failure_buf_bytes = 512;
+
+/// One line naming the variable, the path and the loader error.
+fn failureLine(buf: []u8, path: []const u8, err: anyerror) []const u8 {
+    return std.fmt.bufPrint(buf, "error: {s}={s}: {s}", .{ path_env, path, @errorName(err) }) catch buf[0..0];
+}
+
 /// The edit file's path from the setting's raw text: unset, blank or "0" is off.
 pub fn pathOf(raw: ?[]const u8) platform.environment.Error!?[]const u8 {
     const p = (try platform.environment.path(path_env, raw)) orelse return null;
@@ -101,7 +108,11 @@ pub fn upload(gpa: std.mem.Allocator, d: *const cuda.Driver, file: Edit, mult: f
 pub fn open(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, hidden: u32, layers: u32) !?State {
     const path = (try pathOf(platform.environment.Process.get(.{}, path_env))) orelse return null;
     const mult = try platform.environment.read(f32, scale_env, 1.0);
-    const file = try load(gpa, io, path, hidden, layers);
+    const file = load(gpa, io, path, hidden, layers) catch |e| {
+        var buf: [failure_buf_bytes]u8 = undefined;
+        std.debug.print("{s}\n", .{failureLine(&buf, path, e)});
+        return e;
+    };
     defer file.deinit(gpa);
     const st = try upload(gpa, d, file, mult);
     std.debug.print("info: residual edit {s}, rank {d}, scale x{d}\n", .{ path, file.rank, mult });
@@ -215,6 +226,11 @@ test "parse takes rank 1 and rank 8" {
         defer e.deinit(t.allocator);
         try t.expectEqual(r, e.rank);
     }
+}
+
+test "a failed load names the variable, the path and the error" {
+    var buf: [failure_buf_bytes]u8 = undefined;
+    try t.expectEqualStrings("error: TF_INK2_ABLIT=/a/b.bin: FileNotFound", failureLine(&buf, "/a/b.bin", error.FileNotFound));
 }
 
 test "env off" {
