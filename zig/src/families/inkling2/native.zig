@@ -52,6 +52,23 @@ const Owned = struct {
     ib: be.Inkling,
 };
 
+/// The window the model holds: the one asked for, at most the checkpoint's `model_max_length`.
+fn clampContext(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, asked: usize) !usize {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const cfg = try weights.readConfig(arena.allocator(), io, dir);
+    return clampTo(asked, cfg.text.max_context);
+}
+
+fn clampTo(asked: usize, max_context: u32) usize {
+    return @min(asked, max_context);
+}
+
+test "a window past the checkpoint's maximum is cut to it" {
+    try std.testing.expectEqual(@as(usize, 1048576), clampTo(4194304, 1048576));
+    try std.testing.expectEqual(@as(usize, 65536), clampTo(65536, 1048576));
+}
+
 /// Opens the model with `o.lanes` streams, or (`lanes_fixed` off) the most of them that fit the room; the plan refuses first.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     if (kernels != null) return error.CapturedKernels;
@@ -62,12 +79,14 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.gpa = gpa;
     own.stream = try cuda.Stream.init(ctx.d, true);
     errdefer own.stream.deinit();
+    const context = try clampContext(gpa, io, dir, o.context);
     var n: u32 = @max(o.lanes, 1);
     while (true) {
-        const wo: budget.Options = .{ .context = o.context, .streams = n, .chunk_rows = prompt_rows, .embed_host = embed_host };
+        const wo: budget.Options = .{ .context = context, .streams = n, .chunk_rows = prompt_rows, .embed_host = embed_host };
         own.w = weights.load(gpa, io, weights.deviceUploader(ctx.d), dir, wo, room) catch |e| {
             if (e != error.OverBudget or o.lanes_fixed or n == 1) return e;
             n -= 1;
+            std.log.warn("--parallel {d} does not fit the CUDA memory budget at a {d}-token window: trying {d} stream{s}", .{ n + 1, context, n, if (n == 1) "" else "s" });
             continue;
         };
         break;
@@ -76,18 +95,18 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const text = &own.w.cfg.text;
     const layers = try plan.build(text, own.w.prec[0..text.layers]);
     own.sched = try visits.build(&own.w.cfg, &layers);
-    const co: cache.Options = .{ .context = o.context, .streams = n, .chunk_rows = prompt_rows };
+    const co: cache.Options = .{ .context = context, .streams = n, .chunk_rows = prompt_rows };
     own.cache = try cache.Cache.init(ctx.d, &own.sched, text, co);
     errdefer own.cache.deinit();
     own.c.init(gpa, io, ctx.d, &own.w, own.sched, &own.cache, co) catch |e| return if (e == error.FileNotFound) error.AblitFileMissing else e; // the only file `Ctx.init` reads
     errdefer own.c.deinit();
-    own.ib = try be.Inkling.init(gpa, &own.c, own.stream, n, o.context);
+    own.ib = try be.Inkling.init(gpa, &own.c, own.stream, n, context);
     errdefer own.ib.deinit();
     return .{
         .backend = own.ib.backend(),
         .facts = own.ib.facts(),
         .rows = window_rows,
-        .stream_bytes = @intCast(cache.bytes(&own.sched, text, .{ .context = o.context, .streams = 1, .chunk_rows = prompt_rows })),
+        .stream_bytes = @intCast(cache.bytes(&own.sched, text, .{ .context = context, .streams = 1, .chunk_rows = prompt_rows })),
         .free_streams = n,
         .ctx = own,
         .deinit = release,

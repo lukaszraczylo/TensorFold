@@ -317,7 +317,7 @@ const Collect = struct {
     }
 };
 
-fn readConfig(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !config.Config {
+pub fn readConfig(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !config.Config {
     const path = try std.fs.path.join(arena, &.{ dir, config_file });
     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(config_max_bytes));
     var why: config.Why = .{};

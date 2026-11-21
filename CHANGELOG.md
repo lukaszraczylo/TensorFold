@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Inkling 2: a chat render for a tokenizer that holds the Inkling block markers ends with `<|message_model|>` so the reply starts in the model's turn (the checkpoint's template stops after the user turn); the open cuts `--context` to the checkpoint's `model_max_length`, logs each stream count `--parallel auto` falls back to, and refuses a sampled draw from a row with a non-finite top logit (refs #3476).
+
 - Inkling 2: the native CUDA host registers `inkling2_loop` (ModelOpt NVFP4 checkpoints of Inkling 2 Mini) with a lane backend: one slot a stream (`--parallel`, auto fits the memory room), prompts in 512-row chunks, one-token steps with greedy picks (`head.argmax`, a non-finite row is refused) or keyed draws over the bf16-rounded logits, no draft head, no images, no prompt cache; the open refuses a plan above the room with `--context`, `--parallel` and `TF_INK2_EMBED_HOST` named, and words the `TF_INK2_ABLIT` file errors (refs #3476). Thanks to @ajensenwaud.
 
 - Inkling 2: the engine opens `TF_INK2_ABLIT` at start (`Ctx.init`) and `attn_visit.run` applies the residual edit to its `wo_ud` output on every visit of every pass, for prompt rows and decode rows alike, through the `Ctx.ablit_hook` seam; with the variable unset, empty or `0` no kernel is launched and the outputs are bit-identical to a build without the edit.

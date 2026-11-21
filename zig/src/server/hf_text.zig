@@ -5,6 +5,7 @@ const template = @import("template");
 const json = @import("json");
 const model_text = @import("model_text.zig");
 const KimiText = @import("kimi_text.zig").KimiText;
+const inkling = @import("inkling_reply.zig").markers;
 const dsv41_chat = @import("dsv41_chat");
 const dsv41 = if (@hasDecl(dsv41_chat, "template")) dsv41_chat.template else dsv41_chat;
 const Value = json.Value;
@@ -442,9 +443,37 @@ pub const HfText = struct {
             problem.* = diag.msg;
             return error.Template;
         };
-        return .{ .text = out.s, .spans = out.spans };
+        return .{ .text = if (options.add_generation_prompt and t.speaksInkling()) try std.mem.concat(a, u8, &.{ out.s, inkling.model }) else out.s, .spans = out.spans };
+    }
+
+    /// Inkling 2's tokenizer holds the block markers; its template never opens the model turn, so the render does.
+    fn speaksInkling(t: *const HfText) bool {
+        return t.tok.specialTokenId(inkling.model) != null and t.tok.specialTokenId(inkling.end_sampling) != null;
     }
 };
+
+test "a chat render opens the model turn only for a tokenizer that holds the Inkling markers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t: HfText = undefined;
+    t.native_deepseek = false;
+    t.specials = .null;
+    t.tool_compiled = null;
+    t.clear_thinking = null;
+    t.compiled = try template.compile(a, "{% for m in messages %}[{{ m.content }}]{% endfor %}", null);
+    t.tok.vocab = std.StringHashMap(u32).init(a);
+    var problem: []const u8 = "";
+    const messages = (try json.parse(a, "[{\"role\":\"user\",\"content\":\"hi\"}]")).ok;
+    const plain = try HfText.renderFn(&t, a, messages, .{}, &problem);
+    try std.testing.expectEqualStrings("[hi]", plain.text);
+    try t.tok.vocab.put(inkling.model, 200005);
+    try t.tok.vocab.put(inkling.end_sampling, 200006);
+    const opened = try HfText.renderFn(&t, a, messages, .{}, &problem);
+    try std.testing.expectEqualStrings("[hi]" ++ inkling.model, opened.text);
+    const prefilled = try HfText.renderFn(&t, a, messages, .{ .add_generation_prompt = false }, &problem);
+    try std.testing.expectEqualStrings("[hi]", prefilled.text);
+}
 
 test "model EOS does not hide a different tokenizer chat end" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

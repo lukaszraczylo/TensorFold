@@ -206,6 +206,7 @@ pub const Inkling = struct {
         const h = &x.heads[l.slot];
         const rule = l.rule orelse return x.pick(h);
         const n: usize = x.c.text.unpadded_vocab;
+        _ = try x.pick(h); // a row whose top value is not finite would draw garbage
         try ops.tobf(&x.c.ops, x.s, h.r.logits, 1, n, n, x.bf.ptr, n, 0, n);
         const meta = [4]i32{ @intCast(position - 1), 0, 0, 0 };
         try x.rule.uploadAsync(0, std.mem.asBytes(&rule), x.s.handle);
