@@ -145,8 +145,8 @@ const embed_ids_bytes = 4;
 /// Queries of a global layer's attention input: q, k and v.
 pub const max_inputs = 3;
 
-/// Addresses of the decode flow buffers: the residual stack and message bank, the carried input and the visit's
-/// intermediates. `of(0, rows, hidden)` sizes them.
+/// Addresses of the decode flow buffers: the residual stack and message bank, the carried input, the visit's
+/// intermediates and the loop's messages and controller scratch. `of(0, rows, hidden)` sizes them.
 pub const FlowRegions = struct {
     stack: [bank.stack_slots]u64, // bf16 [rows, hidden]: the embedding, three finished blocks and the partial
     bank: [bank.bank_slots]u64, // bf16 [rows, hidden]: the two blocks a restart saves
@@ -160,6 +160,10 @@ pub const FlowRegions = struct {
     wide: u64, // fp32 [3, rows, hidden]: the carried input widened for a trace
     ids: u64, // int32 [rows]
     emb: u64, // bf16 [rows, hidden]: the embedding rows of a host-resident table
+    mix: u64, // fp32 [3, rows, hidden]: the carried `dest` of a visit with pass > 0
+    mlp_dest: u64, // fp32 [rows, hidden]: the unnormed MLP input mix of a visit with pass > 0
+    msg: u64, // fp32 [4, rows, hidden]: the cross-pass messages, streams attn, k, v, mlp
+    gate_h: u64, // bf16 [rows, gate_rank]: a controller's down projection
     total: u64,
 
     pub fn of(base: u64, rows: usize, hidden: usize) FlowRegions {
@@ -178,6 +182,10 @@ pub const FlowRegions = struct {
         r.wide = take(&at, max_inputs * row * f32_bytes);
         r.ids = take(&at, rows * embed_ids_bytes);
         r.emb = take(&at, row * bf16_bytes);
+        r.mix = take(&at, max_inputs * row * f32_bytes);
+        r.mlp_dest = take(&at, row * f32_bytes);
+        r.msg = take(&at, loop_kernels.n_streams * row * f32_bytes);
+        r.gate_h = take(&at, rows * loop_kernels.gate_rank * bf16_bytes);
         r.total = at - base;
         return r;
     }
@@ -320,21 +328,26 @@ test "flow buffers for one row and for a 512-row chunk" {
     try ts.expectEqual(@as(u64, 7 * 4608), one.dest); // then two bank slots
     try ts.expectEqual(@as(u64, 9216), one.inp - one.dest); // one fp32 dest row
     try ts.expectEqual(@as(u64, 3 * 4608), one.attn_pre - one.inp);
-    try ts.expectEqual(@as(u64, 115456), one.total);
+    try ts.expectEqual(@as(u64, 115456), one.mix);
+    try ts.expectEqual(@as(u64, 3 * 9216), one.mlp_dest - one.mix);
+    try ts.expectEqual(@as(u64, 9216), one.msg - one.mlp_dest);
+    try ts.expectEqual(@as(u64, 4 * 9216), one.gate_h - one.msg);
+    try ts.expectEqual(@as(u64, 189440), one.total); // the 128-byte controller row rounds up to 256
     const big = FlowRegions.of(0, 512, 2304);
     try ts.expectEqual(@as(u64, 512 * 4608), big.stack[1] - big.stack[0]);
     try ts.expectEqual(@as(u64, 7 * 512 * 4608), big.dest);
     try ts.expectEqual(@as(u64, 512 * 9216), big.inp - big.dest);
-    try ts.expectEqual(@as(u64, 58_984_448), big.total);
+    try ts.expectEqual(@as(u64, 58_984_448), big.mix);
+    try ts.expectEqual(@as(u64, 58_984_448 + 37_814_272), big.total);
 }
 
 test "flow regions are aligned and disjoint" {
     const r = FlowRegions.of(1 << 20, 64, 2304);
-    const ordered = r.stack ++ r.bank ++ [_]u64{ r.dest, r.inp, r.attn_pre, r.attn_out, r.mlp_in, r.moe_out, r.resid, r.wide, r.ids, r.emb };
+    const ordered = r.stack ++ r.bank ++ [_]u64{ r.dest, r.inp, r.attn_pre, r.attn_out, r.mlp_in, r.moe_out, r.resid, r.wide, r.ids, r.emb, r.mix, r.mlp_dest, r.msg, r.gate_h };
     var prev: u64 = 1 << 20;
     for (ordered) |at| {
         try ts.expect(at % region_align == 0 and at >= prev);
         prev = at;
     }
-    try ts.expect(r.emb + 64 * 2304 * 2 <= (1 << 20) + r.total);
+    try ts.expect(r.gate_h + 64 * loop_kernels.gate_rank * 2 <= (1 << 20) + r.total);
 }

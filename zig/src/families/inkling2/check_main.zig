@@ -12,7 +12,7 @@ const usage =
     \\loop --model DIR --layer L --rows N --in DIR: reads bank.bf16 ([2, N, 2304]), dest.f32 ([N, 2304]) and norm.bf16 ([2304]), runs core layer L's four cross-pass messages and controllers, writes msgs.f32 ([4, N, 2304]) and ctl_<attn|k|v|mlp>.bf16 ([N, 2304])
     \\ablit --file F --layer L --mult M --in DIR: reads DIR/y.bf16 ([N, 2304]), applies the edit file F at layer L with scale multiplier M, writes y.bf16
     \\attn --model DIR --layer L --pass P --n N --rows R [--pos0 P0] --in DIR: reads DIR/xs.bf16 ([N, 3, 2304]: xq, xk, xv a step), runs the visit (L, P)'s attention on them R rows a call from position P0 with the visit's caches carried (P0 > 0: k0.bf16 and v0.bf16 [keep, 8, 128] fill the rows before it), writes out.bf16 ([N, 2304], the wo_ud projection)
-    \\decode --model DIR --steps FILE.json --visits A-B [--teacher GOLDEN_DIR] [--layers staged] --out DIR: runs the single-token steps of FILE.json ({"steps": [[id], ...]}) from position 0 through visits 0..B (B at most 17), the carried input after each visit and each visit's MoE input replaced by GOLDEN_DIR's (ref.capture layout: visit<VV>.f32, mlp<VV>.f32) when given, and writes step<s>/visit<VV>.f32 and step<s>/mlp<VV>.f32 (the MoE input before the replacement) for visits A..B and a manifest.json in the reference's layout
+    \\decode --model DIR --steps FILE.json --visits A-B [--teacher GOLDEN_DIR] [--layers staged] [--dump-kv L:P,...] --out DIR: runs the single-token steps of FILE.json ({"steps": [[id], ...]}) from position 0 through visits 0..B (B at most 47), the carried input after each visit, each visit's MoE input and a pass > 0 visit's messages replaced by GOLDEN_DIR's (ref.capture layout: visit<VV>.f32, mlp<VV>.f32, msg<VV>.f32) when given, and writes step<s>/visit<VV>.f32 and step<s>/mlp<VV>.f32 (the MoE input before the replacement), for a visit with pass > 0 step<s>/xs<VV>.f32 and msg<VV>.f32 (controller outputs, messages), for visits A..B, and a manifest.json in the reference's layout; --dump-kv writes the K and V rows of those (layer, pass) visits after the last step as kv/L<l>p<p>.<k|v>.bf16 ([steps, 8, 128])
     \\weights --model DIR [--layers A-B] [--readback NAME,...]: uploads the text weights (TF_INK2_EMBED_HOST=1 keeps the
     \\    embedding on the host), writes DIR/weights.json with peak_rss_mib and device_bytes, and one row per readback
     \\    tensor (names below model.llm., e.g. layers.0.attn.wo_ud.weight)
@@ -47,6 +47,7 @@ const Args = struct {
     teacher: ?[]const u8 = null,
     visits: ?ink2.budget.LayerRange = null,
     staged: bool = false,
+    dump_kv: ?[]const u8 = null,
 };
 
 fn parseLayers(text: []const u8) !ink2.budget.LayerRange {
@@ -63,7 +64,7 @@ fn parseArgs(args: []const [:0]const u8) !Args {
         const v: []const u8 = args[i + 1];
         if (std.mem.eql(u8, args[i], "--out")) a.out = v else if (std.mem.eql(u8, args[i], "--model")) a.model = v else if (std.mem.eql(u8, args[i], "--in")) a.in = v else if (std.mem.eql(u8, args[i], "--layers")) {
             if (std.mem.eql(u8, v, staged_layers)) a.staged = true else a.layers = try parseLayers(v);
-        } else if (std.mem.eql(u8, args[i], "--steps")) a.steps = v else if (std.mem.eql(u8, args[i], "--teacher")) a.teacher = v else if (std.mem.eql(u8, args[i], "--visits")) a.visits = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else if (std.mem.eql(u8, args[i], "--pass")) a.pass = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--pos0")) a.pos0 = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--n")) a.n = try std.fmt.parseInt(usize, v, 10) else return error.Usage;
+        } else if (std.mem.eql(u8, args[i], "--steps")) a.steps = v else if (std.mem.eql(u8, args[i], "--teacher")) a.teacher = v else if (std.mem.eql(u8, args[i], "--visits")) a.visits = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--dump-kv")) a.dump_kv = v else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else if (std.mem.eql(u8, args[i], "--pass")) a.pass = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--pos0")) a.pos0 = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--n")) a.n = try std.fmt.parseInt(usize, v, 10) else return error.Usage;
     }
     return a;
 }
@@ -389,7 +390,6 @@ fn moe(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !void {
     try rows_out.finish();
 }
 
-
 /// DIR/name must hold exactly `bytes`; returns it on the device.
 fn uploadFile(d: *const cuda.Driver, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: usize) !cuda.DeviceBuffer {
     const host = try dir.readFileAlloc(io, name, gpa, .limited(bytes + 1));
@@ -596,6 +596,14 @@ const GoldenTeacher = struct {
         };
     }
 
+    fn msg(ctx: *anyopaque, v: u32) ?[]const f32 {
+        const t: *GoldenTeacher = @ptrCast(@alignCast(ctx));
+        return t.read("msg", v, ink2.loop_kernels.n_streams * loop_hidden) catch |e| {
+            t.err = e;
+            return null;
+        };
+    }
+
     fn read(t: *GoldenTeacher, kind: []const u8, v: u32, n: usize) ![]const f32 {
         var name: [64]u8 = undefined;
         const path = try std.fmt.bufPrint(&name, "step{d}/{s}{d:0>2}.f32", .{ t.step, kind, v });
@@ -607,7 +615,7 @@ const GoldenTeacher = struct {
     }
 };
 
-/// Writes the carried vector after each visit from `first` on as the reference's step<s>/visit<VV>.f32.
+/// Writes the rows of each visit from `first` on in the reference's layout: step<s>/<kind><VV>.f32.
 const DecodeTrace = struct {
     d: *const cuda.Driver,
     rows: *ink2.check_rows.Writer,
@@ -615,24 +623,95 @@ const DecodeTrace = struct {
     step: usize = 0,
     buf: []u8,
 
-    fn visit(ctx: *anyopaque, v: u32, inp: u64, qn: u32) anyerror!void {
-        const t: *DecodeTrace = @ptrCast(@alignCast(ctx));
+    fn put(t: *DecodeTrace, kind: []const u8, v: u32, ptr: u64, n: usize) !void {
         if (v < t.first) return;
-        const bytes = qn * loop_hidden * @sizeOf(f32);
-        try cuda.memory.download(t.d, inp, t.buf[0..bytes]);
+        const bytes = n * loop_hidden * @sizeOf(f32);
+        try cuda.memory.download(t.d, ptr, t.buf[0..bytes]);
         var name: [64]u8 = undefined;
-        try t.rows.put(try std.fmt.bufPrint(&name, "step{d}/visit{d:0>2}", .{ t.step, v }), .f32, &.{ qn, loop_hidden }, t.buf[0..bytes]);
+        try t.rows.put(try std.fmt.bufPrint(&name, "step{d}/{s}{d:0>2}", .{ t.step, kind, v }), .f32, &.{ n, loop_hidden }, t.buf[0..bytes]);
+    }
+
+    fn visit(ctx: *anyopaque, v: u32, inp: u64, qn: u32) anyerror!void {
+        try put(@ptrCast(@alignCast(ctx)), "visit", v, inp, qn);
     }
 
     fn mlp(ctx: *anyopaque, v: u32, mlp_in: u64) anyerror!void {
-        const t: *DecodeTrace = @ptrCast(@alignCast(ctx));
-        if (v < t.first) return;
-        const bytes = loop_hidden * @sizeOf(f32);
-        try cuda.memory.download(t.d, mlp_in, t.buf[0..bytes]);
-        var name: [64]u8 = undefined;
-        try t.rows.put(try std.fmt.bufPrint(&name, "step{d}/mlp{d:0>2}", .{ t.step, v }), .f32, &.{ 1, loop_hidden }, t.buf[0..bytes]);
+        try put(@ptrCast(@alignCast(ctx)), "mlp", v, mlp_in, 1);
+    }
+
+    fn xs(ctx: *anyopaque, v: u32, ptr: u64) anyerror!void {
+        try put(@ptrCast(@alignCast(ctx)), "xs", v, ptr, ink2.engine.max_inputs);
+    }
+
+    fn msg(ctx: *anyopaque, v: u32, ptr: u64) anyerror!void {
+        try put(@ptrCast(@alignCast(ctx)), "msg", v, ptr, ink2.loop_kernels.n_streams);
     }
 };
+
+const config_name = "config.json";
+const config_max_bytes = 1 << 20;
+const max_kv_dumps = 8;
+const KvVisit = struct { layer: u32, pass: u32 };
+
+/// `6:0,6:1` -> (layer, pass) visits.
+fn parseKvVisits(text: []const u8, out: *[max_kv_dumps]KvVisit) ![]const KvVisit {
+    var n: usize = 0;
+    var items = std.mem.splitScalar(u8, text, ',');
+    while (items.next()) |item| {
+        const colon = std.mem.indexOfScalar(u8, item, ':') orelse return error.Usage;
+        if (n == max_kv_dumps) return error.Usage;
+        out[n] = .{ .layer = try std.fmt.parseInt(u32, item[0..colon], 10), .pass = try std.fmt.parseInt(u32, item[colon + 1 ..], 10) };
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// The schedule of the model at `dir` before its weights load: the layer kinds do not depend on the expert precision.
+fn scheduleOf(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !ink2.visits.Schedule {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const path = try std.fs.path.join(arena.allocator(), &.{ dir, config_name });
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena.allocator(), .limited(config_max_bytes));
+    var why: ink2.config.Why = .{};
+    const cfg = ink2.config.parse(arena.allocator(), text, &why) catch |e| {
+        std.debug.print("{s}: {s}\n", .{ path, why.text() });
+        return e;
+    };
+    const prec: [ink2.config.max_layers]ink2.plan.Precision = @splat(.nvfp4);
+    const p = try ink2.plan.build(&cfg.text, prec[0..cfg.text.layers]);
+    return ink2.visits.build(&cfg, &p);
+}
+
+/// The K and V rows of each visit in `kv` after `steps` single-token steps from position 0, as kv/L<l>p<p>.<k|v>.bf16
+/// ([steps, kv_heads, head_dim], ref.capture's layout); the cache holds a head's rows at slot pos % ring.
+fn dumpKv(gpa: std.mem.Allocator, rows_out: *ink2.check_rows.Writer, cache: *const ink2.cache.Cache, sched: *const ink2.visits.Schedule, t: *const ink2.config.Text, kv: []const KvVisit, last_visit: u32, steps: usize) !void {
+    const head_row = ink2.kernels.head_dim * 2;
+    for (kv) |want| {
+        const i = for (sched.visits[0..sched.n], 0..) |v, i| {
+            if (v.layer == want.layer and v.pass == want.pass) break i;
+        } else return error.KvVisitUnknown;
+        if (i > last_visit) return error.KvVisitNotRun;
+        const visit = sched.visits[i];
+        const layer = cache.layerAt(visit.kv);
+        const ring: usize = layer.ring;
+        if (steps > ring) return error.KvRingWrapped;
+        const kv_heads: usize = t.heads(visit.layer).kv;
+        const slots = cache.kvAt(visit.kv, 0);
+        const staging = try gpa.alloc(u8, kv_heads * ring * head_row);
+        defer gpa.free(staging);
+        const out = try gpa.alloc(u8, steps * kv_heads * head_row);
+        defer gpa.free(out);
+        for ([_]struct { kind: []const u8, at: u64 }{ .{ .kind = "k", .at = slots.k }, .{ .kind = "v", .at = slots.v } }) |f| {
+            try cuda.memory.download(cache.d, f.at, staging);
+            for (0..steps) |pos| for (0..kv_heads) |h| {
+                @memcpy(out[(pos * kv_heads + h) * head_row ..][0..head_row], staging[(h * ring + pos % ring) * head_row ..][0..head_row]);
+            };
+            var name: [64]u8 = undefined;
+            const file = try std.fmt.bufPrint(&name, "kv/L{d}p{d}.{s}", .{ want.layer, want.pass, f.kind });
+            try rows_out.put(file, .bf16, &.{ steps, kv_heads, ink2.kernels.head_dim }, out);
+        }
+    }
+}
 
 /// Single-token steps of `--steps` from position 0 through visits 0..B of the model; see `usage`.
 fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
@@ -658,15 +737,19 @@ fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
     var stream = try cuda.Stream.init(ctx.d, true);
     defer stream.deinit();
 
+    var kv_buf: [max_kv_dumps]KvVisit = undefined;
+    const kv: []const KvVisit = if (a.dump_kv) |list| try parseKvVisits(list, &kv_buf) else &.{};
+
     const embed_host = try environment.read(bool, embed_host_env, false);
-    const layers = a.layers orelse ink2.budget.LayerRange{ .first = 0, .last = range.last }; // visit i is layer i up to the first pass's end
+    const planned = try scheduleOf(gpa, io, model);
+    if (range.last >= planned.n) return error.VisitsPastSchedule;
+    const layers = a.layers orelse ink2.budget.LayerRange{ .first = 0, .last = ink2.decode.layersRead(&planned, range.last) };
     const o: ink2.budget.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = decode_chunk_rows, .embed_host = embed_host, .layers = layers };
     var w = try ink2.weights.load(gpa, io, ink2.weights.deviceUploader(ctx.d), model, o, device_limit);
     defer w.deinit();
     const layer_plan = try ink2.plan.build(&w.cfg.text, w.prec[0..w.cfg.text.layers]);
     const sched = try ink2.visits.build(&w.cfg, &layer_plan);
-    const last_visit = ink2.decode.lastVisit(w.cfg.loop orelse return error.NotLoop);
-    if (range.last > last_visit) return error.VisitsPastFirstPass;
+    if (sched.n != planned.n) return error.VisitsPastSchedule;
 
     const co: ink2.cache.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = decode_chunk_rows };
     var cache = try ink2.cache.Cache.init(ctx.d, &sched, &w.cfg.text, co);
@@ -677,13 +760,13 @@ fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
 
     var rows_out = try ink2.check_rows.Writer.init(gpa, io, out);
     defer rows_out.deinit();
-    const trace_buf = try gpa.alloc(u8, ink2.engine.max_inputs * loop_hidden * @sizeOf(f32));
+    const trace_buf = try gpa.alloc(u8, ink2.loop_kernels.n_streams * loop_hidden * @sizeOf(f32));
     defer gpa.free(trace_buf);
     var tracer: DecodeTrace = .{ .d = ctx.d, .rows = &rows_out, .first = range.first, .buf = trace_buf };
 
     var golden_dir: ?std.Io.Dir = null;
     defer if (golden_dir) |*dir| dir.close(io);
-    const teacher_buf = try gpa.alloc(f32, ink2.engine.max_inputs * loop_hidden);
+    const teacher_buf = try gpa.alloc(f32, ink2.loop_kernels.n_streams * loop_hidden);
     defer gpa.free(teacher_buf);
     var teacher: GoldenTeacher = .{ .gpa = gpa, .io = io, .dir = undefined, .sched = &sched, .buf = teacher_buf };
     if (a.teacher) |path| {
@@ -692,8 +775,8 @@ fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
     }
 
     const hooks: ink2.decode.Hooks = .{
-        .trace = .{ .ctx = &tracer, .visit = DecodeTrace.visit, .mlp = DecodeTrace.mlp },
-        .teacher = if (a.teacher != null) .{ .ctx = &teacher, .input = GoldenTeacher.input, .mlp = GoldenTeacher.mlp } else null,
+        .trace = .{ .ctx = &tracer, .visit = DecodeTrace.visit, .mlp = DecodeTrace.mlp, .xs = DecodeTrace.xs, .msg = DecodeTrace.msg },
+        .teacher = if (a.teacher != null) .{ .ctx = &teacher, .input = GoldenTeacher.input, .mlp = GoldenTeacher.mlp, .msg = GoldenTeacher.msg } else null,
     };
     const metas = try gpa.alloc(ink2.check_rows.StepMeta, steps.len);
     defer gpa.free(metas);
@@ -705,6 +788,7 @@ fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
         if (teacher.err) |e| return e;
     }
 
+    try dumpKv(gpa, &rows_out, &cache, &sched, &w.cfg.text, kv, range.last, steps.len);
     var qn: [ink2.visits.max_visits]u32 = undefined;
     for (qn[0..sched.n], 0..) |*q, i| q.* = ink2.decode.carriedRows(&sched, @intCast(i));
     try rows_out.finishRun(.{ .hidden = loop_hidden, .visits = sched.n, .unpadded_vocab = w.cfg.text.unpadded_vocab, .qn = qn[0..sched.n], .steps = metas });
