@@ -6,7 +6,7 @@ const ink2 = @import("inkling2");
 const usage =
     \\usage: tf-ink2-check <subcommand> --out DIR [options]
     \\smoke: fills a device buffer with tf_ink2l_fill and writes DIR/smoke.u32 (1024 words of 0xC0FFEE)
-    \\actq --in DIR: reads x_nvfp4_<k>.bf16 and x_mxfp8_<k>.bf16 (shapes in DIR/shapes.json), writes nvfp4_<k>.f32 and mxfp8_<k>.f32
+    \\actq --in DIR: reads x_nvfp4_<k>.bf16 and x_mxfp8_<k>.bf16 (shapes in DIR/shapes.json), writes nvfp4_<k>.f32 and mxfp8_<k>.f32 (dequantised), nvfp4_values_/nvfp4_scales_/nvfp4_amax_<k>.f32, mxfp8_values_<k>.f32 and mxfp8_exps_<k>.u8
     \\weights --model DIR [--layers A-B] [--readback NAME,...]: uploads the text weights (TF_INK2_EMBED_HOST=1 keeps the
     \\    embedding on the host), writes DIR/weights.json with peak_rss_mib and device_bytes, and one row per readback
     \\    tensor (names below model.llm., e.g. layers.0.attn.wo_ud.weight)
@@ -196,16 +196,43 @@ fn actq(init: std.process.Init, in: []const u8, out: []const u8) !void {
             defer x.free();
             var y = try cuda.DeviceBuffer.alloc(ctx.d, rows * kdim * 4);
             defer y.free();
+            var values = try cuda.DeviceBuffer.alloc(ctx.d, rows * kdim * 4);
+            defer values.free();
+            // NVFP4: block scales float32 [rows, k/16]; MXFP8: exponents u8 [rows, k/32]
+            const side_len = if (kind.mx) rows * (kdim / ink2.loop_kernels.mxfp8_block) else rows * (kdim / ink2.loop_kernels.nvfp4_block) * 4;
+            var side = try cuda.DeviceBuffer.alloc(ctx.d, side_len);
+            defer side.free();
+            var amax = try cuda.DeviceBuffer.alloc(ctx.d, rows * 4);
+            defer amax.free();
             try x.upload(0, x_host);
-            if (kind.mx) try ink2.loop_kernels.actMxfp8(&k, stream, x.ptr, y.ptr, rows, kdim) else try ink2.loop_kernels.actNvfp4(&k, stream, x.ptr, y.ptr, rows, kdim);
+            if (kind.mx) {
+                try ink2.loop_kernels.actMxfp8Codes(&k, stream, x.ptr, y.ptr, values.ptr, side.ptr, rows, kdim);
+            } else {
+                try ink2.loop_kernels.actNvfp4Codes(&k, stream, x.ptr, y.ptr, values.ptr, side.ptr, amax.ptr, rows, kdim);
+            }
             try stream.synchronize();
-            const y_host = try gpa.alloc(u8, rows * kdim * 4);
-            defer gpa.free(y_host);
-            try y.download(0, y_host);
-            const name = try std.fmt.allocPrint(gpa, "{s}{s}", .{ kind.out, key[kind.prefix.len..] });
-            defer gpa.free(name);
-            try rows_out.put(name, .f32, &.{ rows, kdim }, y_host);
+            const suffix = key[kind.prefix.len..];
+            try putDevice(gpa, &rows_out, &y, "{s}{s}", .{ kind.out, suffix }, .f32, &.{ rows, kdim });
+            try putDevice(gpa, &rows_out, &values, "{s}values_{s}", .{ kind.out, suffix }, .f32, &.{ rows, kdim });
+            if (kind.mx) {
+                try putDevice(gpa, &rows_out, &side, "{s}exps_{s}", .{ kind.out, suffix }, .u8, &.{ rows, kdim / ink2.loop_kernels.mxfp8_block });
+            } else {
+                try putDevice(gpa, &rows_out, &side, "{s}scales_{s}", .{ kind.out, suffix }, .f32, &.{ rows, kdim / ink2.loop_kernels.nvfp4_block });
+                try putDevice(gpa, &rows_out, &amax, "{s}amax_{s}", .{ kind.out, suffix }, .f32, &.{rows});
+            }
         }
     }
     try rows_out.finish();
+}
+
+/// Downloads a device buffer whole and writes it as a row named by `fmt`.
+fn putDevice(gpa: std.mem.Allocator, rows_out: *ink2.check_rows.Writer, buf: *cuda.DeviceBuffer, comptime fmt: []const u8, name_args: anytype, dtype: ink2.check_rows.Dtype, shape: []const usize) !void {
+    var elems: usize = 1;
+    for (shape) |n| elems *= n;
+    const host = try gpa.alloc(u8, elems * dtype.size());
+    defer gpa.free(host);
+    try buf.download(0, host);
+    const name = try std.fmt.allocPrint(gpa, fmt, name_args);
+    defer gpa.free(name);
+    try rows_out.put(name, dtype, shape, host);
 }

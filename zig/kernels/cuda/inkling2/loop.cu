@@ -21,6 +21,7 @@ constexpr float kInvNvOuter = (float)(1.0 / 1536.0);
 constexpr float kInvE4m3Max = (float)(1.0 / 448.0);
 constexpr int kUe8m0Bias = 127;
 constexpr int kUe8m0Max = 254;
+constexpr int kUe8m0Nan = 255;
 constexpr uint32_t kSubnormalScale = 0x00400000u;  // 2^-127, the scale of biased exponent 0
 
 __device__ __forceinline__ float clampMax(float x, float hi) { return x > hi ? hi : x; }
@@ -82,20 +83,22 @@ __device__ float blockMax(float v, float* red) {
     return r;
 }
 
-// One block a row. out = dequantised float32, the array ref.quant.nvfp4_act returns.
-extern "C" __global__ void tf_ink2l_actq_nvfp4(const __nv_bfloat16* x, float* out, int rows, int k) {
+// One block a row. out = dequantised float32, the array ref.quant.nvfp4_act returns. values, scales and
+// amax_out (each may be null) are what ref.quant.nvfp4_codes returns: e2m1 values [rows, k], e4m3 block
+// scales [rows, k/16] and the row amax [rows], all float32.
+__device__ void actqNvfp4Row(
+    const __nv_bfloat16* x, float* out, float* values, float* scales, float* amax_out, int row, int k) {
     __shared__ float red[kWarps];
-    const int row = blockIdx.x;
-    if (row >= rows) return;
     const __nv_bfloat16* xr = x + (size_t)row * k;
     float* outr = out + (size_t)row * k;
+    if (amax_out == nullptr) values = scales = nullptr;
 
     float m = 0.0f;
     for (int i = threadIdx.x; i < k; i += kThreads) m = fmaxf(m, fabsf(__bfloat162float(xr[i])));
     const float amax = blockMax(m, red);
+    if (amax_out != nullptr && threadIdx.x == 0) amax_out[row] = amax;
 
-    // torch evaluates `float / tensor` as reciprocal(tensor) * float, two roundings, so the encoder does too.
-    const float encoder = clampMax(__fmul_rn(__fdiv_rn(1.0f, amax), kNvOuter), kFp32Max);
+    const float encoder = clampMax(__fdiv_rn(kNvOuter, amax), kFp32Max);
     const float decoder = __fdiv_rn(1.0f, encoder);
     const float err_outer = __fmul_rn(amax, kInvNvOuter);
     const float outer = __fdiv_rn(amax, kNvOuter);
@@ -116,14 +119,29 @@ extern "C" __global__ void tf_ink2l_actq_nvfp4(const __nv_bfloat16* x, float* ou
         const Candidate& w = (c4.err < c6.err) ? c4 : c6;
         #pragma unroll
         for (int i = 0; i < kNvBlock; ++i) outr[b * kNvBlock + i] = __fmul_rn(__fmul_rn(w.values[i], w.scale), outer);
+        if (values != nullptr) {
+            scales[(size_t)row * (k / kNvBlock) + b] = w.scale;
+            #pragma unroll
+            for (int i = 0; i < kNvBlock; ++i) values[(size_t)row * k + b * kNvBlock + i] = w.values[i];
+        }
     }
 }
 
-// The UE8M0 scale of one 32-group: the power of two at or above raw, as ref.quant.mxfp8_act builds it.
-__device__ __forceinline__ float ue8m0Scale(float raw) {
-    if (raw != raw) return __int_as_float(0x7fc00000);
+extern "C" __global__ void tf_ink2l_actq_nvfp4(const __nv_bfloat16* x, float* out, int rows, int k) {
+    if (blockIdx.x < rows) actqNvfp4Row(x, out, nullptr, nullptr, nullptr, blockIdx.x, k);
+}
+
+extern "C" __global__ void tf_ink2l_actq_nvfp4_codes(
+    const __nv_bfloat16* x, float* out, float* values, float* scales, float* amax, int rows, int k) {
+    if (blockIdx.x < rows) actqNvfp4Row(x, out, values, scales, amax, blockIdx.x, k);
+}
+
+// The biased UE8M0 exponent of one 32-group: the power of two at or above raw, as ref.quant.mxfp8_codes builds it.
+__device__ __forceinline__ int ue8m0Biased(float raw) {
     int biased;
-    if (raw == 0.0f) {
+    if (raw != raw) {
+        biased = kUe8m0Nan;
+    } else if (raw == 0.0f) {
         biased = 0;
     } else if (isinf(raw)) {
         biased = kUe8m0Max;
@@ -133,12 +151,17 @@ __device__ __forceinline__ float ue8m0Scale(float raw) {
         const int ceil_exp = (mantissa == 0.5f) ? e - 1 : e;
         biased = min(max(ceil_exp + kUe8m0Bias, 0), kUe8m0Max);
     }
+    return biased;
+}
+
+__device__ __forceinline__ float ue8m0Value(int biased) {
+    if (biased == kUe8m0Nan) return __int_as_float(0x7fc00000);
     return __uint_as_float(biased == 0 ? kSubnormalScale : (uint32_t)biased << 23);
 }
 
-extern "C" __global__ void tf_ink2l_actq_mxfp8(const __nv_bfloat16* x, float* out, int rows, int k) {
-    const int row = blockIdx.x;
-    if (row >= rows) return;
+// values (float32 [rows, k]) and exps (uint8 [rows, k/32]) may be null: ref.quant.mxfp8_codes' outputs.
+__device__ void actqMxfp8Row(
+    const __nv_bfloat16* x, float* out, float* values, uint8_t* exps, int row, int k) {
     const __nv_bfloat16* xr = x + (size_t)row * k;
     float* outr = out + (size_t)row * k;
     for (int g = threadIdx.x; g < k / kMxBlock; g += kThreads) {
@@ -149,11 +172,24 @@ extern "C" __global__ void tf_ink2l_actq_mxfp8(const __nv_bfloat16* x, float* ou
             v[i] = __bfloat162float(xr[g * kMxBlock + i]);
             gmax = fmaxf(gmax, fabsf(v[i]));
         }
-        const float scale = ue8m0Scale(__fmul_rn(gmax, kInvE4m3Max));
+        const int biased = ue8m0Biased(__fmul_rn(gmax, kInvE4m3Max));
+        const float scale = ue8m0Value(biased);
+        if (exps != nullptr) exps[(size_t)row * (k / kMxBlock) + g] = (uint8_t)biased;
         #pragma unroll
         for (int i = 0; i < kMxBlock; ++i) {
             const float q = fminf(fmaxf(__fdiv_rn(v[i], scale), -kE4m3Max), kE4m3Max);
-            outr[g * kMxBlock + i] = __fmul_rn(e4m3Round(q), scale);
+            const float qv = e4m3Round(q);
+            outr[g * kMxBlock + i] = __fmul_rn(qv, scale);
+            if (values != nullptr) values[(size_t)row * k + g * kMxBlock + i] = qv;
         }
     }
+}
+
+extern "C" __global__ void tf_ink2l_actq_mxfp8(const __nv_bfloat16* x, float* out, int rows, int k) {
+    if (blockIdx.x < rows) actqMxfp8Row(x, out, nullptr, nullptr, blockIdx.x, k);
+}
+
+extern "C" __global__ void tf_ink2l_actq_mxfp8_codes(
+    const __nv_bfloat16* x, float* out, float* values, uint8_t* exps, int rows, int k) {
+    if (blockIdx.x < rows) actqMxfp8Row(x, out, values, exps, blockIdx.x, k);
 }

@@ -12,6 +12,8 @@ pub const Kernels = struct {
     fill: cuda.Function,
     actq_nvfp4: cuda.Function,
     actq_mxfp8: cuda.Function,
+    actq_nvfp4_codes: cuda.Function,
+    actq_mxfp8_codes: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -22,6 +24,8 @@ pub const Kernels = struct {
             .fill = try mod.function("tf_ink2l_fill"),
             .actq_nvfp4 = try mod.function("tf_ink2l_actq_nvfp4"),
             .actq_mxfp8 = try mod.function("tf_ink2l_actq_mxfp8"),
+            .actq_nvfp4_codes = try mod.function("tf_ink2l_actq_nvfp4_codes"),
+            .actq_mxfp8_codes = try mod.function("tf_ink2l_actq_mxfp8_codes"),
         };
     }
 
@@ -31,12 +35,14 @@ pub const Kernels = struct {
     }
 };
 
-fn actq(f: cuda.Function, block: usize, s: cuda.Stream, x: u64, out: u64, rows: usize, kdim: usize) !void {
+/// `extra` are the codes kernels' output pointers, between `out` and the sizes.
+fn actq(f: cuda.Function, block: usize, s: cuda.Stream, x: u64, out: u64, extra: []const u64, rows: usize, kdim: usize) !void {
     if (kdim == 0 or kdim % block != 0) return error.BadWidth;
     if (rows == 0) return;
     var args: cuda.Args = .{};
     args.add(x);
     args.add(out);
+    for (extra) |p| args.add(p);
     args.add(@as(i32, @intCast(rows)));
     args.add(@as(i32, @intCast(kdim)));
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = actq_threads } }, s, &args);
@@ -44,12 +50,22 @@ fn actq(f: cuda.Function, block: usize, s: cuda.Stream, x: u64, out: u64, rows: 
 
 /// `x` is bf16 [rows, kdim], `out` float32 [rows, kdim]: per-row NVFP4 with the four-over-six rule, dequantised.
 pub fn actNvfp4(k: *const Kernels, s: cuda.Stream, x: u64, out: u64, rows: usize, kdim: usize) !void {
-    return actq(k.actq_nvfp4, nvfp4_block, s, x, out, rows, kdim);
+    return actq(k.actq_nvfp4, nvfp4_block, s, x, out, &.{}, rows, kdim);
 }
 
 /// Same shapes as `actNvfp4`: per-32 MXFP8 with power-of-two scales.
 pub fn actMxfp8(k: *const Kernels, s: cuda.Stream, x: u64, out: u64, rows: usize, kdim: usize) !void {
-    return actq(k.actq_mxfp8, mxfp8_block, s, x, out, rows, kdim);
+    return actq(k.actq_mxfp8, mxfp8_block, s, x, out, &.{}, rows, kdim);
+}
+
+/// As `actNvfp4`, plus ref.quant.nvfp4_codes: e2m1 values float32 [rows, kdim], e4m3 block scales float32 [rows, kdim/16], row amax float32 [rows].
+pub fn actNvfp4Codes(k: *const Kernels, s: cuda.Stream, x: u64, out: u64, values: u64, scales: u64, amax: u64, rows: usize, kdim: usize) !void {
+    return actq(k.actq_nvfp4_codes, nvfp4_block, s, x, out, &.{ values, scales, amax }, rows, kdim);
+}
+
+/// As `actMxfp8`, plus ref.quant.mxfp8_codes: e4m3 values float32 [rows, kdim] and UE8M0 biased exponents u8 [rows, kdim/32].
+pub fn actMxfp8Codes(k: *const Kernels, s: cuda.Stream, x: u64, out: u64, values: u64, exps: u64, rows: usize, kdim: usize) !void {
+    return actq(k.actq_mxfp8_codes, mxfp8_block, s, x, out, &.{ values, exps }, rows, kdim);
 }
 
 const Fake = struct {
@@ -74,7 +90,7 @@ test "actq launches one block a row and refuses a width off the block" {
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     try actNvfp4(&k, s, 0x1000, 0x2000, 64, 2304);
     try std.testing.expectEqual(@as(u32, 64), Fake.grid_x);
@@ -88,6 +104,12 @@ test "actq launches one block a row and refuses a width off the block" {
     try std.testing.expectError(error.BadWidth, actMxfp8(&k, s, 0, 0, 1, 1136));
     try std.testing.expectError(error.BadWidth, actNvfp4(&k, s, 0, 0, 1, 0));
     try std.testing.expectEqual(launched, Fake.count);
+    try actNvfp4Codes(&k, s, 0, 0, 0, 0, 0, 5, 2304);
+    try std.testing.expectEqual(@as(usize, 4), Fake.which);
+    try std.testing.expectEqual(@as(u32, 5), Fake.grid_x);
+    try actMxfp8Codes(&k, s, 0, 0, 0, 0, 7, 1152);
+    try std.testing.expectEqual(@as(usize, 5), Fake.which);
+    try std.testing.expectError(error.BadWidth, actMxfp8Codes(&k, s, 0, 0, 0, 0, 1, 1136));
     // 1136 is a multiple of 16 but not of 32
     try actNvfp4(&k, s, 0, 0, 1, 1136);
 }
