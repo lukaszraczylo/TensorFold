@@ -120,6 +120,7 @@ fn embedToken(c: *engine.Ctx, s: cuda.Stream, token: u32, out: u64) !void {
         id = std.math.cast(i32, token) orelse return error.TokenOutOfRange;
     }
     try upload(c, s, f.ids, std.mem.asBytes(&id));
+    try s.synchronize(); // the host row and id go out of scope
     try ops.embed(&c.ops, s, f.ids, rows, table, try present(w.embed_norm), out, hidden, c.text.eps);
 }
 
