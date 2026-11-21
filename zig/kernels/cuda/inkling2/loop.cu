@@ -1,4 +1,6 @@
-// Inkling 2 Mini's looped-engine kernels: the check tool's smoke kernel and the expert-input activation quantisers.
+// Inkling 2 Mini's looped-engine kernels: the check tool's smoke kernel, the activation quantisers and the expert decode path.
+// Accumulation order of every output dot (the expert GEMVs here; the prompt path must match): lane l of a warp adds its
+// elements k = l, l + 32, l + 64, ... of the K axis in increasing k with fmaf, then the xor-shuffle tree 16, 8, 4, 2, 1.
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -192,4 +194,132 @@ extern "C" __global__ void tf_ink2l_actq_mxfp8(const __nv_bfloat16* x, float* ou
 extern "C" __global__ void tf_ink2l_actq_mxfp8_codes(
     const __nv_bfloat16* x, float* out, float* values, uint8_t* exps, int rows, int k) {
     if (blockIdx.x < rows) actqMxfp8Row(x, out, values, exps, blockIdx.x, k);
+}
+
+// ---- Expert decode path: GEMV on the stored weights, softcapped SwiGLU, combine ----
+// A stage's device template takes the stored format as a WeightFmt; the extern "C" wrappers are the only per-format code.
+constexpr int kExWarps = kThreads / 32;  // output columns a block computes
+constexpr int kSlots = 8;
+constexpr uint32_t kFloatInf = 0x7f800000u;
+
+__constant__ float kE2m1Lut[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                                   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+
+__device__ __forceinline__ float bf16Round(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+
+__device__ __forceinline__ float e4m3ToFloat(uint8_t b) {
+    return __half2float(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b, __NV_E4M3)));
+}
+
+// ref.weights.dequant_nvfp4: bf16((lut[code] * f32(block scale)) * outer), outer = amax[e] / denominator, low nibble first.
+struct Nvfp4Fmt {
+    static constexpr int kPack = 2;  // elements a stored byte holds
+    static constexpr int kBlock = kNvBlock;
+    __device__ static float expertOuter(const float* amax, const float* denominator, int e) {
+        return __fdiv_rn(amax[e], denominator[0]);
+    }
+    __device__ static float dequant(const uint8_t* w, const uint8_t* scale, int k, float outer) {
+        const int code = (w[k >> 1] >> ((k & 1) * 4)) & 0xF;
+        return bf16Round(__fmul_rn(__fmul_rn(kE2m1Lut[code], e4m3ToFloat(scale[k / kNvBlock])), outer));
+    }
+};
+
+// ref.weights.dequant_mxfp8: bf16(f32(e4m3) * 2^(ue8m0 - 127)), no outer scale.
+struct Mxfp8Fmt {
+    static constexpr int kPack = 1;
+    static constexpr int kBlock = kMxBlock;
+    __device__ static float expertOuter(const float*, const float*, int) { return 1.0f; }
+    __device__ static float dequant(const uint8_t* w, const uint8_t* scale, int k, float) {
+        const int biased = scale[k / kMxBlock];
+        const float exp2 = biased == kUe8m0Nan ? __uint_as_float(kFloatInf) : ue8m0Value(biased);
+        return bf16Round(__fmul_rn(e4m3ToFloat(w[k]), exp2));
+    }
+};
+
+// One output column n of expert e against the activation row x: the warp's dot product, valid in every lane.
+template <class Fmt>
+__device__ float expertColumn(const float* x, int e, int n, const uint8_t* w, const uint8_t* scale, const float* amax,
+                              const float* denominator, int n_dim, int k_dim) {
+    const size_t row = (size_t)e * n_dim + n;
+    const uint8_t* wr = w + row * (k_dim / Fmt::kPack);
+    const uint8_t* sr = scale + row * (k_dim / Fmt::kBlock);
+    const float outer = Fmt::expertOuter(amax, denominator, e);
+    float acc = 0.0f;
+    for (int k = threadIdx.x & 31; k < k_dim; k += 32) acc = __fmaf_rn(x[k], Fmt::dequant(wr, sr, k, outer), acc);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
+    return acc;
+}
+
+// Grid: x = (row, slot) pairs, y = tiles of kExWarps columns. act float [rows, k]; gu bf16 [rows * 8, n].
+template <class Fmt>
+__device__ void exGateUp(const float* act, const int* pick, const uint8_t* w, const uint8_t* scale, const float* amax,
+                         const float* denominator, __nv_bfloat16* gu, int pairs, int n_dim, int k_dim) {
+    const int p = blockIdx.x;
+    const int n = blockIdx.y * kExWarps + (threadIdx.x >> 5);
+    if (p >= pairs || n >= n_dim) return;
+    const float sum = expertColumn<Fmt>(act + (size_t)(p / kSlots) * k_dim, pick[p], n, w, scale, amax, denominator, n_dim, k_dim);
+    if ((threadIdx.x & 31) == 0) gu[(size_t)p * n_dim + n] = __float2bfloat16_rn(sum);
+}
+
+// act float [rows * 8, k] (the quantised SwiGLU output); dn float [rows * 8, n] holds the bf16-rounded value.
+template <class Fmt>
+__device__ void exDown(const float* act, const int* pick, const uint8_t* w, const uint8_t* scale, const float* amax,
+                       const float* denominator, float* dn, int pairs, int n_dim, int k_dim) {
+    const int p = blockIdx.x;
+    const int n = blockIdx.y * kExWarps + (threadIdx.x >> 5);
+    if (p >= pairs || n >= n_dim) return;
+    const float sum = expertColumn<Fmt>(act + (size_t)p * k_dim, pick[p], n, w, scale, amax, denominator, n_dim, k_dim);
+    if ((threadIdx.x & 31) == 0) dn[(size_t)p * n_dim + n] = bf16Round(sum);
+}
+
+extern "C" __global__ void tf_ink2l_ex_gu_nvfp4(const float* act, const int* pick, const uint8_t* w, const uint8_t* scale,
+                                                const float* amax, const float* denominator, __nv_bfloat16* gu, int pairs,
+                                                int n_dim, int k_dim) {
+    exGateUp<Nvfp4Fmt>(act, pick, w, scale, amax, denominator, gu, pairs, n_dim, k_dim);
+}
+
+extern "C" __global__ void tf_ink2l_ex_gu_mxfp8(const float* act, const int* pick, const uint8_t* w, const uint8_t* scale,
+                                                const float* amax, const float* denominator, __nv_bfloat16* gu, int pairs,
+                                                int n_dim, int k_dim) {
+    exGateUp<Mxfp8Fmt>(act, pick, w, scale, amax, denominator, gu, pairs, n_dim, k_dim);
+}
+
+extern "C" __global__ void tf_ink2l_ex_down_nvfp4(const float* act, const int* pick, const uint8_t* w, const uint8_t* scale,
+                                                  const float* amax, const float* denominator, float* dn, int pairs,
+                                                  int n_dim, int k_dim) {
+    exDown<Nvfp4Fmt>(act, pick, w, scale, amax, denominator, dn, pairs, n_dim, k_dim);
+}
+
+extern "C" __global__ void tf_ink2l_ex_down_mxfp8(const float* act, const int* pick, const uint8_t* w, const uint8_t* scale,
+                                                  const float* amax, const float* denominator, float* dn, int pairs,
+                                                  int n_dim, int k_dim) {
+    exDown<Mxfp8Fmt>(act, pick, w, scale, amax, denominator, dn, pairs, n_dim, k_dim);
+}
+
+__device__ __forceinline__ float sigmoidRef(float x) { return __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-x))); }
+
+// ref.ops.situ, one IEEE operation a statement as torch runs it: gate = even index, up = odd index of gu.
+// gu bf16 [pairs, 2 * inter], gamma float [pairs], y bf16 [pairs, inter].
+extern "C" __global__ void tf_ink2l_situ(const __nv_bfloat16* gu, const float* gamma, __nv_bfloat16* y, int pairs, int inter,
+                                         float gate_cap, float up_cap) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)pairs * inter) return;
+    const size_t p = i / inter;
+    const float g = __bfloat162float(gu[2 * i]);
+    const float u = __bfloat162float(gu[2 * i + 1]);
+    float act = __fmul_rn(__fmul_rn(gate_cap, tanhf(__fdiv_rn(g, gate_cap))), sigmoidRef(g));
+    act = __fmul_rn(act, __fmul_rn(up_cap, tanhf(__fdiv_rn(u, up_cap))));
+    y[i] = __float2bfloat16_rn(__fmul_rn(act, gamma[p]));
+}
+
+// out[row, c] = bf16(dn[row, 0, c] + dn[row, 1, c] + ... + dn[row, 7, c]), added in slot order from zero.
+extern "C" __global__ void tf_ink2l_ex_sum(const float* dn, __nv_bfloat16* out, int rows, int n_dim) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * n_dim) return;
+    const size_t row = i / n_dim;
+    const size_t c = i % n_dim;
+    float sum = 0.0f;
+    for (int slot = 0; slot < kSlots; ++slot) sum = __fadd_rn(sum, dn[(row * kSlots + slot) * n_dim + c]);
+    out[i] = __float2bfloat16_rn(sum);
 }
