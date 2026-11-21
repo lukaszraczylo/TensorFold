@@ -6,6 +6,7 @@ const ink2 = @import("inkling2");
 const usage =
     \\usage: tf-ink2-check <subcommand> --out DIR [options]
     \\smoke: fills a device buffer with tf_ink2l_fill and writes DIR/smoke.u32 (1024 words of 0xC0FFEE)
+    \\actq --in DIR: reads x_nvfp4_<k>.bf16 and x_mxfp8_<k>.bf16 (shapes in DIR/shapes.json), writes nvfp4_<k>.f32 and mxfp8_<k>.f32
     \\weights --model DIR [--layers A-B] [--readback NAME,...]: uploads the text weights (TF_INK2_EMBED_HOST=1 keeps the
     \\    embedding on the host), writes DIR/weights.json with peak_rss_mib and device_bytes, and one row per readback
     \\    tensor (names below model.llm., e.g. layers.0.attn.wo_ud.weight)
@@ -22,6 +23,7 @@ const Args = struct {
     sub: []const u8,
     out: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    in: ?[]const u8 = null,
     layers: ?ink2.budget.LayerRange = null,
     readback: ?[]const u8 = null,
 };
@@ -38,7 +40,7 @@ fn parseArgs(args: []const [:0]const u8) !Args {
     while (i < args.len) : (i += 2) {
         if (i + 1 >= args.len) return error.Usage;
         const v: []const u8 = args[i + 1];
-        if (std.mem.eql(u8, args[i], "--out")) a.out = v else if (std.mem.eql(u8, args[i], "--model")) a.model = v else if (std.mem.eql(u8, args[i], "--layers")) a.layers = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else return error.Usage;
+        if (std.mem.eql(u8, args[i], "--out")) a.out = v else if (std.mem.eql(u8, args[i], "--model")) a.model = v else if (std.mem.eql(u8, args[i], "--in")) a.in = v else if (std.mem.eql(u8, args[i], "--layers")) a.layers = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else return error.Usage;
     }
     return a;
 }
@@ -63,6 +65,13 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (std.mem.eql(u8, a.sub, "weights")) {
         try weights(init, a, out);
+        return 0;
+    }
+    if (std.mem.eql(u8, a.sub, "actq")) {
+        try actq(init, a.in orelse {
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }, out);
         return 0;
     }
     std.debug.print("unknown subcommand: {s}\n{s}", .{ a.sub, usage });
@@ -143,4 +152,60 @@ fn smoke(init: std.process.Init, out: []const u8) !void {
     defer rows.deinit();
     try rows.put("smoke", .u32, &.{smoke_words}, std.mem.sliceAsBytes(&host));
     try rows.finish();
+}
+
+const shapes_name = "shapes.json";
+const actq_kinds = [_]struct { prefix: []const u8, out: []const u8, mx: bool }{
+    .{ .prefix = "x_nvfp4_", .out = "nvfp4_", .mx = false },
+    .{ .prefix = "x_mxfp8_", .out = "mxfp8_", .mx = true },
+};
+
+/// Every `x_*_<k>` entry of shapes.json is [rows, k]; the key names its input file.
+fn actq(init: std.process.Init, in: []const u8, out: []const u8) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    var driver = try cuda.Driver.open();
+    defer driver.close();
+    var ctx = try cuda.Context.init(&driver, 0);
+    defer ctx.deinit();
+    var stream = try cuda.Stream.init(ctx.d, true);
+    defer stream.deinit();
+    var k = try ink2.loop_kernels.Kernels.load(ctx.d);
+    defer k.unload();
+
+    const in_dir = try std.Io.Dir.cwd().openDir(io, in, .{});
+    defer in_dir.close(io);
+    const text = try in_dir.readFileAlloc(io, shapes_name, gpa, .limited(1 << 16));
+    defer gpa.free(text);
+    const parsed = try std.json.parseFromSlice(std.json.ArrayHashMap([2]usize), gpa, text, .{});
+    defer parsed.deinit();
+
+    var rows_out = try ink2.check_rows.Writer.init(gpa, io, out);
+    defer rows_out.deinit();
+    for (actq_kinds) |kind| {
+        for (parsed.value.map.keys(), parsed.value.map.values()) |key, shape| {
+            if (!std.mem.startsWith(u8, key, kind.prefix)) continue;
+            const rows, const kdim = .{ shape[0], shape[1] };
+            const file = try std.fmt.allocPrint(gpa, "{s}.bf16", .{key});
+            defer gpa.free(file);
+            const x_host = try in_dir.readFileAlloc(io, file, gpa, .limited(rows * kdim * 2 + 1));
+            defer gpa.free(x_host);
+            if (x_host.len != rows * kdim * 2) return error.ShapeMismatch;
+
+            var x = try cuda.DeviceBuffer.alloc(ctx.d, x_host.len);
+            defer x.free();
+            var y = try cuda.DeviceBuffer.alloc(ctx.d, rows * kdim * 4);
+            defer y.free();
+            try x.upload(0, x_host);
+            if (kind.mx) try ink2.loop_kernels.actMxfp8(&k, stream, x.ptr, y.ptr, rows, kdim) else try ink2.loop_kernels.actNvfp4(&k, stream, x.ptr, y.ptr, rows, kdim);
+            try stream.synchronize();
+            const y_host = try gpa.alloc(u8, rows * kdim * 4);
+            defer gpa.free(y_host);
+            try y.download(0, y_host);
+            const name = try std.fmt.allocPrint(gpa, "{s}{s}", .{ kind.out, key[kind.prefix.len..] });
+            defer gpa.free(name);
+            try rows_out.put(name, .f32, &.{ rows, kdim }, y_host);
+        }
+    }
+    try rows_out.finish();
 }
