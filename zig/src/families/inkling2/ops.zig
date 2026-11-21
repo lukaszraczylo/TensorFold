@@ -75,6 +75,7 @@ pub const Kernels = struct {
     logsoftmax: cuda.Function,
     top1: cuda.Function,
     tobf: cuda.Function,
+    dense1: cuda.Function,
     put_words: cuda.Function,
     rewind: cuda.Function,
     race1: cuda.Function,
@@ -101,6 +102,7 @@ pub const Kernels = struct {
             .logsoftmax = try mod.function("tf_ink2_logsoftmax"),
             .top1 = try mod.function("tf_ink2_top1"),
             .tobf = try mod.function("tf_ink2_tobf"),
+            .dense1 = try mod.function("tf_ink2_dense1"),
             .put_words = try mod.function("tf_ink2_put_words"),
             .rewind = try mod.function("tf_ink2_conv_rewind"),
             .race1 = try mod.function("tf_ink2_race1"),
@@ -244,6 +246,32 @@ pub fn tobf(k: *const Kernels, s: cuda.Stream, x: u64, rows: usize, stride: usiz
     a.add(@as(i64, @intCast(col0)));
     a.add(int(width));
     try go(k.tobf, s, .{ .x = @intCast((width + 255) / 256), .y = @intCast(rows) }, 256, &a);
+}
+
+/// One projection of `dense1`: bf16 `out` [n] = bf16(x . w[n]), x bf16 [k], w bf16 [n, k].
+pub const DenseSeg = extern struct { x: u64, w: u64, out: u64, n: i32, block0: i32 };
+pub const dense_max_segs = 6;
+const DenseSegs = extern struct { s: [dense_max_segs]DenseSeg };
+const dense_cols_per_block = 8;
+
+/// Up to `dense_max_segs` one-row projections with a shared `k`, in one launch, rounded to bf16 in the epilogue; each sum keeps
+/// tf_dense_rows_1's order, so the result equals that kernel followed by `tobf`.
+pub fn dense1(k: *const Kernels, s: cuda.Stream, segs: []const DenseSeg, kdim: usize) !void {
+    if (segs.len == 0 or segs.len > dense_max_segs) return error.BadSegments;
+    if (kdim % 8 != 0) return error.Misaligned;
+    var args_segs: DenseSegs = .{ .s = @splat(.{ .x = 0, .w = 0, .out = 0, .n = 0, .block0 = 0 }) };
+    var blocks: usize = 0;
+    for (segs, 0..) |sg, i| {
+        if (sg.x % 16 != 0 or sg.w % 16 != 0) return error.Misaligned;
+        args_segs.s[i] = sg;
+        args_segs.s[i].block0 = @intCast(blocks);
+        blocks += (@as(usize, @intCast(sg.n)) + dense_cols_per_block - 1) / dense_cols_per_block;
+    }
+    var a: cuda.Args = .{};
+    a.add(args_segs);
+    a.add(int(segs.len));
+    a.add(int(kdim));
+    try go(k.dense1, s, .{ .x = @intCast(blocks) }, dense_cols_per_block * 32, &a);
 }
 
 /// ops.cu's Ink2Words: a link step's header and ids, passed by value.

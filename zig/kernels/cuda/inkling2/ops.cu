@@ -613,6 +613,64 @@ extern "C" __global__ void tf_ink2_tobf(const float* __restrict__ x, long long s
     out[row * out_stride + col0 + i] = i < n ? tobf(x[row * stride + i]) : static_cast<uint16_t>(0xff80u);
 }
 
+// One-row bf16 projections of up to six (input, weight) pairs in one launch: out[n] = bf16(x . w[n]), each sum in the order of
+// tf_dense_rows_1 (lane l: k = 8 l + 256 j, an fmaf chain over each 8, then the xor tree) so it matches that kernel and tobf.
+// Blocks of 8 warps, a warp a column; a segment owns the blocks from block0.
+constexpr int kDenseSegs = 6;
+constexpr int kDenseWarps = 8;
+constexpr int kDenseDepth = 9;  // 16-byte weight loads a lane issues before it accumulates them
+
+struct Ink2DenseSeg {
+    const uint16_t* x;
+    const uint16_t* w;
+    uint16_t* out;
+    int n;
+    int block0;
+};
+
+struct Ink2DenseSegs {
+    Ink2DenseSeg s[kDenseSegs];
+};
+
+__device__ __forceinline__ float dotWord(uint32_t xw, uint32_t ww, float acc) {
+    acc = __fmaf_rn(__uint_as_float(xw << 16), __uint_as_float(ww << 16), acc);
+    return __fmaf_rn(__uint_as_float(xw & 0xffff0000u), __uint_as_float(ww & 0xffff0000u), acc);
+}
+
+extern "C" __global__ void __launch_bounds__(kDenseWarps * 32) tf_ink2_dense1(const Ink2DenseSegs a, int count, int k) {
+    using namespace ink2o;
+    int si = 0;
+    while (si + 1 < count && static_cast<int>(blockIdx.x) >= a.s[si + 1].block0) ++si;
+    const Ink2DenseSeg sg = a.s[si];
+    const int lane = threadIdx.x & 31;
+    const int col = (blockIdx.x - sg.block0) * kDenseWarps + (threadIdx.x >> 5);
+    if (col >= sg.n) return;
+    const uint16_t* wr = sg.w + static_cast<size_t>(col) * k;
+    float acc = 0.0f;
+    for (int c0 = lane * 8; c0 < k; c0 += 256 * kDenseDepth) {
+        uint4 wv[kDenseDepth], xv[kDenseDepth];
+#pragma unroll
+        for (int u = 0; u < kDenseDepth; ++u) {
+            const int kk = c0 + 256 * u;
+            if (kk < k) {
+                wv[u] = *reinterpret_cast<const uint4*>(wr + kk);
+                xv[u] = *reinterpret_cast<const uint4*>(sg.x + kk);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kDenseDepth; ++u) {
+            if (c0 + 256 * u < k) {
+                acc = dotWord(xv[u].x, wv[u].x, acc);
+                acc = dotWord(xv[u].y, wv[u].y, acc);
+                acc = dotWord(xv[u].z, wv[u].z, acc);
+                acc = dotWord(xv[u].w, wv[u].w, acc);
+            }
+        }
+    }
+    for (int m = 16; m > 0; m >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xFFFFFFFFu, acc, m));
+    if (lane == 0) sg.out[col] = tobf(acc);
+}
+
 // A link step's words (header and ids) written to the device buffer every rank broadcasts from.
 struct Ink2Words {
     unsigned w[96];

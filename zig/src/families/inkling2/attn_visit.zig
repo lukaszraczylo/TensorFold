@@ -63,6 +63,26 @@ fn linear(c: *const engine.Ctx, s: cuda.Stream, x: u64, w: Dev, rows: usize, n: 
     try ops.tobf(&c.ops, s, tmp, rows, n, n, out, n, 0, n);
 }
 
+/// The six single-row projections of a visit (wq, wr, gate_attn, sink on x0; wk on x1; wv on x2) in one launch, each rounded to bf16.
+fn linearsOneRow(c: *const engine.Ctx, s: cuda.Stream, x: [3]u64, lw: *const weights.LayerW, dims: [4]usize, hidden: usize) !void {
+    const r = c.scratch.r;
+    const q_dim, const rel_dim, const heads, const kv_dim = dims;
+    const parts = [_]struct { x: u64, w: Dev, out: u64, n: usize }{
+        .{ .x = x[0], .w = lw.wq_du, .out = r.q_raw, .n = q_dim },
+        .{ .x = x[0], .w = lw.wr_du, .out = r.r_raw, .n = rel_dim },
+        .{ .x = x[0], .w = lw.gate_attn, .out = r.gate, .n = q_dim },
+        .{ .x = x[0], .w = lw.attn_sink_proj, .out = r.sink, .n = heads },
+        .{ .x = x[1], .w = lw.wk_dv, .out = r.k_raw, .n = kv_dim },
+        .{ .x = x[2], .w = lw.wv_dv, .out = r.v_raw, .n = kv_dim },
+    };
+    var segs: [parts.len]ops.DenseSeg = undefined;
+    for (parts, &segs) |p, *sg| {
+        try shaped(p.w, "linear", &.{ p.n, hidden });
+        sg.* = .{ .x = p.x, .w = p.w.ptr, .out = p.out, .n = @intCast(p.n), .block0 = 0 };
+    }
+    try ops.dense1(&c.ops, s, &segs, hidden);
+}
+
 /// The K or V conv of the visit: static taps on a local layer, taps from the stream's own input on a global one.
 fn shortConv(c: *const engine.Ctx, s: cuda.Stream, v: visits.Visit, which: cache_mod.Conv, w: Dev, proj: ?Dev, x_in: u64, x_raw: u64, out: u64, rows: usize, stream: u32) !void {
     const g = c.scratch.geometry;
@@ -104,12 +124,16 @@ pub fn run(c: *engine.Ctx, s: cuda.Stream, v: visits.Visit, lw: *const weights.L
     try validate(g, layer, v, lw, rows, p0, stream, c.cache.layout.streams);
     const q_dim, const kv_dim, const rel_dim = .{ g.qDim(), g.kvDim(), g.relDim() };
 
-    try linear(c, s, x[0], lw.wq_du, rows, q_dim, g.hidden, r.q_raw);
-    try linear(c, s, x[0], lw.wr_du, rows, rel_dim, g.hidden, r.r_raw);
-    try linear(c, s, x[0], lw.gate_attn, rows, q_dim, g.hidden, r.gate);
-    try linear(c, s, x[0], lw.attn_sink_proj, rows, g.heads, g.hidden, r.sink);
-    try linear(c, s, x[1], lw.wk_dv, rows, kv_dim, g.hidden, r.k_raw);
-    try linear(c, s, x[2], lw.wv_dv, rows, kv_dim, g.hidden, r.v_raw);
+    if (rows == 1) {
+        try linearsOneRow(c, s, x, lw, .{ q_dim, rel_dim, g.heads, kv_dim }, g.hidden);
+    } else {
+        try linear(c, s, x[0], lw.wq_du, rows, q_dim, g.hidden, r.q_raw);
+        try linear(c, s, x[0], lw.wr_du, rows, rel_dim, g.hidden, r.r_raw);
+        try linear(c, s, x[0], lw.gate_attn, rows, q_dim, g.hidden, r.gate);
+        try linear(c, s, x[0], lw.attn_sink_proj, rows, g.heads, g.hidden, r.sink);
+        try linear(c, s, x[1], lw.wk_dv, rows, kv_dim, g.hidden, r.k_raw);
+        try linear(c, s, x[2], lw.wv_dv, rows, kv_dim, g.hidden, r.v_raw);
+    }
     try shortConv(c, s, v, .k, lw.k_sconv, lw.k_sconv_proj, x[1], r.k_raw, r.k_conv, rows, stream);
     try shortConv(c, s, v, .v, lw.v_sconv, lw.v_sconv_proj, x[2], r.v_raw, r.v_conv, rows, stream);
 
@@ -137,7 +161,12 @@ pub fn run(c: *engine.Ctx, s: cuda.Stream, v: visits.Visit, lw: *const weights.L
     try kernels.prep(&c.attn, s, call, layer, prep, .{ r.q_raw, r.k_conv, r.v_conv, r.r_raw }, .{ lw.q_l2_clip.ptr, lw.rel_l2_clip.ptr }, r.q, r.rel, kv);
     try kernels.relTable(&c.attn, s, call, r.rel, lw.rel_logits_proj.ptr, r.table);
     try kernels.attend(&c.attn, s, call, layer, g.stride, g.slots(), r.q, kv, r.table, r.part_o, r.part_ml, r.sink, r.gate, r.out);
-    try linear(c, s, r.out, lw.wo_ud, rows, g.hidden, q_dim, out);
+    if (rows == 1) {
+        try shaped(lw.wo_ud, "linear", &.{ g.hidden, q_dim });
+        try ops.dense1(&c.ops, s, &.{.{ .x = r.out, .w = lw.wo_ud.ptr, .out = out, .n = @intCast(g.hidden), .block0 = 0 }}, q_dim);
+    } else {
+        try linear(c, s, r.out, lw.wo_ud, rows, g.hidden, q_dim, out);
+    }
     try applyEdit(c, s, v.layer, out, rows);
 }
 
