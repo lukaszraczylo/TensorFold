@@ -8,7 +8,7 @@ const usage =
     \\usage: tf-ink2-check <subcommand> --out DIR [options]
     \\smoke: fills a device buffer with tf_ink2l_fill and writes DIR/smoke.u32 (1024 words of 0xC0FFEE)
     \\actq --in DIR: reads x_nvfp4_<k>.bf16 and x_mxfp8_<k>.bf16 (shapes in DIR/shapes.json), writes nvfp4_<k>.f32 and mxfp8_<k>.f32 (dequantised), nvfp4_values_/nvfp4_scales_/nvfp4_amax_<k>.f32, mxfp8_values_<k>.f32 and mxfp8_exps_<k>.u8
-    \\moe --model DIR --layers L-L --rows N --in DIR: reads DIR/x.bf16 ([N, 2304]), runs layer L's routed MoE, writes out.bf16, pick.i32 ([N, 8]) and gamma.f32 ([N, 8])
+    \\moe --model DIR --layers L-L --rows N [--path naive|grouped] --in DIR: reads DIR/x.bf16 ([N, 2304]), runs layer L's routed MoE, writes out.bf16, pick.i32 ([N, 8]) and gamma.f32 ([N, 8])
     \\loop --model DIR --layer L --rows N --in DIR: reads bank.bf16 ([2, N, 2304]), dest.f32 ([N, 2304]) and norm.bf16 ([2304]), runs core layer L's four cross-pass messages and controllers, writes msgs.f32 ([4, N, 2304]) and ctl_<attn|k|v|mlp>.bf16 ([N, 2304])
     \\ablit --file F --layer L --mult M --in DIR: reads DIR/y.bf16 ([N, 2304]), applies the edit file F at layer L with scale multiplier M, writes y.bf16
     \\attn --model DIR --layer L --pass P --n N --rows R [--pos0 P0] --in DIR: reads DIR/xs.bf16 ([N, 3, 2304]: xq, xk, xv a step), runs the visit (L, P)'s attention on them R rows a call from position P0 with the visit's caches carried (P0 > 0: k0.bf16 and v0.bf16 [keep, 8, 128] fill the rows before it), writes out.bf16 ([N, 2304], the wo_ud projection)
@@ -55,6 +55,7 @@ const Args = struct {
     ids: ?[]const u8 = null,
     chunk_rows: u32 = ink2.prefill.default_chunk_rows,
     decode: usize = 0,
+    path: ?[]const u8 = null,
 };
 
 fn parseLayers(text: []const u8) !ink2.budget.LayerRange {
@@ -71,7 +72,7 @@ fn parseArgs(args: []const [:0]const u8) !Args {
         const v: []const u8 = args[i + 1];
         if (std.mem.eql(u8, args[i], "--out")) a.out = v else if (std.mem.eql(u8, args[i], "--model")) a.model = v else if (std.mem.eql(u8, args[i], "--in")) a.in = v else if (std.mem.eql(u8, args[i], "--layers")) {
             if (std.mem.eql(u8, v, staged_layers)) a.staged = true else a.layers = try parseLayers(v);
-        } else if (std.mem.eql(u8, args[i], "--steps")) a.steps = v else if (std.mem.eql(u8, args[i], "--teacher")) a.teacher = v else if (std.mem.eql(u8, args[i], "--visits")) a.visits = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--dump-kv")) a.dump_kv = v else if (std.mem.eql(u8, args[i], "--prompts")) a.prompts = v else if (std.mem.eql(u8, args[i], "--ids")) a.ids = v else if (std.mem.eql(u8, args[i], "--chunk-rows")) a.chunk_rows = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--decode")) a.decode = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else if (std.mem.eql(u8, args[i], "--pass")) a.pass = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--pos0")) a.pos0 = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--n")) a.n = try std.fmt.parseInt(usize, v, 10) else return error.Usage;
+        } else if (std.mem.eql(u8, args[i], "--steps")) a.steps = v else if (std.mem.eql(u8, args[i], "--teacher")) a.teacher = v else if (std.mem.eql(u8, args[i], "--visits")) a.visits = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--dump-kv")) a.dump_kv = v else if (std.mem.eql(u8, args[i], "--prompts")) a.prompts = v else if (std.mem.eql(u8, args[i], "--ids")) a.ids = v else if (std.mem.eql(u8, args[i], "--chunk-rows")) a.chunk_rows = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--decode")) a.decode = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--path")) a.path = v else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else if (std.mem.eql(u8, args[i], "--pass")) a.pass = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--pos0")) a.pos0 = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--n")) a.n = try std.fmt.parseInt(usize, v, 10) else return error.Usage;
     }
     return a;
 }
@@ -433,7 +434,7 @@ fn ablitRows(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !
 }
 
 const moe_x_name = "x.bf16";
-const moe_max_rows = 16;
+const moe_max_rows = 512;
 
 /// Layer L (`--layers L-L`) of the model on the rows of DIR/x.bf16; the layer's router picks and weights are written too.
 fn moe(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !void {
@@ -476,8 +477,21 @@ fn moe(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !void {
     defer sc.deinit();
 
     const env: m.Env = .{ .driver = ctx.d, .loop = &loop, .ops = &op };
-    try m.forward(&env, stream, &w.layers[range.first], w.prec[range.first], x.ptr, y.ptr, rows, &sc);
+    const path: m.Path = if (a.path) |p| (std.meta.stringToEnum(m.Path, p) orelse return error.Usage) else m.pathFor(rows);
+    const layer = &w.layers[range.first];
+    // one untimed run loads the module's code; the timed one is the second
+    try m.forwardPath(&env, stream, layer, w.prec[range.first], x.ptr, y.ptr, rows, &sc, path);
     try stream.synchronize();
+    var t0 = try cuda.Event.init(ctx.d, true);
+    defer t0.deinit();
+    var t1 = try cuda.Event.init(ctx.d, true);
+    defer t1.deinit();
+    try t0.record(stream);
+    try m.forwardPath(&env, stream, layer, w.prec[range.first], x.ptr, y.ptr, rows, &sc, path);
+    try t1.record(stream);
+    try stream.synchronize();
+    const ms = try cuda.Event.elapsedMs(t0, t1);
+    std.debug.print("moe layer {d} rows {d} path {s}: {d:.2} ms\n", .{ range.first, rows, @tagName(path), ms });
 
     var rows_out = try ink2.check_rows.Writer.init(gpa, io, out);
     defer rows_out.deinit();
@@ -1063,11 +1077,19 @@ fn greedyRun(init: std.process.Init, a: Args, out: []const u8) !void {
     const tokens = try gpa.alloc(u32, prompts.len * n);
     defer gpa.free(tokens);
 
+    var t_start = try cuda.Event.init(c.d, true);
+    defer t_start.deinit();
+    var t_end = try cuda.Event.init(c.d, true);
+    defer t_end.deinit();
     const last = session.sched.n - 1;
     for (prompts, 0..) |ids, p| {
         try session.cache.clear(session.stream, 0);
+        try t_start.record(session.stream);
         try ink2.prefill.run(c, session.stream, 0, ids, a.chunk_rows, head_run.scratch.r.logits, .{});
+        try t_end.record(session.stream);
         var pick = try head_run.finish();
+        const prefill_ms = try cuda.Event.elapsedMs(t_start, t_end);
+        std.debug.print("prefill prompt {d}: {d} ids, chunk rows {d}, {d:.1} ms, {d:.1} tokens/s\n", .{ p, ids.len, a.chunk_rows, prefill_ms, @as(f64, @floatFromInt(ids.len)) * 1000.0 / prefill_ms });
         var g: usize = 0;
         while (true) {
             tokens[p * n + g] = pick;
@@ -1089,7 +1111,7 @@ fn greedyRun(init: std.process.Init, a: Args, out: []const u8) !void {
 fn sessionBytes(session: *const Session, head_scratch: u64) u64 {
     const c = &session.c;
     var total: u64 = session.cache.kv.len + session.cache.conv.len + c.scratch.mem.len + c.flow.mem.len + head_scratch;
-    inline for (.{ "scores", "pick", "gamma", "act", "gu", "y", "yq", "dn" }) |f| total += @field(c.moe_sc, f).len;
+    inline for (.{ "scores", "pick", "gamma", "act", "gu", "y", "yq", "dn", "items", "offsets", "counts" }) |f| total += @field(c.moe_sc, f).len;
     return total;
 }
 

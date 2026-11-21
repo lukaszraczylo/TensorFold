@@ -11,6 +11,10 @@ pub const nvfp4_block = 16;
 pub const mxfp8_block = 32;
 /// Columns a block of the expert GEMVs computes (loop.cu's kExWarps: a warp a column).
 pub const expert_tile = 8;
+/// Pairs of one expert and columns a block of the grouped expert kernels computes; loop.cu's kGroupPairs and kGroupCols.
+pub const group_pairs = 16;
+pub const group_cols = 64;
+const group_threads = 256;
 /// Experts a row picks.
 pub const expert_slots = 8;
 const elementwise_threads = 256;
@@ -36,6 +40,11 @@ pub const Kernels = struct {
     ex_gu_mxfp8: cuda.Function,
     ex_down_nvfp4: cuda.Function,
     ex_down_mxfp8: cuda.Function,
+    group: cuda.Function,
+    exg_gu_nvfp4: cuda.Function,
+    exg_gu_mxfp8: cuda.Function,
+    exg_down_nvfp4: cuda.Function,
+    exg_down_mxfp8: cuda.Function,
     situ: cuda.Function,
     ex_sum: cuda.Function,
     msg: cuda.Function,
@@ -61,6 +70,11 @@ pub const Kernels = struct {
             .ex_gu_mxfp8 = try mod.function("tf_ink2l_ex_gu_mxfp8"),
             .ex_down_nvfp4 = try mod.function("tf_ink2l_ex_down_nvfp4"),
             .ex_down_mxfp8 = try mod.function("tf_ink2l_ex_down_mxfp8"),
+            .group = try mod.function("tf_ink2l_group"),
+            .exg_gu_nvfp4 = try mod.function("tf_ink2l_exg_gu_nvfp4"),
+            .exg_gu_mxfp8 = try mod.function("tf_ink2l_exg_gu_mxfp8"),
+            .exg_down_nvfp4 = try mod.function("tf_ink2l_exg_down_nvfp4"),
+            .exg_down_mxfp8 = try mod.function("tf_ink2l_exg_down_mxfp8"),
             .situ = try mod.function("tf_ink2l_situ"),
             .ex_sum = try mod.function("tf_ink2l_ex_sum"),
             .msg = try mod.function("tf_ink2l_msg"),
@@ -164,6 +178,40 @@ pub fn expertDown(k: *const Kernels, s: cuda.Stream, prec: plan.Precision, act: 
     return expertGemm(if (prec == .nvfp4) k.ex_down_nvfp4 else k.ex_down_mxfp8, s, act, pick, g, dn, rows, n, kdim);
 }
 
+/// Pairs of `rows` rows sorted by expert: `items` int32 [rows * 8] holds pair ids (row * 8 + slot) grouped by expert in
+/// pair order, `offsets` int32 [experts + 1] the group starts, `counts` int32 [experts] the group sizes.
+pub fn expertGroup(k: *const Kernels, s: cuda.Stream, pick: u64, rows: usize, experts: usize, offsets: u64, items: u64, counts: u64) !void {
+    if (rows == 0) return;
+    var args: cuda.Args = .{};
+    args.add(pick);
+    args.add(@as(i32, @intCast(rows)));
+    args.add(@as(i32, @intCast(experts)));
+    args.add(@as(i32, expert_slots));
+    for ([_]u64{ offsets, items, counts }) |v| args.add(v);
+    try cuda.launch.launch(k.group, .{ .grid = .{ .x = 1 }, .block = .{ .x = group_threads } }, s, &args);
+}
+
+fn expertGrouped(f: cuda.Function, s: cuda.Stream, act: u64, offsets: u64, items: u64, g: ExpertGemm, out: u64, rows: usize, experts: usize, n: usize, k: usize) !void {
+    if (n == 0 or k == 0 or k % mxfp8_block != 0) return error.BadWidth;
+    if (rows == 0) return;
+    var args: cuda.Args = .{};
+    for ([_]u64{ act, offsets, items, g.w, g.scale, g.amax, g.outer, out }) |v| args.add(v);
+    for ([_]usize{ n, k }) |v| args.add(@as(i32, @intCast(v)));
+    const col_tiles = (n + group_cols - 1) / group_cols;
+    const pair_tiles = (rows + group_pairs - 1) / group_pairs;
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(col_tiles), .y = @intCast(experts), .z = @intCast(pair_tiles) }, .block = .{ .x = actq_threads } }, s, &args);
+}
+
+/// As `expertGateUp` on the sorted pairs of `expertGroup`; the result of pair p lands at gu row p.
+pub fn expertGateUpGrouped(k: *const Kernels, s: cuda.Stream, prec: plan.Precision, act: u64, offsets: u64, items: u64, g: ExpertGemm, gu: u64, rows: usize, experts: usize, n: usize, kdim: usize) !void {
+    return expertGrouped(if (prec == .nvfp4) k.exg_gu_nvfp4 else k.exg_gu_mxfp8, s, act, offsets, items, g, gu, rows, experts, n, kdim);
+}
+
+/// As `expertDown` on the sorted pairs of `expertGroup`.
+pub fn expertDownGrouped(k: *const Kernels, s: cuda.Stream, prec: plan.Precision, act: u64, offsets: u64, items: u64, g: ExpertGemm, dn: u64, rows: usize, experts: usize, n: usize, kdim: usize) !void {
+    return expertGrouped(if (prec == .nvfp4) k.exg_down_nvfp4 else k.exg_down_mxfp8, s, act, offsets, items, g, dn, rows, experts, n, kdim);
+}
+
 /// ref.ops.situ over rows * 8 pairs: gu bf16 [pairs, 2 * inter], gamma float32 [pairs], y bf16 [pairs, inter].
 pub fn situ(k: *const Kernels, s: cuda.Stream, gu: u64, gamma: u64, y: u64, rows: usize, inter: usize, gate_cap: f32, up_cap: f32) !void {
     if (rows == 0) return;
@@ -245,7 +293,7 @@ test "actq launches one block a row and refuses a width off the block" {
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16), .mix_add = fun.of(&d, 17), .mix_f32 = fun.of(&d, 18) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16), .mix_add = fun.of(&d, 17), .mix_f32 = fun.of(&d, 18), .group = fun.of(&d, 19), .exg_gu_nvfp4 = fun.of(&d, 20), .exg_gu_mxfp8 = fun.of(&d, 21), .exg_down_nvfp4 = fun.of(&d, 22), .exg_down_mxfp8 = fun.of(&d, 23) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     try actNvfp4(&k, s, 0x1000, 0x2000, 64, 2304);
     try std.testing.expectEqual(@as(u32, 64), Fake.grid_x);
@@ -277,7 +325,7 @@ test "expert stages pick the format's kernel and launch a block a pair by column
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16), .mix_add = fun.of(&d, 17), .mix_f32 = fun.of(&d, 18) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16), .mix_add = fun.of(&d, 17), .mix_f32 = fun.of(&d, 18), .group = fun.of(&d, 19), .exg_gu_nvfp4 = fun.of(&d, 20), .exg_gu_mxfp8 = fun.of(&d, 21), .exg_down_nvfp4 = fun.of(&d, 22), .exg_down_mxfp8 = fun.of(&d, 23) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     const g: ExpertGemm = .{ .w = 1, .scale = 2 };
     try expertGateUp(&k, s, .nvfp4, 0, 0, g, 0, 4, 2304, 2304);
@@ -296,6 +344,39 @@ test "expert stages pick the format's kernel and launch a block a pair by column
     try std.testing.expectEqual(@as(usize, 11), Fake.which);
     const launched = Fake.count;
     try std.testing.expectError(error.BadWidth, expertGateUp(&k, s, .nvfp4, 0, 0, g, 0, 1, 2304, 1136));
+    try std.testing.expectEqual(launched, Fake.count);
+}
+
+test "grouped expert stages launch a grid of column tiles by experts by pair tiles" {
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Fake.launch;
+    const fun = struct {
+        fn of(drv: *const cuda.Driver, i: usize) cuda.Function {
+            return .{ .d = drv, .handle = @ptrFromInt(i) };
+        }
+    };
+    var k: Kernels = undefined;
+    k.group = fun.of(&d, 19);
+    k.exg_gu_nvfp4 = fun.of(&d, 20);
+    k.exg_gu_mxfp8 = fun.of(&d, 21);
+    k.exg_down_nvfp4 = fun.of(&d, 22);
+    k.exg_down_mxfp8 = fun.of(&d, 23);
+    const s: cuda.Stream = .{ .d = &d, .handle = null };
+    const g: ExpertGemm = .{ .w = 1, .scale = 2 };
+    try expertGroup(&k, s, 0, 17, 128, 0, 0, 0);
+    try std.testing.expectEqual(@as(usize, 19), Fake.which);
+    try std.testing.expectEqual(@as(u32, 1), Fake.grid_x);
+    try expertGateUpGrouped(&k, s, .nvfp4, 0, 0, 0, g, 0, 512, 128, 2304, 2304);
+    try std.testing.expectEqual(@as(usize, 20), Fake.which);
+    try std.testing.expectEqual(@as(u32, 36), Fake.grid_x);
+    try expertGateUpGrouped(&k, s, .mxfp8, 0, 0, 0, g, 0, 17, 128, 2304, 2304);
+    try std.testing.expectEqual(@as(usize, 21), Fake.which);
+    try expertDownGrouped(&k, s, .nvfp4, 0, 0, 0, g, 0, 17, 128, 2304, 1152);
+    try std.testing.expectEqual(@as(usize, 22), Fake.which);
+    try expertDownGrouped(&k, s, .mxfp8, 0, 0, 0, g, 0, 17, 128, 2304, 1152);
+    try std.testing.expectEqual(@as(usize, 23), Fake.which);
+    const launched = Fake.count;
+    try std.testing.expectError(error.BadWidth, expertDownGrouped(&k, s, .nvfp4, 0, 0, 0, g, 0, 17, 128, 2304, 1136));
     try std.testing.expectEqual(launched, Fake.count);
 }
 

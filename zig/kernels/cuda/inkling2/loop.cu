@@ -303,6 +303,121 @@ extern "C" __global__ void tf_ink2l_ex_down_mxfp8(const float* act, const int* p
     exDown<Mxfp8Fmt>(act, pick, w, scale, amax, denominator, dn, pairs, n_dim, k_dim);
 }
 
+// ---- Grouped expert path (prompt rows): (row, slot) pairs sorted by expert, a block a tile of one expert's pairs ----
+// Every pair's dot keeps expertColumn's order (lane-strided fmaf over k, then the xor tree), so a pair's value is bit-identical
+// to the per-pair kernels'; the tile only shares each dequantised weight across its pairs.
+constexpr int kGroupPairs = 16;                        // pairs of one expert a block holds
+constexpr int kGroupCols = 64;                         // output columns a block computes
+constexpr int kGroupPasses = kGroupCols / kExWarps;    // columns a warp computes in turn
+
+// Counting sort of the (row, slot) pairs by expert, stable in pair order. One block; offsets has experts + 1 entries.
+extern "C" __global__ void tf_ink2l_group(const int* pick, int rows, int experts, int top, int* offsets, int* items, int* counts) {
+    const int pairs = rows * top;
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+        int n = 0;
+        for (int p = 0; p < pairs; ++p) n += pick[p] == e;
+        counts[e] = n;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int sum = 0;
+        for (int e = 0; e < experts; ++e) {
+            offsets[e] = sum;
+            sum += counts[e];
+        }
+        offsets[experts] = sum;
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+        int at = offsets[e];
+        for (int p = 0; p < pairs; ++p) {
+            if (pick[p] == e) items[at++] = p;
+        }
+    }
+}
+
+// Grid: x = column tiles, y = experts, z = tiles of kGroupPairs pairs (an expert gets at most `rows` pairs).
+// Pair p reads act row p / act_div; store(p, n, sum) writes the result of column n.
+template <class Fmt, class Store>
+__device__ void exGrouped(const float* act, int act_div, const int* offsets, const int* items, const uint8_t* w,
+                          const uint8_t* scale, const float* amax, const float* denominator, int n_dim, int k_dim, Store store) {
+    const int e = blockIdx.y;
+    const int begin = offsets[e];
+    const int first = blockIdx.z * kGroupPairs;
+    const int count = min(offsets[e + 1] - begin - first, kGroupPairs);
+    if (count <= 0) return;
+    __shared__ int pair[kGroupPairs];
+    if (threadIdx.x < count) pair[threadIdx.x] = items[begin + first + threadIdx.x];
+    __syncthreads();
+    const float* x[kGroupPairs];
+    #pragma unroll
+    for (int i = 0; i < kGroupPairs; ++i) x[i] = act + (size_t)(pair[i < count ? i : 0] / act_div) * k_dim;
+    const float outer = Fmt::expertOuter(amax, denominator, e);
+    const int lane = threadIdx.x & 31;
+    for (int j = 0; j < kGroupPasses; ++j) {
+        const int n = blockIdx.x * kGroupCols + (threadIdx.x >> 5) + j * kExWarps;
+        if (n >= n_dim) break;
+        const size_t row = (size_t)e * n_dim + n;
+        const uint8_t* wr = w + row * (k_dim / Fmt::kPack);
+        const uint8_t* sr = scale + row * (k_dim / Fmt::kBlock);
+        float acc[kGroupPairs];
+        #pragma unroll
+        for (int i = 0; i < kGroupPairs; ++i) acc[i] = 0.0f;
+        for (int k = lane; k < k_dim; k += 32) {
+            const float wv = Fmt::dequant(wr, sr, k, outer);
+            #pragma unroll
+            for (int i = 0; i < kGroupPairs; ++i) {
+                if (i < count) acc[i] = __fmaf_rn(x[i][k], wv, acc[i]);
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < kGroupPairs; ++i) {
+            if (i >= count) continue;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) acc[i] = __fadd_rn(acc[i], __shfl_xor_sync(0xffffffffu, acc[i], o));
+            if (lane == 0) store(pair[i], n, acc[i]);
+        }
+    }
+}
+
+template <class Fmt>
+__device__ void exgGateUp(const float* act, const int* offsets, const int* items, const uint8_t* w, const uint8_t* scale,
+                          const float* amax, const float* denominator, __nv_bfloat16* gu, int n_dim, int k_dim) {
+    exGrouped<Fmt>(act, kSlots, offsets, items, w, scale, amax, denominator, n_dim, k_dim,
+                   [&](int p, int n, float sum) { gu[(size_t)p * n_dim + n] = __float2bfloat16_rn(sum); });
+}
+
+template <class Fmt>
+__device__ void exgDown(const float* act, const int* offsets, const int* items, const uint8_t* w, const uint8_t* scale,
+                        const float* amax, const float* denominator, float* dn, int n_dim, int k_dim) {
+    exGrouped<Fmt>(act, 1, offsets, items, w, scale, amax, denominator, n_dim, k_dim,
+                   [&](int p, int n, float sum) { dn[(size_t)p * n_dim + n] = bf16Round(sum); });
+}
+
+extern "C" __global__ void tf_ink2l_exg_gu_nvfp4(const float* act, const int* offsets, const int* items, const uint8_t* w,
+                                                 const uint8_t* scale, const float* amax, const float* denominator,
+                                                 __nv_bfloat16* gu, int n_dim, int k_dim) {
+    exgGateUp<Nvfp4Fmt>(act, offsets, items, w, scale, amax, denominator, gu, n_dim, k_dim);
+}
+
+extern "C" __global__ void tf_ink2l_exg_gu_mxfp8(const float* act, const int* offsets, const int* items, const uint8_t* w,
+                                                 const uint8_t* scale, const float* amax, const float* denominator,
+                                                 __nv_bfloat16* gu, int n_dim, int k_dim) {
+    exgGateUp<Mxfp8Fmt>(act, offsets, items, w, scale, amax, denominator, gu, n_dim, k_dim);
+}
+
+extern "C" __global__ void tf_ink2l_exg_down_nvfp4(const float* act, const int* offsets, const int* items, const uint8_t* w,
+                                                   const uint8_t* scale, const float* amax, const float* denominator,
+                                                   float* dn, int n_dim, int k_dim) {
+    exgDown<Nvfp4Fmt>(act, offsets, items, w, scale, amax, denominator, dn, n_dim, k_dim);
+}
+
+extern "C" __global__ void tf_ink2l_exg_down_mxfp8(const float* act, const int* offsets, const int* items, const uint8_t* w,
+                                                   const uint8_t* scale, const float* amax, const float* denominator,
+                                                   float* dn, int n_dim, int k_dim) {
+    exgDown<Mxfp8Fmt>(act, offsets, items, w, scale, amax, denominator, dn, n_dim, k_dim);
+}
+
 __device__ __forceinline__ float sigmoidRef(float x) { return __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-x))); }
 
 // ref.ops.situ, one IEEE operation a statement as torch runs it: gate = even index, up = odd index of gu.
