@@ -18,9 +18,9 @@ const config_file = "config.json";
 const config_max_bytes = 1 << 20;
 const max_rank = 4;
 const bad_log_limit = 5;
+const diag_bytes = 2048;
 
-/// The streams of a layer's controllers, in the order of `names.controller_streams`.
-const stream_order = [_][]const u8{ "attn", "k", "v", "mlp" };
+const stream_order = names.controller_streams;
 
 /// A tensor on the device: its address, byte count and the checkpoint's dtype and shape.
 pub const Dev = struct { ptr: u64, bytes: usize, dtype: st.DType, shape: [max_rank]u64, rank: u8 };
@@ -227,8 +227,9 @@ pub const Weights = struct {
     }
 
     fn put(w: *Weights, item: Item, tensor: core.checkpoint.Tensor) !void {
+        try w.held.ensureUnusedCapacity(w.gpa, 1);
         const ptr = try w.up.vtable.alloc(w.up.ctx, tensor.bytes.len);
-        try w.held.append(w.gpa, .{ .ptr = ptr, .bytes = tensor.bytes.len });
+        w.held.appendAssumeCapacity(.{ .ptr = ptr, .bytes = tensor.bytes.len });
         try w.up.vtable.upload(w.up.ctx, ptr, tensor.bytes);
         w.device_bytes += tensor.bytes.len;
         var dev: Dev = .{ .ptr = ptr, .bytes = tensor.bytes.len, .dtype = tensor.dtype, .shape = @splat(0), .rank = tensor.rank };
@@ -326,13 +327,35 @@ fn readConfig(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !config.Con
     };
 }
 
-fn logList(label: []const u8, list: []const []const u8) void {
-    for (list[0..@min(list.len, bad_log_limit)]) |n| std.log.warn("{s}: {s}", .{ label, n });
-}
+/// What a refusal found, for the caller to print: the first few offending tensors per kind.
+pub const Diag = struct {
+    buf: [diag_bytes]u8 = undefined,
+    len: usize = 0,
+
+    fn add(d: *Diag, label: []const u8, list: []const []const u8) void {
+        for (list[0..@min(list.len, bad_log_limit)]) |n| {
+            const line = std.fmt.bufPrint(d.buf[d.len..], "{s}: {s}\n", .{ label, n }) catch return;
+            d.len += line.len;
+        }
+    }
+
+    pub fn text(d: *const Diag) []const u8 {
+        return d.buf[0..d.len];
+    }
+};
 
 /// Loads the text weights of the checkpoint under `dir`: refuses (`WeightShape`) a tensor the weight map disagrees
 /// with and (`OverBudget`) a budget above `limit` before any upload, then uploads one layer at a time.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, up: Uploader, dir: []const u8, o: budget.Options, limit: u64) !Weights {
+    var diag: Diag = .{};
+    return loadDiag(gpa, io, up, dir, o, limit, &diag) catch |e| {
+        if (diag.len > 0) std.log.err("{s}", .{diag.text()});
+        return e;
+    };
+}
+
+/// `load` with the refusal's detail in `diag` instead of the log.
+pub fn loadDiag(gpa: std.mem.Allocator, io: std.Io, up: Uploader, dir: []const u8, o: budget.Options, limit: u64, diag: *Diag) !Weights {
     var scratch = std.heap.ArenaAllocator.init(gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -350,9 +373,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, up: Uploader, dir: []const u8, o
     try names.precisions(header, layers, &w.prec);
     const report = try names.check(a, &w.cfg, header, .model);
     if (!report.clean()) {
-        logList("missing", report.missing.items);
-        logList("wrong dtype or shape", report.wrong.items);
-        logList("unknown", report.unknown.items);
+        diag.add("missing", report.missing.items);
+        diag.add("wrong dtype or shape", report.wrong.items);
+        diag.add("unknown", report.unknown.items);
         return error.WeightShape;
     }
 
@@ -623,7 +646,9 @@ test "refuses a wrong shape before any upload" {
     defer fx.deinit();
     var fake: Fake = .{ .gpa = t.allocator };
     defer fake.deinit();
-    try t.expectError(error.WeightShape, load(t.allocator, t.io, fake.uploader(), fx.dir, test_options, test_limit));
+    var diag: Diag = .{};
+    try t.expectError(error.WeightShape, loadDiag(t.allocator, t.io, fake.uploader(), fx.dir, test_options, test_limit, &diag));
+    try t.expect(std.mem.indexOf(u8, diag.text(), "wrong dtype or shape: model.llm.layers.2.attn.wq_du.weight") != null);
     try t.expectEqual(@as(usize, 0), fake.allocs);
 }
 

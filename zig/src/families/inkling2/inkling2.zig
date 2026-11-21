@@ -11,6 +11,7 @@ pub const budget = @import("budget.zig");
 pub const loop_kernels = @import("loop_kernels.zig");
 pub const check_rows = @import("check_rows.zig");
 pub const weights = @import("weights.zig");
+pub const proc_status = @import("proc_status.zig");
 
 /// config.json's name in the release.
 pub const model_type = "inkling2";
@@ -27,4 +28,5 @@ test {
     _ = loop_kernels;
     _ = check_rows;
     _ = weights;
+    _ = proc_status;
 }

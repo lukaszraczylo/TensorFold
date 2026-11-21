@@ -156,7 +156,7 @@ fn draft(m: config.Mtp, text: *const Text, sink: anytype) !void {
 }
 
 /// The streams each core layer's loop controller gates between passes.
-const controller_streams = [_][]const u8{ "attn", "k", "v", "mlp" };
+pub const controller_streams = [_][]const u8{ "attn", "k", "v", "mlp" };
 
 /// Loop controllers of the core layers and the cross-pass queries; none for a model without a loop.
 pub fn loopTensors(c: *const config.Config, sink: anytype) !void {

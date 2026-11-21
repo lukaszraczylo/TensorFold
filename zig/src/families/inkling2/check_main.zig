@@ -16,9 +16,6 @@ const embed_host_env = "TF_INK2_EMBED_HOST";
 const dev_context = 2048;
 const dev_chunk_rows = 64;
 const device_limit: u64 = 30 << 30; // ASSUMPTION: the dev pod's GB10 pool shows about 31 GiB available
-const proc_status = "/proc/self/status";
-const peak_rss_key = "VmHWM:";
-const kib_per_mib = 1024;
 const stats_name = "weights.json";
 
 const Args = struct {
@@ -72,19 +69,6 @@ pub fn main(init: std.process.Init) !u8 {
     return 2;
 }
 
-/// The process's peak resident set, in MiB (VmHWM).
-fn peakRssMib(init: std.process.Init) !u64 {
-    const text = try std.Io.Dir.cwd().readFileAlloc(init.io, proc_status, init.gpa, .limited(1 << 16));
-    defer init.gpa.free(text);
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (!std.mem.startsWith(u8, line, peak_rss_key)) continue;
-        var f = std.mem.tokenizeAny(u8, line[peak_rss_key.len..], " \tkB");
-        return (try std.fmt.parseInt(u64, f.next() orelse return error.BadStatus, 10)) / kib_per_mib;
-    }
-    return error.BadStatus;
-}
-
 fn rowDtype(d: ink2.weights.Dev) !ink2.check_rows.Dtype {
     return switch (d.dtype) {
         .bf16 => .bf16,
@@ -108,7 +92,7 @@ fn weights(init: std.process.Init, a: Args, out: []const u8) !void {
     const o: ink2.budget.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = dev_chunk_rows, .embed_host = embed_host, .layers = a.layers };
     var w = try ink2.weights.load(init.gpa, init.io, ink2.weights.deviceUploader(ctx.d), model, o, device_limit);
     defer w.deinit();
-    const peak = try peakRssMib(init);
+    const peak = ink2.proc_status.peakMib(init.gpa, init.io);
 
     var rows = try ink2.check_rows.Writer.init(init.gpa, init.io, out);
     defer rows.deinit();
@@ -127,10 +111,11 @@ fn weights(init: std.process.Init, a: Args, out: []const u8) !void {
     }
     try rows.finish();
 
-    const stats = try std.fmt.allocPrint(init.gpa, "{{\"peak_rss_mib\":{d},\"device_bytes\":{d},\"budget_weights\":{d},\"budget_total\":{d},\"embed_host\":{s},\"layers\":[{d},{d}]}}\n", .{ peak, w.device_bytes, w.plan.weights, w.plan.total, if (embed_host) "true" else "false", w.first, w.last });
+    const peak_mib = try peak;
+    const stats = try std.fmt.allocPrint(init.gpa, "{{\"peak_rss_mib\":{d},\"device_bytes\":{d},\"budget_weights\":{d},\"budget_total\":{d},\"embed_host\":{s},\"layers\":[{d},{d}]}}\n", .{ peak_mib, w.device_bytes, w.plan.weights, w.plan.total, if (embed_host) "true" else "false", w.first, w.last });
     defer init.gpa.free(stats);
     try rows.dir.writeFile(init.io, .{ .sub_path = stats_name, .data = stats });
-    std.debug.print("device_bytes {d} budget_weights {d} peak_rss_mib {d}\n", .{ w.device_bytes, w.plan.weights, peak });
+    std.debug.print("device_bytes {d} budget_weights {d} peak_rss_mib {d}\n", .{ w.device_bytes, w.plan.weights, peak_mib });
 }
 
 fn smoke(init: std.process.Init, out: []const u8) !void {
