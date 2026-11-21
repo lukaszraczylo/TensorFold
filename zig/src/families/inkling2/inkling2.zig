@@ -23,6 +23,8 @@ pub const attn_visit = @import("attn_visit.zig");
 pub const decode = @import("decode.zig");
 pub const head = @import("head.zig");
 pub const prefill = @import("prefill.zig");
+pub const backend = @import("backend.zig");
+pub const native = @import("native.zig");
 
 /// config.json's name in the release.
 pub const model_type = "inkling2";
@@ -49,4 +51,6 @@ test {
     _ = decode;
     _ = head;
     _ = prefill;
+    _ = backend;
+    _ = native;
 }
