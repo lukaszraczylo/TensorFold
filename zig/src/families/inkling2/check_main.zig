@@ -16,6 +16,8 @@ const usage =
     \\    With --visits ending at the last visit it also runs the head on the carried input after it (the golden's when --teacher is given, so the logits show the head alone) and writes step<s>/logits.f32 ([unpadded_vocab], softcapped fp32) and step<s>/argmax.u32 (the device pick, checked against a host pick); with --teacher also step<s>/logits_free.f32, the logits of the engine's own last-visit output
     \\greedy --model DIR --prompts FILE.json --n N [--chunk-rows R] --out DIR: FILE.json is {"prompts": [[id, ...], ...]}; each prompt is prefilled in chunks of R rows (default 512) from position 0 (conv states cleared between prompts), then N tokens are picked greedily (lowest id on ties); writes tokens.u32 ([prompts, N]) and p<P>/logits<GG>.f32 ([unpadded_vocab]) for each picked token
     \\prefill --model DIR --ids FILE.json [--chunk-rows R] [--decode N] [--teacher GOLDEN_DIR] [--dump-kv L:P,...] --out DIR: FILE.json is {"steps": [[id, ...], [id], ...]}; step 0 is prefilled in chunks of R rows (default 512) from position 0, then steps 1..N run as single-token decode steps (teacher-forced ids); writes ref.capture's all-rows layout (step<s>/visit<VV>.f32 [rows, qn, 2304], mlp<VV>.f32, xs<VV>.f32, msg<VV>.f32), step<s>/logits.f32 and argmax.u32 (the last row's), and a manifest.json; with GOLDEN_DIR (captured with --all-rows) the carried input, the MoE input and the messages of every row are replaced by the reference's; --dump-kv writes the K and V rows of the given (layer, pass) visits for all positions
+    \\rowcost --model DIR --ids FILE.json [--chunk-rows R] [--pass W] --out DIR: FILE.json's step 0 (2048 ids at most) is prefilled up to 8 ids short of its end; prints ms of a forward and head over R = 1..8 rows at that position (W = 1: window kernels)
+    \\rowgate --model DIR --ids FILE.json [--chunk-rows R] --out DIR: as rowcost's prompt; checks that one R-row window forward gives the logits of R one-token forwards byte for byte, for R = 2..8, and names the first visit that differs
     \\weights --model DIR [--layers A-B] [--readback NAME,...]: uploads the text weights (TF_INK2_EMBED_HOST=1 keeps the
     \\    embedding on the host), writes DIR/weights.json with peak_rss_mib and device_bytes, and one row per readback
     \\    tensor (names below model.llm., e.g. layers.0.attn.wo_ud.weight)
@@ -139,6 +141,14 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (std.mem.eql(u8, a.sub, "greedy")) {
         try greedyRun(init, a, out);
+        return 0;
+    }
+    if (std.mem.eql(u8, a.sub, "rowgate")) {
+        try rowGate(init, a);
+        return 0;
+    }
+    if (std.mem.eql(u8, a.sub, "rowcost")) {
+        try rowCost(init, a);
         return 0;
     }
     if (std.mem.eql(u8, a.sub, "logprobs")) {
@@ -1216,6 +1226,223 @@ fn prefillRun(init: std.process.Init, a: Args, out: []const u8) !void {
     const extra = sessionBytes(&session, ink2.head.deviceBytes(&session.w.cfg.text, 1).scratch);
     const caches = session.cache.kv.len + session.cache.conv.len;
     std.debug.print("prefill: {d} ids in chunks of {d}, {d} decode steps, device_bytes {d} + {d} (caches {d}, scratch {d}) = {d}\n", .{ steps[0].len, a.chunk_rows, a.decode, session.w.device_bytes, extra, caches, extra - caches, session.w.device_bytes + extra });
+}
+
+/// Saves and restores the per-token device state (KV caches and conv states) around a window.
+const StateSnap = struct {
+    kv: cuda.DeviceBuffer,
+    conv: cuda.DeviceBuffer,
+
+    fn init(cache: *const ink2.cache.Cache) !StateSnap {
+        var kv = try cuda.DeviceBuffer.alloc(cache.d, cache.kv.len);
+        errdefer kv.free();
+        return .{ .kv = kv, .conv = try cuda.DeviceBuffer.alloc(cache.d, cache.conv.len) };
+    }
+
+    fn deinit(sn: *StateSnap) void {
+        sn.kv.free();
+        sn.conv.free();
+    }
+
+    fn save(sn: *const StateSnap, cache: *const ink2.cache.Cache, s: cuda.Stream) !void {
+        try sn.kv.copyFrom(0, cache.kv.ptr, cache.kv.len, s.handle);
+        try sn.conv.copyFrom(0, cache.conv.ptr, cache.conv.len, s.handle);
+        try s.synchronize();
+    }
+
+    fn restore(sn: *const StateSnap, cache: *const ink2.cache.Cache, s: cuda.Stream) !void {
+        try cache.kv.copyFrom(0, sn.kv.ptr, sn.kv.len, s.handle);
+        try cache.conv.copyFrom(0, sn.conv.ptr, sn.conv.len, s.handle);
+        try s.synchronize();
+    }
+};
+
+/// Keeps the carried vector after each visit, as float32 [qn, rows, hidden], for a comparison between two runs.
+const VisitKeep = struct {
+    d: *const cuda.Driver,
+    bufs: [ink2.visits.max_visits][]f32 = @splat(&.{}),
+    mlps: [ink2.visits.max_visits][]f32 = @splat(&.{}),
+    qns: [ink2.visits.max_visits]u32 = @splat(0),
+    rows: usize = 0,
+    row0: usize = 0,
+    total_rows: usize,
+    gpa: std.mem.Allocator,
+    scratch: []f32,
+
+    fn visit(ctx: *anyopaque, v: u32, span: ink2.decode.Span, inp: u64, qn: u32) anyerror!void {
+        const k: *VisitKeep = @ptrCast(@alignCast(ctx));
+        const n = qn * span.rows * loop_hidden;
+        try cuda.memory.download(k.d, inp, std.mem.sliceAsBytes(k.scratch[0..n]));
+        if (k.bufs[v].len == 0) k.bufs[v] = try k.gpa.alloc(f32, qn * k.total_rows * loop_hidden);
+        k.qns[v] = qn;
+        for (0..qn) |q| for (0..span.rows) |r| {
+            const src = k.scratch[(q * span.rows + r) * loop_hidden ..][0..loop_hidden];
+            @memcpy(k.bufs[v][(q * k.total_rows + k.row0 + r) * loop_hidden ..][0..loop_hidden], src);
+        };
+    }
+};
+
+fn mlpKeep(ctx: *anyopaque, v: u32, span: ink2.decode.Span, mlp_in: u64) anyerror!void {
+    const k: *VisitKeep = @ptrCast(@alignCast(ctx));
+    const n = span.rows * loop_hidden;
+    try cuda.memory.download(k.d, mlp_in, std.mem.sliceAsBytes(k.scratch[0..n]));
+    if (k.mlps[v].len == 0) k.mlps[v] = try k.gpa.alloc(f32, k.total_rows * loop_hidden);
+    @memcpy(k.mlps[v][k.row0 * loop_hidden ..][0 .. span.rows * loop_hidden], k.scratch[0..n]);
+}
+
+/// Gate B: the logits of one R-row forward equal R sequential one-token forwards, byte for byte, for R = 2..8.
+fn rowGate(init: std.process.Init, a: Args) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const model = a.model orelse return error.Usage;
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, a.ids orelse return error.Usage, gpa, .limited(1 << 22));
+    defer gpa.free(text);
+    const parsed = try std.json.parseFromSlice(DecodeSteps, gpa, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const ids = parsed.value.steps[0];
+    const max_r = row_cost_max_rows;
+    if (ids.len <= max_r or ids.len > dev_context) return error.BadSteps;
+    const p0 = ids.len - max_r;
+
+    var session: Session = undefined;
+    try session.open(gpa, io, model, null, a.layers, a.chunk_rows);
+    defer session.deinit();
+    const c = &session.c;
+    const last = session.sched.n - 1;
+    const stream = session.stream;
+    try ink2.prefill.run(c, stream, 0, ids[0..p0], a.chunk_rows, null, .{});
+    var snap = try StateSnap.init(&session.cache);
+    defer snap.deinit();
+    try snap.save(&session.cache, stream);
+
+    const vocab = c.text.unpadded_vocab;
+    var scratch = try ink2.head.Scratch.init(c.d, max_r, vocab);
+    defer scratch.deinit();
+    const seq_logits = try gpa.alloc(f32, max_r * vocab);
+    defer gpa.free(seq_logits);
+    const bat_logits = try gpa.alloc(f32, max_r * vocab);
+    defer gpa.free(bat_logits);
+    const tmp = try gpa.alloc(f32, 3 * max_r * loop_hidden);
+    defer gpa.free(tmp);
+
+    var all_ok = true;
+    for (2..max_r + 1) |rows| {
+        var seq: VisitKeep = .{ .d = c.d, .total_rows = rows, .gpa = gpa, .scratch = tmp };
+        var bat: VisitKeep = .{ .d = c.d, .total_rows = rows, .gpa = gpa, .scratch = tmp };
+        defer for (0..session.sched.n) |v| {
+            gpa.free(seq.bufs[v]);
+            gpa.free(bat.bufs[v]);
+            gpa.free(seq.mlps[v]);
+            gpa.free(bat.mlps[v]);
+        };
+        const sh: ink2.decode.Hooks = .{ .trace = .{ .ctx = &seq, .visit = VisitKeep.visit, .mlp = mlpKeep } };
+        const bh: ink2.decode.Hooks = .{ .trace = .{ .ctx = &bat, .visit = VisitKeep.visit, .mlp = mlpKeep } };
+        for (0..rows) |r| {
+            seq.row0 = r;
+            try ink2.decode.forward(c, stream, 0, ids[p0 + r ..][0..1], p0 + r, last, sh);
+            try ink2.head.logits(c, stream, c.flow.r.inp, 1, scratch.r.logits);
+            try stream.synchronize();
+            try cuda.memory.download(c.d, scratch.r.logits, std.mem.sliceAsBytes(seq_logits[r * vocab ..][0..vocab]));
+        }
+        try snap.restore(&session.cache, stream);
+        c.window = true;
+        defer c.window = false;
+        try ink2.decode.forward(c, stream, 0, ids[p0..][0..rows], p0, last, bh);
+        try ink2.head.logits(c, stream, c.flow.r.inp, rows, scratch.r.logits);
+        try stream.synchronize();
+        try cuda.memory.download(c.d, scratch.r.logits, std.mem.sliceAsBytes(bat_logits[0 .. rows * vocab]));
+        c.window = false;
+        try snap.restore(&session.cache, stream);
+
+        var first_visit: ?usize = null;
+        var first_row: usize = 0;
+        for (0..session.sched.n) |v| {
+            if (first_visit != null) break;
+            const qn = seq.qns[v];
+            for (0..rows) |r| for (0..qn) |q| {
+                const o = (q * rows + r) * loop_hidden;
+                if (!std.mem.eql(u8, std.mem.sliceAsBytes(seq.bufs[v][o..][0..loop_hidden]), std.mem.sliceAsBytes(bat.bufs[v][o..][0..loop_hidden]))) {
+                    if (first_visit == null) {
+                        first_visit = v;
+                        first_row = r;
+                    }
+                }
+            };
+        }
+        var first_mlp: ?usize = null;
+        var mlp_row: usize = 0;
+        for (0..session.sched.n) |v| {
+            if (first_mlp != null) break;
+            for (0..rows) |r| {
+                const o = r * loop_hidden;
+                if (!std.mem.eql(u8, std.mem.sliceAsBytes(seq.mlps[v][o..][0..loop_hidden]), std.mem.sliceAsBytes(bat.mlps[v][o..][0..loop_hidden]))) {
+                    if (first_mlp == null) {
+                        first_mlp = v;
+                        mlp_row = r;
+                    }
+                }
+            }
+        }
+        if (first_mlp) |v| std.debug.print("rowgate R={d}: first differing MoE input at visit {d} row {d}\n", .{ rows, v, mlp_row });
+        var bad_rows: usize = 0;
+        for (0..rows) |r| {
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(seq_logits[r * vocab ..][0..vocab]), std.mem.sliceAsBytes(bat_logits[r * vocab ..][0..vocab]))) bad_rows += 1;
+        }
+        if (bad_rows != 0 or first_visit != null) all_ok = false;
+        if (first_visit) |v| {
+            std.debug.print("rowgate R={d}: logits rows differing {d}/{d}; first differing carried vector at visit {d} row {d}\n", .{ rows, bad_rows, rows, v, first_row });
+        } else std.debug.print("rowgate R={d}: logits rows differing {d}/{d}; every visit identical\n", .{ rows, bad_rows, rows });
+    }
+    std.debug.print("rowgate: {s}\n", .{if (all_ok) "PASS" else "FAIL"});
+}
+
+const row_cost_max_rows = 8;
+const row_cost_reps = 5;
+
+/// Milliseconds of a forward over R = 1..8 rows plus the head on those rows, at the position the prompt of `--ids` (step 0) ends.
+fn rowCost(init: std.process.Init, a: Args) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const model = a.model orelse return error.Usage;
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, a.ids orelse return error.Usage, gpa, .limited(1 << 22));
+    defer gpa.free(text);
+    const parsed = try std.json.parseFromSlice(DecodeSteps, gpa, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const ids = parsed.value.steps[0];
+    if (ids.len <= row_cost_max_rows or ids.len > dev_context) return error.BadSteps;
+    const p0 = ids.len - row_cost_max_rows;
+
+    var session: Session = undefined;
+    try session.open(gpa, io, model, null, a.layers, a.chunk_rows);
+    defer session.deinit();
+    const c = &session.c;
+    const last = session.sched.n - 1;
+    try ink2.prefill.run(c, session.stream, 0, ids[0..p0], a.chunk_rows, null, .{});
+    var scratch = try ink2.head.Scratch.init(c.d, row_cost_max_rows, c.text.unpadded_vocab);
+    defer scratch.deinit();
+    var t0 = try cuda.Event.init(c.d, true);
+    defer t0.deinit();
+    var t1 = try cuda.Event.init(c.d, true);
+    defer t1.deinit();
+    c.window = (a.pass orelse 0) != 0;
+    defer c.window = false;
+    for (1..row_cost_max_rows + 1) |rows| {
+        var best: f32 = std.math.inf(f32);
+        var sum: f32 = 0;
+        for (0..row_cost_reps + 1) |rep| {
+            try t0.record(session.stream);
+            try ink2.decode.forward(c, session.stream, 0, ids[p0..][0..rows], p0, last, .{});
+            try ink2.head.logits(c, session.stream, c.flow.r.inp, rows, scratch.r.logits);
+            try ink2.head.argmax(c, session.stream, scratch.r.logits, rows, scratch.r.val, scratch.r.id);
+            try t1.record(session.stream);
+            try session.stream.synchronize();
+            const ms = try cuda.Event.elapsedMs(t0, t1);
+            if (rep == 0) continue;
+            best = @min(best, ms);
+            sum += ms;
+        }
+        std.debug.print("rowcost R={d} p0={d} min_ms {d:.2} mean_ms {d:.2}\n", .{ rows, p0, best, sum / row_cost_reps });
+    }
 }
 
 /// Each chunk of `--tokens` through the chunked prefill with the head's log-probs of the scored rows; see `usage`.

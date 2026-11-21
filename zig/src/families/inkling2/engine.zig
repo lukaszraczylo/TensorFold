@@ -244,6 +244,8 @@ pub const Ctx = struct {
     dq: cuda.DeviceBuffer, // bf16 expansion of an 8-bit weight a prompt GEMM reads; empty unless TF_INK2_DENSE8 or TF_INK2_HEAD8
     ablit: ?ablit.State, // TF_INK2_ABLIT: null leaves every visit unedited
     ablit_hook: AblitHook,
+    /// A window of 2..8 rows runs the one-row 8-bit kernels per row, so its rows equal the one-token decodes bit for bit.
+    window: bool,
 
     pub fn init(c: *Ctx, gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, w: *const weights.Weights, sched: visits.Schedule, cache: *Cache, o: cache_mod.Options) !void {
         const g = try Geometry.of(&w.cfg.text, o);
@@ -271,6 +273,7 @@ pub const Ctx = struct {
         c.env = .{ .driver = d, .loop = &c.loop, .ops = &c.ops };
         c.gpa = gpa;
         c.ablit_hook = applyAblit;
+        c.window = false;
         c.ablit = try ablit.open(gpa, io, d, g.hidden, c.text.layers);
     }
 

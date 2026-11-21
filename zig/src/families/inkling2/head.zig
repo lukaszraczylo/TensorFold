@@ -39,9 +39,10 @@ fn logits8(c: *engine.Ctx, s: cuda.Stream, h: u64, rows: usize, out_f32: u64, w:
     const t = &c.text;
     const n: usize = t.unpadded_vocab;
     const stored: usize = c.w.unembed.shape[0];
-    if (rows == 1) {
+    if (rows == 1 or (c.window and rows <= ops.window_max_rows)) {
         const seg: ops.DenseSeg = .{ .x = h, .w = w, .out = out_f32, .n = @intCast(n), .block0 = 0 };
-        return ops.dense1Q8(&c.ops, s, &.{seg}, t.hidden, true, stored);
+        if (rows == 1) return ops.dense1Q8(&c.ops, s, &.{seg}, t.hidden, true, stored);
+        return ops.dense1Q8Rows(&c.ops, s, &.{seg}, t.hidden, true, stored, rows);
     }
     var row0: usize = 0;
     while (row0 < n) : (row0 += engine.dq_tile_rows) {

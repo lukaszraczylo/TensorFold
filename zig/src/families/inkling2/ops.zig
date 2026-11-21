@@ -77,6 +77,7 @@ pub const Kernels = struct {
     tobf: cuda.Function,
     dense1: cuda.Function,
     dense1_q8: cuda.Function,
+    dense1_q8_rows: cuda.Function,
     q8_to_bf16: cuda.Function,
     put_words: cuda.Function,
     rewind: cuda.Function,
@@ -106,6 +107,7 @@ pub const Kernels = struct {
             .tobf = try mod.function("tf_ink2_tobf"),
             .dense1 = try mod.function("tf_ink2_dense1"),
             .dense1_q8 = try mod.function("tf_ink2_dense1_q8"),
+            .dense1_q8_rows = try mod.function("tf_ink2_dense1_q8_rows"),
             .q8_to_bf16 = try mod.function("tf_ink2_q8_to_bf16"),
             .put_words = try mod.function("tf_ink2_put_words"),
             .rewind = try mod.function("tf_ink2_conv_rewind"),
@@ -271,6 +273,17 @@ pub fn dense1Q8(k: *const Kernels, s: cuda.Stream, segs: []const DenseSeg, kdim:
     return dense1With(k, s, segs, kdim, .{ .f32_out = f32_out, .stored_rows = stored_rows });
 }
 
+/// Rows a window verifies at most: ops.cu's kRowsMax.
+pub const window_max_rows = 8;
+
+/// `dense1Q8` over `rows` rows (2..`window_max_rows`) of x [rows, k] into out [rows, n] (a segment's n): each weight is read once and
+/// every row's sum keeps the one-row kernel's order, so a row equals the `dense1Q8` launch on it bit for bit.
+pub fn dense1Q8Rows(k: *const Kernels, s: cuda.Stream, segs: []const DenseSeg, kdim: usize, f32_out: bool, stored_rows: usize, rows: usize) !void {
+    if (kdim % q8_block != 0) return error.Misaligned;
+    if (rows == 0 or rows > window_max_rows) return error.RowsExceedWindow;
+    return dense1With(k, s, segs, kdim, .{ .f32_out = f32_out, .stored_rows = stored_rows, .rows = rows });
+}
+
 /// Weights of one 8-bit scale: loop.cu's kQ8Block.
 pub const q8_block = 32;
 
@@ -285,7 +298,7 @@ pub fn q8ToBf16(k: *const Kernels, s: cuda.Stream, w: u64, n: usize, kdim: usize
     try go(k.q8_to_bf16, s, .{ .x = @intCast((rows * kdim + 255) / 256) }, 256, &a);
 }
 
-const Q8Mode = struct { f32_out: bool, stored_rows: usize };
+const Q8Mode = struct { f32_out: bool, stored_rows: usize, rows: usize = 1 };
 
 fn dense1With(k: *const Kernels, s: cuda.Stream, segs: []const DenseSeg, kdim: usize, q8: ?Q8Mode) !void {
     if (segs.len == 0 or segs.len > dense_max_segs) return error.BadSegments;
@@ -305,7 +318,9 @@ fn dense1With(k: *const Kernels, s: cuda.Stream, segs: []const DenseSeg, kdim: u
     if (q8) |m| {
         a.add(int(@intFromBool(m.f32_out)));
         a.add(int(m.stored_rows));
-        return go(k.dense1_q8, s, .{ .x = @intCast(blocks) }, dense_cols_per_block * 32, &a);
+        if (m.rows == 1) return go(k.dense1_q8, s, .{ .x = @intCast(blocks) }, dense_cols_per_block * 32, &a);
+        a.add(int(m.rows));
+        return go(k.dense1_q8_rows, s, .{ .x = @intCast(blocks) }, dense_cols_per_block * 32, &a);
     }
     try go(k.dense1, s, .{ .x = @intCast(blocks) }, dense_cols_per_block * 32, &a);
 }

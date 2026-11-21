@@ -733,6 +733,84 @@ extern "C" __global__ void __launch_bounds__(kDenseWarps * 32) tf_ink2_dense1_q8
     else sg.out[col] = tobf(acc);
 }
 
+constexpr int kRowsMax = 8;  // rows a window verifies
+
+// tf_ink2_dense1_q8 over `rows` <= kRowsMax rows x [rows, k] and out [rows, n]: each weight is read and converted once, every row's sum
+// keeps the one-row kernel's order (chunk order in a lane, then the xor tree), so a row equals the one-row launch bit for bit.
+extern "C" __global__ void __launch_bounds__(kDenseWarps * 32) tf_ink2_dense1_q8_rows(const Ink2DenseSegs a, int count, int k, int f32_out,
+                                                                                     int stored_rows, int rows) {
+    using namespace ink2o;
+    int si = 0;
+    while (si + 1 < count && static_cast<int>(blockIdx.x) >= a.s[si + 1].block0) ++si;
+    const Ink2DenseSeg sg = a.s[si];
+    const int lane = threadIdx.x & 31;
+    const int col = (blockIdx.x - sg.block0) * kDenseWarps + (threadIdx.x >> 5);
+    if (col >= sg.n) return;
+    const int8_t* wr = reinterpret_cast<const int8_t*>(sg.w) + static_cast<size_t>(col) * k;
+    const __half* sr = reinterpret_cast<const __half*>(reinterpret_cast<const int8_t*>(sg.w) + static_cast<size_t>(stored_rows ? stored_rows : sg.n) * k) +
+                       static_cast<size_t>(col) * (k / kQ8Block);
+    const int chunks = k / kQ8Chunk;
+    float acc[kRowsMax];
+#pragma unroll
+    for (int r = 0; r < kRowsMax; ++r) acc[r] = 0.0f;
+    for (int base = 0; base < chunks; base += 32 * kQ8Depth) {
+        uint4 wv[kQ8Depth];
+        float sc[kQ8Depth];
+#pragma unroll
+        for (int j = 0; j < kQ8Depth; ++j) {
+            const int c = base + lane + 32 * j;
+            if (c < chunks) {
+                wv[j] = *reinterpret_cast<const uint4*>(wr + c * kQ8Chunk);
+                sc[j] = __half2float(sr[c >> 1]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kQ8Depth; ++j) {
+            const int c = base + lane + 32 * j;
+            if (c >= chunks) continue;
+            const uint32_t ws[4] = {wv[j].x, wv[j].y, wv[j].z, wv[j].w};
+            uint32_t b[8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float s0 = static_cast<float>(static_cast<int8_t>(ws[i])) * sc[j];
+                const float s1 = static_cast<float>(static_cast<int8_t>(ws[i] >> 8)) * sc[j];
+                const float s2 = static_cast<float>(static_cast<int8_t>(ws[i] >> 16)) * sc[j];
+                const float s3 = static_cast<float>(static_cast<int8_t>(ws[i] >> 24)) * sc[j];
+                const __nv_bfloat162 p01 = __floats2bfloat162_rn(s0, s1), p23 = __floats2bfloat162_rn(s2, s3);
+                b[2 * i] = *reinterpret_cast<const uint32_t*>(&p01);
+                b[2 * i + 1] = *reinterpret_cast<const uint32_t*>(&p23);
+            }
+#pragma unroll
+            for (int r = 0; r < kRowsMax; ++r) {
+                if (r >= rows) break;
+                const uint16_t* xr = sg.x + static_cast<size_t>(r) * k + c * kQ8Chunk;
+                const uint4 xa = *reinterpret_cast<const uint4*>(xr);
+                const uint4 xb = *reinterpret_cast<const uint4*>(xr + 8);
+                const uint32_t xs[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+                float v = acc[r];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint32_t x0 = xs[2 * i], x1 = xs[2 * i + 1], b01 = b[2 * i], b23 = b[2 * i + 1];
+                    v = __fmaf_rn(__uint_as_float(x0 << 16), __uint_as_float(b01 << 16), v);
+                    v = __fmaf_rn(__uint_as_float(x0 & 0xffff0000u), __uint_as_float(b01 & 0xffff0000u), v);
+                    v = __fmaf_rn(__uint_as_float(x1 << 16), __uint_as_float(b23 << 16), v);
+                    v = __fmaf_rn(__uint_as_float(x1 & 0xffff0000u), __uint_as_float(b23 & 0xffff0000u), v);
+                }
+                acc[r] = v;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kRowsMax; ++r) {
+        if (r >= rows) break;
+        float v = acc[r];
+        for (int m = 16; m > 0; m >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xFFFFFFFFu, v, m));
+        if (lane != 0) continue;
+        if (f32_out) reinterpret_cast<float*>(sg.out)[static_cast<size_t>(r) * sg.n + col] = v;
+        else sg.out[static_cast<size_t>(r) * sg.n + col] = tobf(v);
+    }
+}
+
 // bf16(code * scale) of `count` elements (a multiple of 32) of an int8 plane and its fp16 scales: the weights a prompt GEMM reads.
 extern "C" __global__ void tf_ink2_q8_to_bf16(const int8_t* __restrict__ q, const __half* __restrict__ scales, uint16_t* __restrict__ out,
                                               long long count) {

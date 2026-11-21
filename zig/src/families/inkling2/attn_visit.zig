@@ -66,8 +66,20 @@ fn linear(c: *const engine.Ctx, s: cuda.Stream, x: u64, w: Dev, rows: usize, n: 
     try ops.tobf(&c.ops, s, tmp, rows, n, n, out, n, 0, n);
 }
 
-/// The six single-row projections of a visit (wq, wr, gate_attn, sink on x0; wk on x1; wv on x2) in one launch, each rounded to bf16.
-fn linearsOneRow(c: *const engine.Ctx, s: cuda.Stream, x: [3]u64, lw: *const weights.LayerW, dims: [4]usize, hidden: usize) !void {
+/// `ops.dense1Q8` for one row, `ops.dense1Q8Rows` for a window's.
+fn denseQ8(c: *const engine.Ctx, s: cuda.Stream, segs: []const ops.DenseSeg, kdim: usize, rows: usize) !void {
+    if (rows == 1) return ops.dense1Q8(&c.ops, s, segs, kdim, false, 0);
+    return ops.dense1Q8Rows(&c.ops, s, segs, kdim, false, 0, rows);
+}
+
+/// Whether a call of `rows` rows takes the decode-order projections: one row, or a window's rows on 8-bit weights.
+fn decodeOrder(c: *const engine.Ctx, rows: usize, w: Dev) bool {
+    return rows == 1 or (c.window and w.q8 and rows <= ops.window_max_rows);
+}
+
+/// The six projections of a visit (wq, wr, gate_attn, sink on x0; wk on x1; wv on x2) in one launch, each rounded to bf16. One row, or
+/// a window's rows on 8-bit weights (`Ctx.window`).
+fn linearsOneRow(c: *const engine.Ctx, s: cuda.Stream, x: [3]u64, lw: *const weights.LayerW, dims: [4]usize, hidden: usize, rows: usize) !void {
     const r = c.scratch.r;
     const q_dim, const rel_dim, const heads, const kv_dim = dims;
     const parts = [_]struct { x: u64, w: Dev, out: u64, n: usize }{
@@ -83,7 +95,7 @@ fn linearsOneRow(c: *const engine.Ctx, s: cuda.Stream, x: [3]u64, lw: *const wei
         try shaped(p.w, "linear", &.{ p.n, hidden });
         sg.* = .{ .x = p.x, .w = p.w.ptr, .out = p.out, .n = @intCast(p.n), .block0 = 0 };
     }
-    if (lw.wq_du.q8) return ops.dense1Q8(&c.ops, s, &segs, hidden, false, 0);
+    if (lw.wq_du.q8) return denseQ8(c, s, &segs, hidden, rows);
     try ops.dense1(&c.ops, s, &segs, hidden);
 }
 
@@ -128,8 +140,8 @@ pub fn run(c: *engine.Ctx, s: cuda.Stream, v: visits.Visit, lw: *const weights.L
     try validate(g, layer, v, lw, rows, p0, stream, c.cache.layout.streams);
     const q_dim, const kv_dim, const rel_dim = .{ g.qDim(), g.kvDim(), g.relDim() };
 
-    if (rows == 1) {
-        try linearsOneRow(c, s, x, lw, .{ q_dim, rel_dim, g.heads, kv_dim }, g.hidden);
+    if (decodeOrder(c, rows, lw.wq_du)) {
+        try linearsOneRow(c, s, x, lw, .{ q_dim, rel_dim, g.heads, kv_dim }, g.hidden, rows);
     } else {
         try linear(c, s, x[0], lw.wq_du, rows, q_dim, g.hidden, r.q_raw);
         try linear(c, s, x[0], lw.wr_du, rows, rel_dim, g.hidden, r.r_raw);
@@ -165,10 +177,10 @@ pub fn run(c: *engine.Ctx, s: cuda.Stream, v: visits.Visit, lw: *const weights.L
     try kernels.prep(&c.attn, s, call, layer, prep, .{ r.q_raw, r.k_conv, r.v_conv, r.r_raw }, .{ lw.q_l2_clip.ptr, lw.rel_l2_clip.ptr }, r.q, r.rel, kv);
     try kernels.relTable(&c.attn, s, call, r.rel, lw.rel_logits_proj.ptr, r.table);
     try kernels.attend(&c.attn, s, call, layer, g.stride, g.slots(), r.q, kv, r.table, r.part_o, r.part_ml, r.sink, r.gate, r.out);
-    if (rows == 1) {
+    if (decodeOrder(c, rows, lw.wo_ud)) {
         try shaped(lw.wo_ud, "linear", &.{ g.hidden, q_dim });
         const seg: ops.DenseSeg = .{ .x = r.out, .w = lw.wo_ud.ptr, .out = out, .n = @intCast(g.hidden), .block0 = 0 };
-        if (lw.wo_ud.q8) try ops.dense1Q8(&c.ops, s, &.{seg}, q_dim, false, 0) else try ops.dense1(&c.ops, s, &.{seg}, q_dim);
+        if (lw.wo_ud.q8) try denseQ8(c, s, &.{seg}, q_dim, rows) else try ops.dense1(&c.ops, s, &.{seg}, q_dim);
     } else {
         try linear(c, s, r.out, lw.wo_ud, rows, g.hidden, q_dim, out);
     }
