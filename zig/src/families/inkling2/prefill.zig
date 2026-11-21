@@ -38,6 +38,7 @@ pub fn chunk(c: *engine.Ctx, s: cuda.Stream, stream: u32, ids: []const u32, p0: 
 /// One chunk as `chunk` runs it, with the head's log-probs of the rows `want` selects into `out` (fp32 [want.count,
 /// unpadded_vocab]) in place of the last row's logits.
 pub fn chunkLogprobs(c: *engine.Ctx, s: cuda.Stream, stream: u32, ids: []const u32, p0: u64, want: head.RowRange, out: u64, h: decode.Hooks) !void {
+    if (ids.len > c.scratch.geometry.max_rows) return error.RowsExceedScratch;
     if (ids.len == 0) return error.Inkling2EmptyChunk;
     if (want.first + want.count > ids.len) return error.Inkling2RowsPastChunk;
     try decode.forward(c, s, stream, ids, p0, c.sched.n - 1, h);
@@ -99,4 +100,7 @@ test "run refuses a chunk size the scratch cannot hold before it touches the dev
     try ts.expectError(error.RowsExceedScratch, run(&c, s, 0, &.{1}, 0, null, .{}));
     try ts.expectError(error.Inkling2EmptyChunk, run(&c, s, 0, &.{}, 64, null, .{}));
     try ts.expectError(error.Inkling2EmptyChunk, chunk(&c, s, 0, &.{}, 0, null, .{}));
+    const rows: head.RowRange = .{ .first = 0, .count = 1 };
+    try ts.expectError(error.RowsExceedScratch, chunkLogprobs(&c, s, 0, &@as([65]u32, @splat(1)), 0, rows, 0, .{}));
+    try ts.expectError(error.Inkling2EmptyChunk, chunkLogprobs(&c, s, 0, &.{}, 0, rows, 0, .{}));
 }
