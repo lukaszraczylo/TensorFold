@@ -15,6 +15,10 @@ pub const moe = @import("moe.zig");
 pub const bank = @import("bank.zig");
 pub const proc_status = @import("proc_status.zig");
 pub const ablit = @import("ablit.zig");
+pub const cache = @import("cache.zig");
+pub const plan = @import("plan.zig");
+pub const engine = @import("engine.zig");
+pub const attn_visit = @import("attn_visit.zig");
 
 /// config.json's name in the release.
 pub const model_type = "inkling2";
@@ -35,4 +39,7 @@ test {
     _ = bank;
     _ = proc_status;
     _ = ablit;
+    _ = cache;
+    _ = engine;
+    _ = attn_visit;
 }

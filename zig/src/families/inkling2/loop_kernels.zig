@@ -26,6 +26,7 @@ const msg_scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, loop_hidden)));
 pub const Kernels = struct {
     mod: cuda.Module,
     fill: cuda.Function,
+    round_bf16: cuda.Function,
     actq_nvfp4: cuda.Function,
     actq_mxfp8: cuda.Function,
     actq_nvfp4_codes: cuda.Function,
@@ -48,6 +49,7 @@ pub const Kernels = struct {
         return .{
             .mod = mod,
             .fill = try mod.function("tf_ink2l_fill"),
+            .round_bf16 = try mod.function("tf_ink2l_round_bf16"),
             .actq_nvfp4 = try mod.function("tf_ink2l_actq_nvfp4"),
             .actq_mxfp8 = try mod.function("tf_ink2l_actq_mxfp8"),
             .actq_nvfp4_codes = try mod.function("tf_ink2l_actq_nvfp4_codes"),
@@ -70,6 +72,16 @@ pub const Kernels = struct {
         k.* = undefined;
     }
 };
+
+/// `n` fp32 values rounded to bf16 precision in place.
+pub fn roundBf16(k: *const Kernels, s: cuda.Stream, x: u64, n: usize) !void {
+    if (n == 0) return;
+    var args: cuda.Args = .{};
+    args.add(x);
+    args.add(@as(i32, @intCast(n)));
+    const blocks = (n + elementwise_threads - 1) / elementwise_threads;
+    try cuda.launch.launch(k.round_bf16, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = elementwise_threads } }, s, &args);
+}
 
 /// `extra` are the codes kernels' output pointers, between `out` and the sizes.
 fn actq(f: cuda.Function, block: usize, s: cuda.Stream, x: u64, out: u64, extra: []const u64, rows: usize, kdim: usize) !void {
@@ -209,7 +221,7 @@ test "actq launches one block a row and refuses a width off the block" {
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     try actNvfp4(&k, s, 0x1000, 0x2000, 64, 2304);
     try std.testing.expectEqual(@as(u32, 64), Fake.grid_x);
@@ -241,7 +253,7 @@ test "expert stages pick the format's kernel and launch a block a pair by column
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     const g: ExpertGemm = .{ .w = 1, .scale = 2 };
     try expertGateUp(&k, s, .nvfp4, 0, 0, g, 0, 4, 2304, 2304);
@@ -261,6 +273,21 @@ test "expert stages pick the format's kernel and launch a block a pair by column
     const launched = Fake.count;
     try std.testing.expectError(error.BadWidth, expertGateUp(&k, s, .nvfp4, 0, 0, g, 0, 1, 2304, 1136));
     try std.testing.expectEqual(launched, Fake.count);
+}
+
+test "roundBf16 covers every value and skips an empty span" {
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Fake.launch;
+    const f: cuda.Function = .{ .d = &d, .handle = @ptrFromInt(16) };
+    var k: Kernels = undefined;
+    k.round_bf16 = f;
+    const s: cuda.Stream = .{ .d = &d, .handle = null };
+    const launched = Fake.count;
+    try roundBf16(&k, s, 0, 0);
+    try std.testing.expectEqual(launched, Fake.count);
+    try roundBf16(&k, s, 0, 257);
+    try std.testing.expectEqual(@as(usize, 16), Fake.which);
+    try std.testing.expectEqual(@as(u32, 2), Fake.grid_x);
 }
 
 test "the loader type-checks in a build with kernels" {

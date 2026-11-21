@@ -11,6 +11,12 @@ extern "C" __global__ void tf_ink2l_fill(uint32_t* out, int n, uint32_t v) {
     if (i < n) out[i] = v;
 }
 
+// x[i] = float(bf16(x[i])) in place: a reference bf16 result a later kernel reads as fp32 (the dynamic conv taps).
+extern "C" __global__ void tf_ink2l_round_bf16(float* x, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = __bfloat162float(__float2bfloat16_rn(x[i]));
+}
+
 // Each statement follows ref/quant.py's line, one IEEE operation at a time: no fused multiply-adds, no fast division.
 constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / 32;
