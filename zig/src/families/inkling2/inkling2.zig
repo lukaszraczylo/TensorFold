@@ -17,6 +17,7 @@ pub const proc_status = @import("proc_status.zig");
 pub const ablit = @import("ablit.zig");
 pub const cache = @import("cache.zig");
 pub const plan = @import("plan.zig");
+pub const config = @import("config.zig");
 pub const engine = @import("engine.zig");
 pub const attn_visit = @import("attn_visit.zig");
 

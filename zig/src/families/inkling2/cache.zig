@@ -69,6 +69,29 @@ pub fn bytes(sched: *const visits.Schedule, t: *const config.Text, o: Options) u
     return streams * (visits.kvBytes(sched, t, o.context, o.chunk_rows) + sched.n * visits.convBytes(t));
 }
 
+/// Zeroes a device span on a fresh non-blocking stream and waits: a legacy-stream memset does not order against the engine's streams.
+pub fn zeroSync(d: *const cuda.Driver, ptr: u64, len: usize) !void {
+    if (len == 0) return;
+    var s = try cuda.Stream.init(d, true);
+    defer s.deinit();
+    const view: cuda.DeviceBuffer = .{ .d = d, .ptr = ptr, .len = len, .borrowed = true };
+    try view.fill8(0, s.handle);
+    try s.synchronize();
+}
+
+const row_bytes = kernels.head_dim * 2;
+
+/// One key head's ring bytes: rows `first_pos..first_pos + keep` of `src` (bf16 [keep, kv_heads, head_dim]) at slot
+/// pos % ring, every other slot zero. `dst` holds `ring` rows.
+pub fn headRing(dst: []u8, ring: usize, kv_heads: usize, head: usize, first_pos: usize, keep: usize, src: []const u8) void {
+    std.debug.assert(dst.len == ring * row_bytes and src.len == keep * kv_heads * row_bytes and keep <= ring);
+    @memset(dst, 0);
+    for (0..keep) |i| {
+        const slot = (first_pos + i) % ring;
+        @memcpy(dst[slot * row_bytes ..][0..row_bytes], src[(i * kv_heads + head) * row_bytes ..][0..row_bytes]);
+    }
+}
+
 pub const Cache = struct {
     d: *const cuda.Driver,
     layout: Layout,
@@ -83,7 +106,7 @@ pub const Cache = struct {
         errdefer kv.free();
         var conv = try cuda.DeviceBuffer.alloc(d, layout.convTotal());
         errdefer conv.free();
-        try conv.fill8(0, null);
+        try zeroSync(d, conv.ptr, conv.len);
         return .{ .d = d, .layout = layout, .kv = kv, .conv = conv };
     }
 
@@ -283,4 +306,19 @@ test "init refuses empty options before it allocates" {
     var d: cuda.Driver = undefined;
     try ts.expectError(error.BadCacheOptions, Cache.init(&d, &m.sched, &m.cfg.text, .{ .context = 2048, .streams = 0, .chunk_rows = 1 }));
     try ts.expectError(error.BadCacheOptions, Cache.init(&d, &m.sched, &m.cfg.text, .{ .context = 2048, .streams = 1, .chunk_rows = 0 }));
+}
+
+test "headRing places a head's rows at pos % ring and zeroes the rest" {
+    const ring = 4;
+    const kv_heads = 2;
+    var src: [3 * kv_heads * row_bytes]u8 = undefined;
+    for (&src, 0..) |*b, i| b.* = @intCast(1 + (i / row_bytes) % 200);
+    var dst: [ring * row_bytes]u8 = undefined;
+    headRing(&dst, ring, kv_heads, 1, 3, 3, &src);
+    // positions 3, 4, 5 land in slots 3, 0, 1; the (row, head) block index is i * kv_heads + head
+    try ts.expectEqual(@as(u8, 1 + 1), dst[3 * row_bytes]);
+    try ts.expectEqual(@as(u8, 1 + 3), dst[0 * row_bytes]);
+    try ts.expectEqual(@as(u8, 1 + 5), dst[1 * row_bytes]);
+    try ts.expectEqual(@as(u8, 0), dst[2 * row_bytes]);
+    try ts.expectEqual(@as(u8, 0), dst[2 * row_bytes + row_bytes - 1]);
 }

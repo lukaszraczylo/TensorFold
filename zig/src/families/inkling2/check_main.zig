@@ -11,7 +11,7 @@ const usage =
     \\moe --model DIR --layers L-L --rows N --in DIR: reads DIR/x.bf16 ([N, 2304]), runs layer L's routed MoE, writes out.bf16, pick.i32 ([N, 8]) and gamma.f32 ([N, 8])
     \\loop --model DIR --layer L --rows N --in DIR: reads bank.bf16 ([2, N, 2304]), dest.f32 ([N, 2304]) and norm.bf16 ([2304]), runs core layer L's four cross-pass messages and controllers, writes msgs.f32 ([4, N, 2304]) and ctl_<attn|k|v|mlp>.bf16 ([N, 2304])
     \\ablit --file F --layer L --mult M --in DIR: reads DIR/y.bf16 ([N, 2304]), applies the edit file F at layer L with scale multiplier M, writes y.bf16
-    \\attn --model DIR --layer L --pass P --n N --rows R --in DIR: reads DIR/xs.bf16 ([N, 3, 2304]: xq, xk, xv a step), runs the visit (L, P)'s attention on them R rows a call with the visit's caches carried, writes out.bf16 ([N, 2304], the wo_ud projection)
+    \\attn --model DIR --layer L --pass P --n N --rows R [--pos0 P0] --in DIR: reads DIR/xs.bf16 ([N, 3, 2304]: xq, xk, xv a step), runs the visit (L, P)'s attention on them R rows a call from position P0 with the visit's caches carried (P0 > 0: k0.bf16 and v0.bf16 [keep, 8, 128] fill the rows before it), writes out.bf16 ([N, 2304], the wo_ud projection)
     \\weights --model DIR [--layers A-B] [--readback NAME,...]: uploads the text weights (TF_INK2_EMBED_HOST=1 keeps the
     \\    embedding on the host), writes DIR/weights.json with peak_rss_mib and device_bytes, and one row per readback
     \\    tensor (names below model.llm., e.g. layers.0.attn.wo_ud.weight)
@@ -40,6 +40,7 @@ const Args = struct {
     mult: f32 = 1.0,
     pass: ?u32 = null,
     n: ?usize = null,
+    pos0: usize = 0,
 };
 
 fn parseLayers(text: []const u8) !ink2.budget.LayerRange {
@@ -54,7 +55,7 @@ fn parseArgs(args: []const [:0]const u8) !Args {
     while (i < args.len) : (i += 2) {
         if (i + 1 >= args.len) return error.Usage;
         const v: []const u8 = args[i + 1];
-        if (std.mem.eql(u8, args[i], "--out")) a.out = v else if (std.mem.eql(u8, args[i], "--model")) a.model = v else if (std.mem.eql(u8, args[i], "--in")) a.in = v else if (std.mem.eql(u8, args[i], "--layers")) a.layers = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else if (std.mem.eql(u8, args[i], "--pass")) a.pass = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--n")) a.n = try std.fmt.parseInt(usize, v, 10) else return error.Usage;
+        if (std.mem.eql(u8, args[i], "--out")) a.out = v else if (std.mem.eql(u8, args[i], "--model")) a.model = v else if (std.mem.eql(u8, args[i], "--in")) a.in = v else if (std.mem.eql(u8, args[i], "--layers")) a.layers = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else if (std.mem.eql(u8, args[i], "--pass")) a.pass = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--pos0")) a.pos0 = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--n")) a.n = try std.fmt.parseInt(usize, v, 10) else return error.Usage;
     }
     return a;
 }
@@ -470,7 +471,7 @@ fn attnTrace(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !
     var stream = try cuda.Stream.init(ctx.d, true);
     defer stream.deinit();
 
-    const context = std.mem.alignForward(usize, @max(n, dev_context), attn_context_align);
+    const context = std.mem.alignForward(usize, @max(a.pos0 + n, dev_context), attn_context_align);
     const embed_host = try environment.read(bool, embed_host_env, false);
     const o: ink2.budget.Options = .{ .context = context, .streams = 1, .chunk_rows = @intCast(@max(rows, dev_chunk_rows)), .embed_host = embed_host, .layers = .{ .first = layer, .last = layer } };
     var w = try ink2.weights.load(gpa, io, ink2.weights.deviceUploader(ctx.d), model, o, device_limit);
@@ -495,6 +496,8 @@ fn attnTrace(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !
     defer gpa.free(xs);
     if (xs.len != n * attn_inputs * row_bytes) return error.ShapeMismatch;
 
+    if (a.pos0 > 0) try attnPrefix(gpa, io, in_dir, &cache, visit, a.pos0, &w.cfg.text);
+
     var x: [attn_inputs]cuda.DeviceBuffer = undefined;
     var made: usize = 0;
     defer for (x[0..made]) |*b| b.free();
@@ -514,7 +517,7 @@ fn attnTrace(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !
             for (0..m) |r| @memcpy(stage[r * row_bytes ..][0..row_bytes], xs[((at + r) * attn_inputs + j) * row_bytes ..][0..row_bytes]);
             try b.upload(0, stage[0 .. m * row_bytes]);
         }
-        try ink2.attn_visit.run(&c, stream, visit, &w.layers[layer], .{ x[0].ptr, x[1].ptr, x[2].ptr }, m, at, 0, out_buf.ptr + at * row_bytes);
+        try ink2.attn_visit.run(&c, stream, visit, &w.layers[layer], .{ x[0].ptr, x[1].ptr, x[2].ptr }, m, a.pos0 + at, 0, out_buf.ptr + at * row_bytes);
         try stream.synchronize();
     }
 
@@ -522,4 +525,31 @@ fn attnTrace(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !
     defer rows_out.deinit();
     try putDevice(gpa, &rows_out, &out_buf, "out", .{}, .bf16, &.{ n, hidden });
     try rows_out.finish();
+}
+
+const attn_k0_name = "k0.bf16";
+const attn_v0_name = "v0.bf16";
+
+/// Writes the rows before `pos0` (k0.bf16, v0.bf16: bf16 [keep, kv_heads, 128], the last `keep` positions) into the visit's rings.
+fn attnPrefix(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, cache: *ink2.cache.Cache, visit: ink2.visits.Visit, pos0: usize, t: *const ink2.config.Text) !void {
+    const kv_heads: usize = t.heads(visit.layer).kv;
+    const layer = cache.layerAt(visit.kv);
+    const slots = cache.kvAt(visit.kv, 0);
+    const head_row = ink2.kernels.head_dim * 2;
+    const limit = pos0 * kv_heads * head_row;
+    for ([_]struct { name: []const u8, at: u64 }{ .{ .name = attn_k0_name, .at = slots.k }, .{ .name = attn_v0_name, .at = slots.v } }) |f| {
+        const src = try dir.readFileAlloc(io, f.name, gpa, .limited(limit + 1));
+        defer gpa.free(src);
+        if (src.len == 0 or src.len % (kv_heads * head_row) != 0) return error.ShapeMismatch;
+        const keep = src.len / (kv_heads * head_row);
+        if (keep > pos0 or keep > layer.ring) return error.ShapeMismatch;
+        const ring: usize = layer.ring;
+        const staging = try gpa.alloc(u8, ring * head_row);
+        defer gpa.free(staging);
+        for (0..kv_heads) |h| {
+            ink2.cache.headRing(staging, ring, kv_heads, h, pos0 - keep, keep, src);
+            const view: cuda.DeviceBuffer = .{ .d = cache.d, .ptr = f.at + h * ring * head_row, .len = staging.len, .borrowed = true };
+            try view.upload(0, staging);
+        }
+    }
 }

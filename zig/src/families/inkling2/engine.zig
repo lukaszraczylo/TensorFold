@@ -128,8 +128,7 @@ pub const Scratch = struct {
         var mem = try cuda.DeviceBuffer.alloc(d, Regions.of(0, g).total);
         errdefer mem.free();
         const r = Regions.of(mem.ptr, g);
-        const seg_of: cuda.DeviceBuffer = .{ .d = d, .ptr = r.seg_of, .len = @as(usize, g.max_rows) * 4, .borrowed = true };
-        try seg_of.fill8(0, null);
+        try cache_mod.zeroSync(d, r.seg_of, @as(usize, g.max_rows) * 4);
         return .{ .geometry = g, .mem = mem, .r = r };
     }
 
