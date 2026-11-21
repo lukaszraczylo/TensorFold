@@ -1,6 +1,7 @@
 //! Device context of Inkling 2 Mini's engine: the kernel images, the visit caches and the attention scratch.
 const std = @import("std");
 const cuda = @import("cuda");
+const ablit = @import("ablit.zig");
 const bank = @import("bank.zig");
 const cache_mod = @import("cache.zig");
 const config = @import("config.zig");
@@ -213,6 +214,13 @@ pub const Flow = struct {
     }
 };
 
+/// The residual edit launch of one attention output; a test swaps it for a recorder.
+pub const AblitHook = *const fn (*const loop_kernels.Kernels, *const ablit.State, cuda.Stream, u32, u64, usize, u32) anyerror!void;
+
+fn applyAblit(k: *const loop_kernels.Kernels, st: *const ablit.State, s: cuda.Stream, layer: u32, y: u64, rows: usize, hidden: u32) anyerror!void {
+    return ablit.apply(k, st, s, layer, y, rows, hidden);
+}
+
 /// What the engine's visits run against. Initialised in place: `env` points into it, so it never moves.
 pub const Ctx = struct {
     d: *const cuda.Driver,
@@ -228,8 +236,11 @@ pub const Ctx = struct {
     scratch: Scratch,
     flow: Flow,
     moe_sc: moe.Scratch,
+    gpa: std.mem.Allocator,
+    ablit: ?ablit.State, // TF_INK2_ABLIT: null leaves every visit unedited
+    ablit_hook: AblitHook,
 
-    pub fn init(c: *Ctx, d: *const cuda.Driver, w: *const weights.Weights, sched: visits.Schedule, cache: *Cache, o: cache_mod.Options) !void {
+    pub fn init(c: *Ctx, gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, w: *const weights.Weights, sched: visits.Schedule, cache: *Cache, o: cache_mod.Options) !void {
         const g = try Geometry.of(&w.cfg.text, o);
         c.d = d;
         c.text = w.cfg.text;
@@ -251,9 +262,13 @@ pub const Ctx = struct {
         c.moe_sc = try moe.Scratch.init(d, g.max_rows);
         errdefer c.moe_sc.deinit();
         c.env = .{ .driver = d, .loop = &c.loop, .ops = &c.ops };
+        c.gpa = gpa;
+        c.ablit_hook = applyAblit;
+        c.ablit = try ablit.open(gpa, io, d, g.hidden, c.text.layers);
     }
 
     pub fn deinit(c: *Ctx) void {
+        if (c.ablit) |*st| ablit.close(st, c.gpa);
         c.moe_sc.deinit();
         c.flow.deinit();
         c.scratch.deinit();

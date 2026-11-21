@@ -609,7 +609,7 @@ fn attnTrace(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !
     var cache = try ink2.cache.Cache.init(ctx.d, &sched, &w.cfg.text, co);
     defer cache.deinit();
     var c: ink2.engine.Ctx = undefined;
-    try c.init(ctx.d, &w, sched, &cache, co);
+    try c.init(gpa, io, ctx.d, &w, sched, &cache, co);
     defer c.deinit();
 
     const in_dir = try std.Io.Dir.cwd().openDir(io, in, .{});
@@ -935,7 +935,7 @@ const Session = struct {
         const co: ink2.cache.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = chunk_rows };
         s.cache = try ink2.cache.Cache.init(s.ctx.d, &s.sched, &s.w.cfg.text, co);
         errdefer s.cache.deinit();
-        try s.c.init(s.ctx.d, &s.w, s.sched, &s.cache, co);
+        try s.c.init(gpa, io, s.ctx.d, &s.w, s.sched, &s.cache, co);
     }
 
     fn deinit(s: *Session) void {

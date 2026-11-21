@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Inkling 2: the engine opens `TF_INK2_ABLIT` at start (`Ctx.init`) and `attn_visit.run` applies the residual edit to its `wo_ud` output on every visit of every pass, for prompt rows and decode rows alike, through the `Ctx.ablit_hook` seam; with the variable unset, empty or `0` no kernel is launched and the outputs are bit-identical to a build without the edit.
+
 - Inkling 2: chunked prefill runs a prompt through the 48 visits of Inkling 2 Mini `chunk_rows` rows at a time (`prefill.run`, default 512): the decode forward is now row-batched (`decode.forward`, `decode.step` is its one-row case), the attention, short convs, MoE, mixes and controllers take the chunk's rows, and the KV caches and conv states carry over from chunk to chunk, so decode goes on after the prompt as after a token-by-token run; the head runs on the last row only. `tf-ink2-check prefill` writes the reference's all-rows layout for a gate, and `greedy` now prefills its prompts in chunks.
 
 - Inkling 2: the output head of Inkling 2 Mini: `head.logits` multiplies the final-normed bf16 head input by the first `unpadded_vocab_size` rows of `unembed.weight` into fp32 logits and applies the logit softcap in fp32, `head.argmax` picks the first index of the largest logit, the decode teacher can also replace the head input after the last visit, `tf-ink2-check decode --visits 0-47` writes `step<s>/logits.f32` and the device pick, and `tf-ink2-check greedy` feeds prompts one token at a time and picks tokens greedily (refs #3476). Thanks to @ajensenwaud.

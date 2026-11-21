@@ -4,11 +4,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cuda = @import("cuda");
 const cache_mod = @import("cache.zig");
+const ablit = @import("ablit.zig");
 const config = @import("config.zig");
 const engine = @import("engine.zig");
 const kernels = @import("kernels.zig");
 const loop_kernels = @import("loop_kernels.zig");
 const ops = @import("ops.zig");
+const plan = @import("plan.zig");
 const visits = @import("visits.zig");
 const weights = @import("weights.zig");
 
@@ -136,6 +138,12 @@ pub fn run(c: *engine.Ctx, s: cuda.Stream, v: visits.Visit, lw: *const weights.L
     try kernels.relTable(&c.attn, s, call, r.rel, lw.rel_logits_proj.ptr, r.table);
     try kernels.attend(&c.attn, s, call, layer, g.stride, g.slots(), r.q, kv, r.table, r.part_o, r.part_ml, r.sink, r.gate, r.out);
     try linear(c, s, r.out, lw.wo_ud, rows, g.hidden, q_dim, out);
+    try applyEdit(c, s, v.layer, out, rows);
+}
+
+/// The residual edit of every visit's output, passes and prompt rows alike, when the engine holds one.
+fn applyEdit(c: *const engine.Ctx, s: cuda.Stream, layer: u32, out: u64, rows: usize) !void {
+    if (c.ablit) |*st| try c.ablit_hook(&c.loop, st, s, layer, out, rows, c.scratch.geometry.hidden);
 }
 
 const ts = std.testing;
@@ -186,4 +194,40 @@ test "weight shapes are checked" {
     var missing = good;
     missing.ptr = 0;
     try ts.expectError(error.WeightShape, shaped(missing, "x", &.{ 3072, 2304 }));
+}
+
+const Recorded = struct {
+    var layers: [visits.max_visits]u32 = undefined;
+    var rows: [visits.max_visits]usize = undefined;
+    var n: usize = 0;
+
+    fn hook(_: *const loop_kernels.Kernels, _: *const ablit.State, _: cuda.Stream, layer: u32, _: u64, rows_: usize, _: u32) anyerror!void {
+        layers[n] = layer;
+        rows[n] = rows_;
+        n += 1;
+    }
+};
+
+test "attention output edit is applied once per visit" {
+    var why: config.Why = .{};
+    const cfg = try config.parse(ts.allocator, config_test.mini, &why);
+    const prec: [config.max_layers]plan.Precision = @splat(.nvfp4);
+    const p = try plan.build(&cfg.text, prec[0..cfg.text.layers]);
+    const sched = try visits.build(&cfg, &p);
+    var c: engine.Ctx = undefined;
+    c.scratch.geometry.hidden = 2304;
+    c.ablit = @as(ablit.State, undefined);
+    c.ablit_hook = Recorded.hook;
+    var d: cuda.Driver = undefined;
+    const s: cuda.Stream = .{ .d = &d, .handle = null };
+    Recorded.n = 0;
+    for (sched.visits[0..sched.n]) |v| try applyEdit(&c, s, v.layer, 0, 7);
+    try ts.expectEqual(@as(usize, 48), Recorded.n);
+    for (sched.visits[0..sched.n], Recorded.layers[0..Recorded.n], Recorded.rows[0..Recorded.n]) |v, l, r| {
+        try ts.expectEqual(v.layer, l);
+        try ts.expectEqual(@as(usize, 7), r);
+    }
+    c.ablit = null;
+    for (sched.visits[0..sched.n]) |v| try applyEdit(&c, s, v.layer, 0, 7);
+    try ts.expectEqual(@as(usize, 48), Recorded.n);
 }
