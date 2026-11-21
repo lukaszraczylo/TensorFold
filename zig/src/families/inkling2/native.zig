@@ -11,6 +11,7 @@ const plan = @import("plan.zig");
 const visits = @import("visits.zig");
 const weights = @import("weights.zig");
 const be = @import("backend.zig");
+const drafter = @import("drafter.zig");
 
 pub const model_type = "inkling2_loop";
 pub const formats: []const []const u8 = &.{"modelopt-nvfp4"};
@@ -77,6 +78,7 @@ test "a window past the checkpoint's maximum is cut to it, and a zero maximum is
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     if (kernels != null) return error.CapturedKernels;
     const embed_host = try platform.environment.read(bool, embed_host_env, false);
+    const mtp = try platform.environment.read(bool, drafter.enable_env, false);
     const room: u64 = if (o.room) |r| r.read(r.ctx) orelse 0 else std.math.maxInt(u64);
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
@@ -87,7 +89,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     var n: u32 = @max(o.lanes, 1);
     while (true) {
         const wo: budget.Options = .{ .context = context, .streams = n, .chunk_rows = prompt_rows, .embed_host = embed_host };
-        own.w = weights.load(gpa, io, weights.deviceUploader(ctx.d), dir, wo, room) catch |e| {
+        const draft_bytes: u64 = if (mtp) try draftBytes(gpa, io, dir, n) else 0;
+        own.w = weights.load(gpa, io, weights.deviceUploader(ctx.d), dir, wo, room -| draft_bytes) catch |e| {
             if (e != error.OverBudget or o.lanes_fixed or n == 1) return e;
             n -= 1;
             std.log.warn("--parallel {d} does not fit the CUDA memory budget at a {d}-token window: trying {d} stream{s}", .{ n + 1, context, n, if (n == 1) "" else "s" });
@@ -104,12 +107,12 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.cache.deinit();
     own.c.init(gpa, io, ctx.d, &own.w, own.sched, &own.cache, co) catch |e| return if (e == error.FileNotFound) error.AblitFileMissing else e; // the only file `Ctx.init` reads
     errdefer own.c.deinit();
-    own.ib = try be.Inkling.init(gpa, &own.c, own.stream, n, context);
+    own.ib = try be.Inkling.init(gpa, &own.c, own.stream, n, context, if (mtp) .{ .io = io, .dir = dir } else null);
     errdefer own.ib.deinit();
     return .{
         .backend = own.ib.backend(),
         .facts = own.ib.facts(),
-        .rows = window_rows,
+        .rows = if (mtp) be.mtp_rows else window_rows,
         .stream_bytes = @intCast(cache.bytes(&own.sched, text, .{ .context = context, .streams = 1, .chunk_rows = prompt_rows })),
         .free_streams = n,
         .ctx = own,
@@ -117,6 +120,24 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .target = &own.ib,
     };
 }
+
+/// What the draft head holds beyond the target: the checkpoint's mtp.safetensors, the fold of its Markov bias through the
+/// unembedding, each stream's tapped rows and the head's scratch.
+fn draftBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, streams: u32) !u64 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = try weights.readConfig(a, io, dir);
+    const m = cfg.mtp orelse return error.NoDraftHead;
+    const path = try std.fs.path.join(a, &.{ dir, drafter.file_name });
+    const file = try std.Io.Dir.cwd().statFile(io, path, .{});
+    const fold = @as(u64, cfg.text.unpadded_vocab) * m.rank * 2;
+    const taps = @as(u64, streams) * prompt_rows * m.taps_n * cfg.text.hidden * 2;
+    return file.size + fold + taps + draft_scratch_bytes;
+}
+
+/// The head's scratch buffers (drafter.zig) and a window's logits, with room to spare.
+const draft_scratch_bytes: u64 = 256 << 20;
 
 /// The device bytes the host pre-check counts: the text weights, without the tower or a host-gathered embedding.
 pub fn tensorWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, vision: bool) !u64 {
@@ -135,15 +156,15 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.PastContext => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
         error.NoFreeSlot => "every stream's caches are in use: retry once another request ends",
-        error.NoDraftHead => "Inkling 2 Mini on CUDA has no draft head: it decodes one token a step",
+        error.NoDraftHead => "Inkling 2 Mini on CUDA has no draft head unless TF_INK2_MTP=1 loads the checkpoint's mtp.safetensors: it decodes one token a step",
         error.InklingTextOnly => "Inkling 2 Mini on CUDA reads text only: this request has images",
         error.StructuresUnsupported => "structured output is not built for Inkling 2 Mini on CUDA yet",
-        error.WindowTooWide => "Inkling 2 Mini on CUDA verifies one row a window: it takes no drafts",
+        error.WindowTooWide => "Inkling 2 Mini on CUDA verifies one row a window (eight with TF_INK2_MTP=1): the window is wider",
         error.NonFiniteLogits => "the model's logits went non-finite at this row: the request is stopped rather than answered from them",
         error.ZeroMaxContext => "the checkpoint's config.json gives model_max_length 0: it must be a positive token count",
         error.CapturedKernels => "Inkling 2 Mini runs on the engine's own kernels: unset TENSORFOLD_CUDA_KERNELS",
         error.OverBudget => "the CUDA memory budget does not hold Inkling 2 Mini's weights, caches and scratch at this --context and --parallel: lower either one, set TF_INK2_EMBED_HOST=1 to read the embedding rows from the host, or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
-        error.InvalidEnvironment => "a TF_INK2_* setting is invalid: TF_INK2_EMBED_HOST is 0 or 1, TF_INK2_ABLIT a file path (or 0), TF_INK2_ABLIT_SCALE a number above 0 and up to 16",
+        error.InvalidEnvironment => "a TF_INK2_* setting is invalid: TF_INK2_EMBED_HOST and TF_INK2_MTP are 0 or 1, TF_INK2_ABLIT a file path (or 0), TF_INK2_ABLIT_SCALE a number above 0 and up to 16",
         error.AblitFileMissing => "TF_INK2_ABLIT names a file that does not exist: give the path of the TFINK2A1 edit file, or unset it",
         error.BadSize => "TF_INK2_ABLIT: the edit file's size does not match its header or this model",
         error.BadMagic => "TF_INK2_ABLIT: the file is not a TFINK2A1 edit file",

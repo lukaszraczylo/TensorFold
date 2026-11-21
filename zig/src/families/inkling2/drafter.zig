@@ -17,7 +17,7 @@ const Checkpoint = core.checkpoint.Checkpoint;
 
 pub const enable_env = "TF_INK2_MTP";
 
-const file_name = "mtp.safetensors";
+pub const file_name = "mtp.safetensors";
 const bf16_bytes = 2;
 const f32_bytes = 4;
 /// The head's norm epsilon (mtp_config rms_norm_eps).
