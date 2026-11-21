@@ -332,6 +332,12 @@ fn teach(c: *engine.Ctx, s: cuda.Stream, op: bank.Op, qn: u32, vec: []const f32)
     try s.synchronize(); // the host copy goes out of scope
 }
 
+/// The teacher replaces the carried input after visit `i` when a visit follows, and after the last visit of the schedule,
+/// whose carried input is the head's `h` (the trace sees the engine's own first).
+fn teachesAfter(i: u32, last_visit: u32, op: bank.Op) bool {
+    return i < last_visit or op.next == .head;
+}
+
 /// Visits `0..last_visit` of the schedule for one token at position `pos` of `stream`. The carried vector after each
 /// visit, each visit's MoE input and a pass > 0 visit's messages and controller outputs go to `h.trace`; `h.teacher`
 /// replaces the carried vector, the messages and the MoE input, so errors cannot accumulate.
@@ -362,7 +368,7 @@ pub fn step(c: *engine.Ctx, s: cuda.Stream, stream: u32, token: u32, pos: u64, l
             try s.synchronize();
             try tr.visit(tr.ctx, i, t.ptr, t.qn);
         }
-        if (i < last_visit) if (h.teacher) |te| if (te.input(te.ctx, i)) |vec| try teach(c, s, op, t.qn, vec);
+        if (teachesAfter(i, last_visit, op)) if (h.teacher) |te| if (te.input(te.ctx, i)) |vec| try teach(c, s, op, t.qn, vec);
     }
     try s.synchronize();
 }
@@ -411,6 +417,17 @@ test "the loop visits read the bank, the messages and the prelude destinations" 
         // a pass > 0 visit reads the fp32 dest: from the previous visit's mix, or the prelude destinations at a restart
         if (i > 0 and v.pass > 0) try ts.expect(p[i - 1].next == (if (v.restart) bank.NextInput.prelude_dests else bank.NextInput.mix_fp32));
         if (v.restart) try ts.expect(!config.isGlobal(v.layer)); // the prelude destinations have one row
+    }
+    try ts.expect(p[47].next == .head);
+}
+
+test "the teacher replaces the head input after the last visit only" {
+    const m = try miniSchedule();
+    const p = bank.plan(&m.s, &m.cfg);
+    for (0..m.s.n) |i| {
+        // a run that stops at visit `i` before the end hands the next visit's input to nobody
+        try ts.expectEqual(i == m.s.n - 1, teachesAfter(@intCast(i), @intCast(i), p[i]));
+        try ts.expect(teachesAfter(@intCast(i), @intCast(m.s.n - 1), p[i]) == (i + 1 < m.s.n or p[i].next == .head));
     }
     try ts.expect(p[47].next == .head);
 }

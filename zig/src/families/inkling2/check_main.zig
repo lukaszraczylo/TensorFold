@@ -13,6 +13,8 @@ const usage =
     \\ablit --file F --layer L --mult M --in DIR: reads DIR/y.bf16 ([N, 2304]), applies the edit file F at layer L with scale multiplier M, writes y.bf16
     \\attn --model DIR --layer L --pass P --n N --rows R [--pos0 P0] --in DIR: reads DIR/xs.bf16 ([N, 3, 2304]: xq, xk, xv a step), runs the visit (L, P)'s attention on them R rows a call from position P0 with the visit's caches carried (P0 > 0: k0.bf16 and v0.bf16 [keep, 8, 128] fill the rows before it), writes out.bf16 ([N, 2304], the wo_ud projection)
     \\decode --model DIR --steps FILE.json --visits A-B [--teacher GOLDEN_DIR] [--layers staged] [--dump-kv L:P,...] --out DIR: runs the single-token steps of FILE.json ({"steps": [[id], ...]}) from position 0 through visits 0..B (B at most 47), the carried input after each visit, each visit's MoE input and a pass > 0 visit's messages replaced by GOLDEN_DIR's (ref.capture layout: visit<VV>.f32, mlp<VV>.f32, msg<VV>.f32) when given, and writes step<s>/visit<VV>.f32 and step<s>/mlp<VV>.f32 (the MoE input before the replacement), for a visit with pass > 0 step<s>/xs<VV>.f32 and msg<VV>.f32 (controller outputs, messages), for visits A..B, and a manifest.json in the reference's layout; --dump-kv writes the K and V rows of those (layer, pass) visits after the last step as kv/L<l>p<p>.<k|v>.bf16 ([steps, 8, 128])
+    \\    With --visits ending at the last visit it also runs the head on the carried input after it (the golden's when --teacher is given, so the logits show the head alone) and writes step<s>/logits.f32 ([unpadded_vocab], softcapped fp32) and step<s>/argmax.u32 (the device pick, checked against a host pick); with --teacher also step<s>/logits_free.f32, the logits of the engine's own last-visit output
+    \\greedy --model DIR --prompts FILE.json --n N --out DIR: FILE.json is {"prompts": [[id, ...], ...]}; each prompt is fed one token at a time from position 0 (conv states cleared between prompts), then N tokens are picked greedily (lowest id on ties); writes tokens.u32 ([prompts, N]) and p<P>/logits<GG>.f32 ([unpadded_vocab]) for each picked token
     \\weights --model DIR [--layers A-B] [--readback NAME,...]: uploads the text weights (TF_INK2_EMBED_HOST=1 keeps the
     \\    embedding on the host), writes DIR/weights.json with peak_rss_mib and device_bytes, and one row per readback
     \\    tensor (names below model.llm., e.g. layers.0.attn.wo_ud.weight)
@@ -48,6 +50,7 @@ const Args = struct {
     visits: ?ink2.budget.LayerRange = null,
     staged: bool = false,
     dump_kv: ?[]const u8 = null,
+    prompts: ?[]const u8 = null,
 };
 
 fn parseLayers(text: []const u8) !ink2.budget.LayerRange {
@@ -64,7 +67,7 @@ fn parseArgs(args: []const [:0]const u8) !Args {
         const v: []const u8 = args[i + 1];
         if (std.mem.eql(u8, args[i], "--out")) a.out = v else if (std.mem.eql(u8, args[i], "--model")) a.model = v else if (std.mem.eql(u8, args[i], "--in")) a.in = v else if (std.mem.eql(u8, args[i], "--layers")) {
             if (std.mem.eql(u8, v, staged_layers)) a.staged = true else a.layers = try parseLayers(v);
-        } else if (std.mem.eql(u8, args[i], "--steps")) a.steps = v else if (std.mem.eql(u8, args[i], "--teacher")) a.teacher = v else if (std.mem.eql(u8, args[i], "--visits")) a.visits = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--dump-kv")) a.dump_kv = v else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else if (std.mem.eql(u8, args[i], "--pass")) a.pass = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--pos0")) a.pos0 = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--n")) a.n = try std.fmt.parseInt(usize, v, 10) else return error.Usage;
+        } else if (std.mem.eql(u8, args[i], "--steps")) a.steps = v else if (std.mem.eql(u8, args[i], "--teacher")) a.teacher = v else if (std.mem.eql(u8, args[i], "--visits")) a.visits = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--dump-kv")) a.dump_kv = v else if (std.mem.eql(u8, args[i], "--prompts")) a.prompts = v else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else if (std.mem.eql(u8, args[i], "--pass")) a.pass = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--pos0")) a.pos0 = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--n")) a.n = try std.fmt.parseInt(usize, v, 10) else return error.Usage;
     }
     return a;
 }
@@ -123,6 +126,10 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (std.mem.eql(u8, a.sub, "decode")) {
         try decodeRun(init, a, out);
+        return 0;
+    }
+    if (std.mem.eql(u8, a.sub, "greedy")) {
+        try greedyRun(init, a, out);
         return 0;
     }
     if (std.mem.eql(u8, a.sub, "conv")) {
@@ -704,6 +711,8 @@ const DecodeTrace = struct {
     first: u32,
     step: usize = 0,
     buf: []u8,
+    /// Set with a teacher: the engine's own head input of the last visit goes through the head before the teacher's replaces it.
+    head_free: ?*HeadRun = null,
 
     fn put(t: *DecodeTrace, kind: []const u8, v: u32, ptr: u64, n: usize) !void {
         if (v < t.first) return;
@@ -714,7 +723,13 @@ const DecodeTrace = struct {
     }
 
     fn visit(ctx: *anyopaque, v: u32, inp: u64, qn: u32) anyerror!void {
-        try put(@ptrCast(@alignCast(ctx)), "visit", v, inp, qn);
+        const t: *DecodeTrace = @ptrCast(@alignCast(ctx));
+        try put(t, "visit", v, inp, qn);
+        if (t.head_free) |h| if (v == h.last_visit) {
+            _ = try h.run();
+            var name: [64]u8 = undefined;
+            try h.put(t.rows, try std.fmt.bufPrint(&name, "step{d}/logits_free", .{t.step}));
+        };
     }
 
     fn mlp(ctx: *anyopaque, v: u32, mlp_in: u64) anyerror!void {
@@ -795,6 +810,94 @@ fn dumpKv(gpa: std.mem.Allocator, rows_out: *ink2.check_rows.Writer, cache: *con
     }
 }
 
+/// The head on the carried input of the last visit: logits and the device pick, with the logits on the host.
+const HeadRun = struct {
+    c: *ink2.engine.Ctx,
+    s: cuda.Stream,
+    scratch: ink2.head.Scratch,
+    host: []f32,
+    last_visit: u32,
+
+    fn init(gpa: std.mem.Allocator, c: *ink2.engine.Ctx, s: cuda.Stream) !HeadRun {
+        const n: usize = c.text.unpadded_vocab;
+        const host = try gpa.alloc(f32, n);
+        errdefer gpa.free(host);
+        return .{ .c = c, .s = s, .scratch = try ink2.head.Scratch.init(c.d, 1, n), .host = host, .last_visit = c.sched.n - 1 };
+    }
+
+    fn deinit(h: *HeadRun, gpa: std.mem.Allocator) void {
+        h.scratch.deinit();
+        gpa.free(h.host);
+    }
+
+    /// Logits of the carried input now in the flow, into `host`; returns the device pick, which a host pick must repeat.
+    fn run(h: *HeadRun) !u32 {
+        const r = h.scratch.r;
+        try ink2.head.logits(h.c, h.s, h.c.flow.r.inp, 1, r.logits);
+        try ink2.head.argmax(h.c, h.s, r.logits, 1, r.val, r.id);
+        try h.s.synchronize();
+        try cuda.memory.download(h.c.d, r.logits, std.mem.sliceAsBytes(h.host));
+        var id: u32 = undefined;
+        try cuda.memory.download(h.c.d, r.id, std.mem.asBytes(&id));
+        if (ink2.head.hostArgmax(h.host)) |want| if (want != id) {
+            std.debug.print("head: device pick {d} but host pick {d}\n", .{ id, want });
+            return error.Inkling2PickMismatch;
+        };
+        return id;
+    }
+
+    fn put(h: *const HeadRun, rows_out: *ink2.check_rows.Writer, name: []const u8) !void {
+        try rows_out.put(name, .f32, &.{h.host.len}, std.mem.sliceAsBytes(h.host));
+    }
+};
+
+/// The device, the weights through `last_visit`, the caches and the engine context, in place: `c` points into them.
+const Session = struct {
+    driver: cuda.Driver,
+    ctx: cuda.Context,
+    stream: cuda.Stream,
+    w: ink2.weights.Weights,
+    sched: ink2.visits.Schedule,
+    cache: ink2.cache.Cache,
+    c: ink2.engine.Ctx,
+
+    /// Weights of the layers visits 0..`last_visit` (default: the whole schedule) read, or `layers` when given.
+    fn open(s: *Session, gpa: std.mem.Allocator, io: std.Io, model: []const u8, last_visit: ?u32, layers: ?ink2.budget.LayerRange) !void {
+        s.driver = try cuda.Driver.open();
+        errdefer s.driver.close();
+        s.ctx = try cuda.Context.init(&s.driver, 0);
+        errdefer s.ctx.deinit();
+        s.stream = try cuda.Stream.init(s.ctx.d, true);
+        errdefer s.stream.deinit();
+
+        const embed_host = try environment.read(bool, embed_host_env, false);
+        const planned = try scheduleOf(gpa, io, model);
+        const last = last_visit orelse planned.n - 1;
+        if (last >= planned.n) return error.VisitsPastSchedule;
+        const range = layers orelse ink2.budget.LayerRange{ .first = 0, .last = ink2.decode.layersRead(&planned, last) };
+        const o: ink2.budget.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = decode_chunk_rows, .embed_host = embed_host, .layers = range };
+        s.w = try ink2.weights.load(gpa, io, ink2.weights.deviceUploader(s.ctx.d), model, o, device_limit);
+        errdefer s.w.deinit();
+        const layer_plan = try ink2.plan.build(&s.w.cfg.text, s.w.prec[0..s.w.cfg.text.layers]);
+        s.sched = try ink2.visits.build(&s.w.cfg, &layer_plan);
+        if (s.sched.n != planned.n) return error.VisitsPastSchedule;
+
+        const co: ink2.cache.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = decode_chunk_rows };
+        s.cache = try ink2.cache.Cache.init(s.ctx.d, &s.sched, &s.w.cfg.text, co);
+        errdefer s.cache.deinit();
+        try s.c.init(s.ctx.d, &s.w, s.sched, &s.cache, co);
+    }
+
+    fn deinit(s: *Session) void {
+        s.c.deinit();
+        s.cache.deinit();
+        s.w.deinit();
+        s.stream.deinit();
+        s.ctx.deinit();
+        s.driver.close();
+    }
+};
+
 /// Single-token steps of `--steps` from position 0 through visits 0..B of the model; see `usage`.
 fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
     const gpa = init.gpa;
@@ -812,39 +915,20 @@ fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
     if (steps.len == 0 or steps.len > dev_context) return error.BadSteps;
     for (steps) |ids| if (ids.len != 1) return error.BadSteps;
 
-    var driver = try cuda.Driver.open();
-    defer driver.close();
-    var ctx = try cuda.Context.init(&driver, 0);
-    defer ctx.deinit();
-    var stream = try cuda.Stream.init(ctx.d, true);
-    defer stream.deinit();
-
     var kv_buf: [max_kv_dumps]KvVisit = undefined;
     const kv: []const KvVisit = if (a.dump_kv) |list| try parseKvVisits(list, &kv_buf) else &.{};
 
-    const embed_host = try environment.read(bool, embed_host_env, false);
-    const planned = try scheduleOf(gpa, io, model);
-    if (range.last >= planned.n) return error.VisitsPastSchedule;
-    const layers = a.layers orelse ink2.budget.LayerRange{ .first = 0, .last = ink2.decode.layersRead(&planned, range.last) };
-    const o: ink2.budget.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = decode_chunk_rows, .embed_host = embed_host, .layers = layers };
-    var w = try ink2.weights.load(gpa, io, ink2.weights.deviceUploader(ctx.d), model, o, device_limit);
-    defer w.deinit();
-    const layer_plan = try ink2.plan.build(&w.cfg.text, w.prec[0..w.cfg.text.layers]);
-    const sched = try ink2.visits.build(&w.cfg, &layer_plan);
-    if (sched.n != planned.n) return error.VisitsPastSchedule;
-
-    const co: ink2.cache.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = decode_chunk_rows };
-    var cache = try ink2.cache.Cache.init(ctx.d, &sched, &w.cfg.text, co);
-    defer cache.deinit();
-    var c: ink2.engine.Ctx = undefined;
-    try c.init(ctx.d, &w, sched, &cache, co);
-    defer c.deinit();
+    var session: Session = undefined;
+    try session.open(gpa, io, model, range.last, a.layers);
+    defer session.deinit();
+    const c = &session.c;
+    const sched = session.sched;
 
     var rows_out = try ink2.check_rows.Writer.init(gpa, io, out);
     defer rows_out.deinit();
     const trace_buf = try gpa.alloc(u8, ink2.loop_kernels.n_streams * loop_hidden * @sizeOf(f32));
     defer gpa.free(trace_buf);
-    var tracer: DecodeTrace = .{ .d = ctx.d, .rows = &rows_out, .first = range.first, .buf = trace_buf };
+    var tracer: DecodeTrace = .{ .d = c.d, .rows = &rows_out, .first = range.first, .buf = trace_buf };
 
     var golden_dir: ?std.Io.Dir = null;
     defer if (golden_dir) |*dir| dir.close(io);
@@ -856,6 +940,13 @@ fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
         teacher.dir = golden_dir.?;
     }
 
+    // the head runs when the visits reach the last one
+    const with_head = range.last + 1 == sched.n;
+    var head_run: HeadRun = undefined;
+    if (with_head) head_run = try HeadRun.init(gpa, c, session.stream);
+    defer if (with_head) head_run.deinit(gpa);
+    if (with_head and a.teacher != null) tracer.head_free = &head_run;
+
     const hooks: ink2.decode.Hooks = .{
         .trace = .{ .ctx = &tracer, .visit = DecodeTrace.visit, .mlp = DecodeTrace.mlp, .xs = DecodeTrace.xs, .msg = DecodeTrace.msg },
         .teacher = if (a.teacher != null) .{ .ctx = &teacher, .input = GoldenTeacher.input, .mlp = GoldenTeacher.mlp, .msg = GoldenTeacher.msg } else null,
@@ -866,13 +957,84 @@ fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
         tracer.step = s;
         teacher.step = s;
         metas[s] = .{ .n = 1, .pos0 = s };
-        try ink2.decode.step(&c, stream, 0, ids[0], s, range.last, hooks);
+        try ink2.decode.step(c, session.stream, 0, ids[0], s, range.last, hooks);
         if (teacher.err) |e| return e;
+        if (with_head) {
+            const pick = try head_run.run();
+            var name: [64]u8 = undefined;
+            try head_run.put(&rows_out, try std.fmt.bufPrint(&name, "step{d}/logits", .{s}));
+            try rows_out.put(try std.fmt.bufPrint(&name, "step{d}/argmax", .{s}), .u32, &.{1}, std.mem.asBytes(&pick));
+        }
     }
 
-    try dumpKv(gpa, &rows_out, &cache, &sched, &w.cfg.text, kv, range.last, steps.len);
+    try dumpKv(gpa, &rows_out, &session.cache, &sched, &session.w.cfg.text, kv, range.last, steps.len);
     var qn: [ink2.visits.max_visits]u32 = undefined;
     for (qn[0..sched.n], 0..) |*q, i| q.* = ink2.decode.carriedRows(&sched, @intCast(i));
-    try rows_out.finishRun(.{ .hidden = loop_hidden, .visits = sched.n, .unpadded_vocab = w.cfg.text.unpadded_vocab, .qn = qn[0..sched.n], .steps = metas });
-    std.debug.print("decode: {d} steps, visits {d}-{d}, device_bytes {d}\n", .{ steps.len, range.first, range.last, w.device_bytes });
+    try rows_out.finishRun(.{ .hidden = loop_hidden, .visits = sched.n, .unpadded_vocab = session.w.cfg.text.unpadded_vocab, .qn = qn[0..sched.n], .steps = metas });
+    std.debug.print("decode: {d} steps, visits {d}-{d}, device_bytes {d}\n", .{ steps.len, range.first, range.last, session.w.device_bytes });
+    if (with_head) {
+        const b = ink2.head.deviceBytes(&session.w.cfg.text, 1);
+        std.debug.print("head: unembed {d} B (in device_bytes), scratch {d} B\n", .{ b.unembed, b.scratch });
+    }
+}
+
+const GreedyPrompts = struct { prompts: []const []const u32 };
+
+/// Each prompt of `--prompts` one token at a time from position 0, then `--n` greedy tokens; see `usage`.
+fn greedyRun(init: std.process.Init, a: Args, out: []const u8) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const model = a.model orelse return error.Usage;
+    const prompts_path = a.prompts orelse return error.Usage;
+    const n = a.n orelse return error.Usage;
+
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, prompts_path, gpa, .limited(1 << 22));
+    defer gpa.free(text);
+    const parsed = try std.json.parseFromSlice(GreedyPrompts, gpa, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const prompts = parsed.value.prompts;
+    if (prompts.len == 0 or n == 0) return error.BadPrompts;
+
+    var session: Session = undefined;
+    try session.open(gpa, io, model, null, a.layers);
+    defer session.deinit();
+    const c = &session.c;
+    const vocab = c.text.unpadded_vocab;
+    for (prompts) |ids| {
+        if (ids.len == 0 or ids.len + n > dev_context) return error.BadPrompts;
+        for (ids) |id| if (id >= vocab) return error.BadPrompts;
+    }
+
+    var head_run = try HeadRun.init(gpa, c, session.stream);
+    defer head_run.deinit(gpa);
+    var rows_out = try ink2.check_rows.Writer.init(gpa, io, out);
+    defer rows_out.deinit();
+    const tokens = try gpa.alloc(u32, prompts.len * n);
+    defer gpa.free(tokens);
+
+    const last = session.sched.n - 1;
+    for (prompts, 0..) |ids, p| {
+        try session.cache.clear(session.stream, 0);
+        var pos: usize = 0;
+        var cur: u32 = ids[0];
+        while (true) {
+            try ink2.decode.step(c, session.stream, 0, cur, pos, last, .{});
+            pos += 1;
+            if (pos < ids.len) {
+                cur = ids[pos];
+                continue;
+            }
+            const g = pos - ids.len;
+            const pick = try head_run.run();
+            tokens[p * n + g] = pick;
+            var name: [64]u8 = undefined;
+            try head_run.put(&rows_out, try std.fmt.bufPrint(&name, "p{d}/logits{d:0>2}", .{ p, g }));
+            if (g + 1 == n) break;
+            cur = pick;
+        }
+    }
+    try rows_out.put("tokens", .u32, &.{ prompts.len, n }, std.mem.sliceAsBytes(tokens));
+    try rows_out.finish();
+    const b = ink2.head.deviceBytes(&session.w.cfg.text, 1);
+    std.debug.print("greedy: {d} prompts, {d} tokens each, device_bytes {d}, head unembed {d} B (in device_bytes), scratch {d} B\n", .{ prompts.len, n, session.w.device_bytes, b.unembed, b.scratch });
 }
