@@ -10,6 +10,7 @@ const engine = @import("engine.zig");
 const loop_kernels = @import("loop_kernels.zig");
 const moe = @import("moe.zig");
 const ops = @import("ops.zig");
+const prof = @import("prof.zig");
 const visits = @import("visits.zig");
 const weights = @import("weights.zig");
 
@@ -395,6 +396,7 @@ pub fn forward(c: *engine.Ctx, s: cuda.Stream, stream: u32, ids: []const u32, p0
         const i: u32 = @intCast(idx);
         const v = c.sched.visits[i];
         const op = plan[i];
+        prof.at(@intCast(i));
         if (op.bank_from) |from| try saveBank(c, s, from, n);
         try attnInputs(c, s, i, v, op, span, h);
         try sublayers(c, s, stream, i, v, op, span, h);

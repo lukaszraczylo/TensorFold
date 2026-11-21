@@ -22,6 +22,7 @@ pub const engine = @import("engine.zig");
 pub const attn_visit = @import("attn_visit.zig");
 pub const decode = @import("decode.zig");
 pub const head = @import("head.zig");
+pub const prof = @import("prof.zig");
 pub const prefill = @import("prefill.zig");
 pub const backend = @import("backend.zig");
 pub const native = @import("native.zig");
@@ -48,6 +49,7 @@ test {
     _ = cache;
     _ = engine;
     _ = attn_visit;
+    _ = prof;
     _ = decode;
     _ = head;
     _ = prefill;

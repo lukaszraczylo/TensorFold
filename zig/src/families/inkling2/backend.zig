@@ -5,6 +5,7 @@ const lanes = @import("lanes");
 const decode = @import("decode.zig");
 const engine = @import("engine.zig");
 const head = @import("head.zig");
+const prof = @import("prof.zig");
 const ops = @import("ops.zig");
 const pre = @import("prefill.zig");
 
@@ -67,6 +68,7 @@ pub const Inkling = struct {
     pub fn init(gpa: std.mem.Allocator, c: *engine.Ctx, s: cuda.Stream, streams: u32, context: usize) !Inkling {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         const d = c.d;
+        try prof.install(d);
         const vocab: usize = c.text.unpadded_vocab;
         const free = try gpa.alloc(bool, streams);
         errdefer gpa.free(free);
@@ -228,10 +230,14 @@ pub const Inkling = struct {
     /// `token` at the stream's next position through every visit, then the draw of the one after at `position`.
     fn step(x: *Inkling, l: *Lane, token: u32, position: u64) !u32 {
         if (position != l.len + 1) return error.PositionMismatch;
+        prof.begin(x.s.handle);
         try decode.step(x.c, x.s, l.slot, token, l.len, x.c.sched.n - 1, .{});
         l.len += 1;
+        prof.at(prof.tag_head);
         try head.logits(x.c, x.s, x.c.flow.r.inp, 1, x.heads[l.slot].r.logits);
-        return x.draw(l, position);
+        const tok = try x.draw(l, position);
+        prof.end();
+        return tok;
     }
 
     fn first(ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64 {
