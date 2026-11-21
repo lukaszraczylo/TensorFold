@@ -251,3 +251,70 @@ test "the real checkpoint's 24 shard headers and mtp.safetensors match the map (
     try t.expectEqual(@as(usize, 84), mtp.expected);
     try t.expect(mtp.clean());
 }
+
+const mini_fixture = @embedFile("fixtures/mini_model_header.txt");
+
+fn loadMini(a: std.mem.Allocator) !config.Config {
+    var why: config.Why = .{};
+    return config.parse(a, config_test.mini, &why);
+}
+
+test "mini header is clean against the loop map" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try loadMini(a);
+    const entries = try unfold(a, mini_fixture, "inkling2-mini-model");
+    const r = try names.check(a, &c, entries, .model);
+    try t.expectEqual(entries.count(), r.expected);
+    try t.expectEqual(@as(usize, 0), r.missing.items.len);
+    try t.expectEqual(@as(usize, 0), r.wrong.items.len);
+    try t.expectEqual(@as(usize, 0), r.unknown.items.len);
+}
+
+const Collect = struct {
+    arena: std.mem.Allocator,
+    names: std.ArrayList([]const u8) = .empty,
+
+    pub fn put(k: *Collect, name: []const u8, _: st.DType, _: []const u64) !void {
+        try k.names.append(k.arena, try k.arena.dupe(u8, name));
+    }
+};
+
+test "controllers on core layers only" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try loadMini(a);
+    var k: Collect = .{ .arena = a };
+    try names.loopTensors(&c, &k);
+    var controllers: usize = 0;
+    for (k.names.items) |n| {
+        if (std.mem.indexOf(u8, n, ".controllers.") == null) continue;
+        controllers += 1;
+        try t.expect(!std.mem.startsWith(u8, n, "model.llm.layers.5."));
+        try t.expect(!std.mem.startsWith(u8, n, "model.llm.layers.18."));
+    }
+    try t.expectEqual(@as(usize, 144), controllers);
+    try t.expectEqualStrings("model.llm.layers.6.controllers.attn.down_weight", k.names.items[0]);
+}
+
+test "a plain config adds no loop tensors" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try load(a);
+    var k: Collect = .{ .arena = a };
+    try names.loopTensors(&c, &k);
+    try t.expectEqual(@as(usize, 0), k.names.items.len);
+}
+
+test "precisions of mini: NVFP4 on layers 0 to 19, MXFP8 on 20 to 23" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try loadMini(a);
+    var prec: [config.max_layers]plan.Precision = undefined;
+    try names.precisions(try unfold(a, mini_fixture, "inkling2-mini-model"), c.text.layers, &prec);
+    for (0..c.text.layers) |i| try t.expectEqual(if (i < 20) plan.Precision.nvfp4 else plan.Precision.mxfp8, prec[i]);
+}

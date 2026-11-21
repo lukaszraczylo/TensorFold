@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Inkling 2: the weight map names the loop checkpoint's per-layer controllers (down, gain and forget weights for the attn, k, v and mlp streams of the core layers) and its two cross-pass query tensors, and Inkling 2 Mini's real safetensors header (1244 tensors) matches it with no missing, wrong or extra tensor (refs #3476). Thanks to @ajensenwaud.
+
 - Inkling 2: the host config accepts the looped `inkling2_loop` checkpoint (Inkling 2 Mini) and reads its core range, pass count and gate rank; a variable-depth loop or a core range off the attention-residual blocks is refused by name (refs #3476). Thanks to @ajensenwaud.
 
 - Server: Inkling 2 replies split into reasoning, text and tool calls by vLLM's block table. Each tool call takes the request's id, and a stream holds a block header back until the block names its kind (refs #3476). Thanks to @ajensenwaud.

@@ -155,11 +155,33 @@ fn draft(m: config.Mtp, text: *const Text, sink: anytype) !void {
     }
 }
 
+/// The streams each core layer's loop controller gates between passes.
+const controller_streams = [_][]const u8{ "attn", "k", "v", "mlp" };
+
+/// Loop controllers of the core layers and the cross-pass queries; none for a model without a loop.
+pub fn loopTensors(c: *const config.Config, sink: anytype) !void {
+    const l = c.loop orelse return;
+    const h: u64 = c.text.hidden;
+    const rank: u64 = l.gate_rank;
+    for (l.core_start..l.core_end) |i| {
+        inline for (controller_streams) |s| {
+            const pre = "model.llm.layers.{d}.controllers." ++ s ++ ".";
+            try put(sink, pre ++ "down_weight", .{i}, .bf16, &.{ rank, 2 * h });
+            try put(sink, pre ++ "gain_weight", .{i}, .bf16, &.{ h, rank });
+            try put(sink, pre ++ "forget_weight", .{i}, .bf16, &.{ h, rank });
+        }
+    }
+    const rows: u64 = 2 * @as(u64, l.core_end - l.core_start);
+    try put(sink, "model.llm.middle_cycle_cross_pass_queries", .{}, .f32, &.{ rows, h });
+    try put(sink, "model.llm.middle_cycle_cross_pass_kv_queries", .{}, .f32, &.{ rows, h });
+}
+
 /// Every tensor of `file` the config implies, as sink.put(name, dtype, dims); `prec` is one precision per layer.
 pub fn all(c: *const config.Config, prec: []const plan.Precision, file: File, sink: anytype) !void {
     switch (file) {
         .model => {
             try backbone(&c.text, prec, sink);
+            try loopTensors(c, sink);
             try vision(c.vision, sink);
         },
         .mtp => try draft(c.mtp orelse return error.NoDraftHead, &c.text, sink),
