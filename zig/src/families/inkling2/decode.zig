@@ -182,6 +182,7 @@ fn control(c: *engine.Ctx, s: cuda.Stream, w: weights.Controller, dest: u64, str
         .forget = try present(w.forget),
         .norm = norm,
         .h = f.gate_h,
+        .z = f.gate_z,
         .out = out,
         .rows = n,
     });

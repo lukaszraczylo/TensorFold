@@ -165,6 +165,7 @@ pub const FlowRegions = struct {
     mlp_dest: u64, // fp32 [rows, hidden]: the unnormed MLP input mix of a visit with pass > 0
     msg: u64, // fp32 [4, rows, hidden]: the cross-pass messages, streams attn, k, v, mlp
     gate_h: u64, // bf16 [rows, gate_rank]: a controller's down projection
+    gate_z: u64, // fp32 [rows, hidden]: a controller's blend before its norm
     total: u64,
 
     pub fn of(base: u64, rows: usize, hidden: usize) FlowRegions {
@@ -187,6 +188,7 @@ pub const FlowRegions = struct {
         r.mlp_dest = take(&at, row * f32_bytes);
         r.msg = take(&at, loop_kernels.n_streams * row * f32_bytes);
         r.gate_h = take(&at, rows * loop_kernels.gate_rank * bf16_bytes);
+        r.gate_z = take(&at, row * f32_bytes);
         r.total = at - base;
         return r;
     }
@@ -347,22 +349,22 @@ test "flow buffers for one row and for a 512-row chunk" {
     try ts.expectEqual(@as(u64, 3 * 9216), one.mlp_dest - one.mix);
     try ts.expectEqual(@as(u64, 9216), one.msg - one.mlp_dest);
     try ts.expectEqual(@as(u64, 4 * 9216), one.gate_h - one.msg);
-    try ts.expectEqual(@as(u64, 189440), one.total); // the 128-byte controller row rounds up to 256
+    try ts.expectEqual(@as(u64, 189440), one.total - 9216); // the 128-byte controller row rounds up to 256
     const big = FlowRegions.of(0, 512, 2304);
     try ts.expectEqual(@as(u64, 512 * 4608), big.stack[1] - big.stack[0]);
     try ts.expectEqual(@as(u64, 7 * 512 * 4608), big.dest);
     try ts.expectEqual(@as(u64, 512 * 9216), big.inp - big.dest);
     try ts.expectEqual(@as(u64, 58_984_448), big.mix);
-    try ts.expectEqual(@as(u64, 58_984_448 + 37_814_272), big.total);
+    try ts.expectEqual(@as(u64, 58_984_448 + 37_814_272), big.total - 512 * 9216);
 }
 
 test "flow regions are aligned and disjoint" {
     const r = FlowRegions.of(1 << 20, 64, 2304);
-    const ordered = r.stack ++ r.bank ++ [_]u64{ r.dest, r.inp, r.attn_pre, r.attn_out, r.mlp_in, r.moe_out, r.resid, r.wide, r.ids, r.emb, r.mix, r.mlp_dest, r.msg, r.gate_h };
+    const ordered = r.stack ++ r.bank ++ [_]u64{ r.dest, r.inp, r.attn_pre, r.attn_out, r.mlp_in, r.moe_out, r.resid, r.wide, r.ids, r.emb, r.mix, r.mlp_dest, r.msg, r.gate_h, r.gate_z };
     var prev: u64 = 1 << 20;
     for (ordered) |at| {
         try ts.expect(at % region_align == 0 and at >= prev);
         prev = at;
     }
-    try ts.expect(r.gate_h + 64 * loop_kernels.gate_rank * 2 <= (1 << 20) + r.total);
+    try ts.expect(r.gate_z + 64 * 2304 * 4 <= (1 << 20) + r.total);
 }

@@ -50,6 +50,7 @@ pub const Kernels = struct {
     msg: cuda.Function,
     ctl_down: cuda.Function,
     ctl_blend: cuda.Function,
+    ctl_apply: cuda.Function,
     ablit: cuda.Function,
     mix_add: cuda.Function,
     mix_f32: cuda.Function,
@@ -79,7 +80,8 @@ pub const Kernels = struct {
             .ex_sum = try mod.function("tf_ink2l_ex_sum"),
             .msg = try mod.function("tf_ink2l_msg"),
             .ctl_down = try mod.function("tf_ink2l_ctl_down"),
-            .ctl_blend = try mod.function("tf_ink2l_ctl_blend"),
+            .ctl_blend = try mod.function("tf_ink2l_ctl_blend_z"),
+            .ctl_apply = try mod.function("tf_ink2l_ctl_blend_apply"),
             .ablit = try mod.function("tf_ink2l_ablit"),
             .mix_add = try mod.function("tf_ink2l_mix_add"),
             .mix_f32 = try mod.function("tf_ink2l_mix_f32"),
@@ -255,20 +257,32 @@ pub fn messages(k: *const Kernels, s: cuda.Stream, bank: [msg_sources]u64, qa: u
 }
 
 /// One stream of one core layer: dest and msg float32 [rows, 2304], the controller's bf16 weights, the sublayer norm
-/// weight bf16 [2304]; h bf16 [rows, 64] is scratch and out bf16 [rows, 2304] the normed blend.
-pub const ControllerArgs = struct { dest: u64, msg: u64, down: u64, gain: u64, forget: u64, norm: u64, h: u64, out: u64, rows: usize };
+/// weight bf16 [2304]; h bf16 [rows, 64] and z float32 [rows, 2304] are scratch and out bf16 [rows, 2304] the normed blend.
+pub const ControllerArgs = struct { dest: u64, msg: u64, down: u64, gain: u64, forget: u64, norm: u64, h: u64, z: u64, out: u64, rows: usize };
+
+/// Ranks a `ctl_down` block computes, columns a `ctl_blend` block computes, columns an apply block normalises.
+const down_ranks = 2;
+const blend_cols = 8;
+const apply_threads = 128;
 
 pub fn controller(k: *const Kernels, s: cuda.Stream, a: ControllerArgs) !void {
     if (a.rows == 0) return;
-    const cfg: cuda.launch.Config = .{ .grid = .{ .x = @intCast(a.rows) }, .block = .{ .x = actq_threads } };
+    const down_cfg: cuda.launch.Config = .{ .grid = .{ .x = @intCast(a.rows * (gate_rank / down_ranks)) }, .block = .{ .x = down_ranks * 32 } };
     var down: cuda.Args = .{};
     for ([_]u64{ a.dest, a.msg, a.down, a.h }) |p| down.add(p);
     for ([_]usize{ a.rows, loop_hidden, gate_rank }) |v| down.add(@as(i32, @intCast(v)));
-    try cuda.launch.launch(k.ctl_down, cfg, s, &down);
+    try cuda.launch.launch(k.ctl_down, down_cfg, s, &down);
+    const blend_cfg: cuda.launch.Config = .{ .grid = .{ .x = @intCast(a.rows * (loop_hidden / blend_cols)) }, .block = .{ .x = actq_threads } };
     var blend: cuda.Args = .{};
-    for ([_]u64{ a.dest, a.msg, a.h, a.gain, a.forget, a.norm, a.out }) |p| blend.add(p);
+    for ([_]u64{ a.dest, a.msg, a.h, a.gain, a.forget, a.z }) |p| blend.add(p);
     for ([_]usize{ a.rows, loop_hidden, gate_rank }) |v| blend.add(@as(i32, @intCast(v)));
-    try cuda.launch.launch(k.ctl_blend, cfg, s, &blend);
+    try cuda.launch.launch(k.ctl_blend, blend_cfg, s, &blend);
+    const apply_cfg: cuda.launch.Config = .{ .grid = .{ .x = @intCast(a.rows * (loop_hidden / apply_threads)) }, .block = .{ .x = apply_threads } };
+    var apply: cuda.Args = .{};
+    for ([_]u64{ a.z, a.norm, a.out }) |p| apply.add(p);
+    apply.add(@as(i32, @intCast(a.rows)));
+    apply.add(@as(i32, loop_hidden));
+    try cuda.launch.launch(k.ctl_apply, apply_cfg, s, &apply);
 }
 
 const Fake = struct {
@@ -293,7 +307,7 @@ test "actq launches one block a row and refuses a width off the block" {
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16), .mix_add = fun.of(&d, 17), .mix_f32 = fun.of(&d, 18), .group = fun.of(&d, 19), .exg_gu_nvfp4 = fun.of(&d, 20), .exg_gu_mxfp8 = fun.of(&d, 21), .exg_down_nvfp4 = fun.of(&d, 22), .exg_down_mxfp8 = fun.of(&d, 23) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ctl_apply = fun.of(&d, 24), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16), .mix_add = fun.of(&d, 17), .mix_f32 = fun.of(&d, 18), .group = fun.of(&d, 19), .exg_gu_nvfp4 = fun.of(&d, 20), .exg_gu_mxfp8 = fun.of(&d, 21), .exg_down_nvfp4 = fun.of(&d, 22), .exg_down_mxfp8 = fun.of(&d, 23) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     try actNvfp4(&k, s, 0x1000, 0x2000, 64, 2304);
     try std.testing.expectEqual(@as(u32, 64), Fake.grid_x);
@@ -325,7 +339,7 @@ test "expert stages pick the format's kernel and launch a block a pair by column
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16), .mix_add = fun.of(&d, 17), .mix_f32 = fun.of(&d, 18), .group = fun.of(&d, 19), .exg_gu_nvfp4 = fun.of(&d, 20), .exg_gu_mxfp8 = fun.of(&d, 21), .exg_down_nvfp4 = fun.of(&d, 22), .exg_down_mxfp8 = fun.of(&d, 23) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ctl_apply = fun.of(&d, 24), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16), .mix_add = fun.of(&d, 17), .mix_f32 = fun.of(&d, 18), .group = fun.of(&d, 19), .exg_gu_nvfp4 = fun.of(&d, 20), .exg_gu_mxfp8 = fun.of(&d, 21), .exg_down_nvfp4 = fun.of(&d, 22), .exg_down_mxfp8 = fun.of(&d, 23) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     const g: ExpertGemm = .{ .w = 1, .scale = 2 };
     try expertGateUp(&k, s, .nvfp4, 0, 0, g, 0, 4, 2304, 2304);

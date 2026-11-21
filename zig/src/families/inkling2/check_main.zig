@@ -561,6 +561,8 @@ fn loopLayer(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !
     defer msgs.free();
     var h = try cuda.DeviceBuffer.alloc(ctx.d, rows * lk.gate_rank * 2);
     defer h.free();
+    var z = try cuda.DeviceBuffer.alloc(ctx.d, rows * loop_hidden * 4);
+    defer z.free();
     var y = try cuda.DeviceBuffer.alloc(ctx.d, block_bytes);
     defer y.free();
 
@@ -570,7 +572,7 @@ fn loopLayer(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !
     try stream.synchronize();
     try putDevice(gpa, &rows_out, &msgs, "msgs", .{}, .f32, &.{ lk.n_streams, rows, loop_hidden });
     for (lk.stream_names, 0..) |name, s| {
-        try lk.controller(&k, stream, .{ .dest = dest.ptr, .msg = msgs.ptr + s * f32_bytes, .down = ctl[s].down.ptr, .gain = ctl[s].gain.ptr, .forget = ctl[s].forget.ptr, .norm = norm.ptr, .h = h.ptr, .out = y.ptr, .rows = rows });
+        try lk.controller(&k, stream, .{ .dest = dest.ptr, .msg = msgs.ptr + s * f32_bytes, .down = ctl[s].down.ptr, .gain = ctl[s].gain.ptr, .forget = ctl[s].forget.ptr, .norm = norm.ptr, .h = h.ptr, .z = z.ptr, .out = y.ptr, .rows = rows });
         try stream.synchronize();
         try putDevice(gpa, &rows_out, &y, "ctl_{s}", .{name}, .bf16, &.{ rows, loop_hidden });
     }
