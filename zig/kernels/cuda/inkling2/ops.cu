@@ -820,6 +820,13 @@ extern "C" __global__ void tf_ink2_q8_to_bf16(const int8_t* __restrict__ q, cons
     out[i] = tobf(static_cast<float>(q[i]) * __half2float(scales[i / kQ8Block]));
 }
 
+// bf16 rows [rows][c] into dst's rows `dst_stride` elements apart: a tap's rows in the drafter's [row][tap][c] layout.
+extern "C" __global__ void tf_ink2_put_rows(const uint16_t* __restrict__ src, uint16_t* __restrict__ dst, int rows, int c, long long dst_stride) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<long long>(rows) * c) return;
+    dst[(i / c) * dst_stride + i % c] = src[i];
+}
+
 // A link step's words (header and ids) written to the device buffer every rank broadcasts from.
 struct Ink2Words {
     unsigned w[96];

@@ -118,7 +118,7 @@ fn inputNorms(lw: *const weights.LayerW, layer: u32) ![ops.max_queries]u64 {
 
 /// The embeddings of `ids` through embed_norm into `out` (bf16 [ids.len, hidden]); a host-resident table goes up in
 /// pieces of `embed_piece_rows` rows through the flow's `emb` region.
-fn embedTokens(c: *engine.Ctx, s: cuda.Stream, ids: []const u32, out: u64) !void {
+pub fn embedTokens(c: *engine.Ctx, s: cuda.Stream, ids: []const u32, out: u64) !void {
     const w = c.w;
     const f = c.flow.r;
     const n = ids.len;
@@ -163,7 +163,9 @@ fn mixArgs(c: *const engine.Ctx, blocks: []const u64, partial: u64, partial_bf16
 }
 
 fn conv(c: *engine.Ctx, s: cuda.Stream, a: ops.ConvArgs) !void {
-    try ops.conv(&c.ops, s, a, 1);
+    var b = a;
+    b.hist = c.histAt(a.state);
+    try ops.conv(&c.ops, s, b, 1);
 }
 
 fn controllers(lw: *const weights.LayerW) !*const [loop_kernels.n_streams]weights.Controller {
@@ -338,6 +340,19 @@ fn nextInput(c: *engine.Ctx, s: cuda.Stream, i: u32, v: visits.Visit, op: bank.O
     }
 }
 
+/// The drafter's taps of a forward: the partial stream the visit after a listed one starts from, and the final normed hidden
+/// for the tap named after the last visit (config `mtp.taps`, visit numbers; `sched.n` is the final hidden).
+fn tapRows(c: *engine.Ctx, s: cuda.Stream, tp: engine.Taps, i: u32, op: bank.Op, span: Span) !void {
+    const n: usize = span.rows;
+    const row0: u64 = if (tp.by_position) span.p0 * tp.taps * hidden * bf16_bytes else 0;
+    const m = c.w.cfg.mtp orelse return error.NoDraftHead;
+    const f = c.flow.r;
+    for (m.taps[0..m.taps_n], 0..) |at, t| {
+        const src: u64 = if (at == c.sched.n) (if (i + 1 == c.sched.n) f.inp else continue) else if (at == i + 1) f.stack[op.blocks + @intFromBool(op.first)] else continue;
+        try ops.putRows(&c.ops, s, src, tp.dst + row0 + t * hidden * bf16_bytes, n, hidden, tp.taps * hidden);
+    }
+}
+
 /// What the trace sees after a visit: the carried vector as float32 and its row count.
 fn traced(c: *engine.Ctx, s: cuda.Stream, i: u32, op: bank.Op, n: usize) !struct { ptr: u64, qn: u32 } {
     const f = c.flow.r;
@@ -402,6 +417,7 @@ pub fn forward(c: *engine.Ctx, s: cuda.Stream, stream: u32, ids: []const u32, p0
         try attnInputs(c, s, i, v, op, span, h);
         try sublayers(c, s, stream, i, v, op, span, h);
         try nextInput(c, s, i, v, op, n);
+        if (c.taps) |tp| try tapRows(c, s, tp, i, op, span);
         if (i == last_visit and h.trace == null) break;
         if (h.trace == null and h.teacher == null) continue;
         const t = try traced(c, s, i, op, n);

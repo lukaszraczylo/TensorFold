@@ -24,6 +24,7 @@ pub const decode = @import("decode.zig");
 pub const head = @import("head.zig");
 pub const prof = @import("prof.zig");
 pub const prefill = @import("prefill.zig");
+pub const drafter = @import("drafter.zig");
 pub const backend = @import("backend.zig");
 pub const native = @import("native.zig");
 
@@ -53,6 +54,7 @@ test {
     _ = decode;
     _ = head;
     _ = prefill;
+    _ = drafter;
     _ = backend;
     _ = native;
 }

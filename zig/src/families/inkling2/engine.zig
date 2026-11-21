@@ -225,6 +225,56 @@ fn applyAblit(k: *const loop_kernels.Kernels, st: *const ablit.State, s: cuda.St
     return ablit.apply(k, st, s, layer, y, rows, hidden);
 }
 
+/// What a speculative window needs to take its rejected rows back: a copy of the conv states before the window, each conv
+/// site's input rows during it, and the site tables the rewind kernel reads. The KV caches need none: a row past the kept
+/// ones is never read (the ring holds a call's rows beyond the window) and the next call overwrites it.
+pub const Rec = struct {
+    hist: cuda.DeviceBuffer, // fp32 [window_rows, C] a conv site, sites in the conv state's order
+    backup: cuda.DeviceBuffer, // the conv states as the window began
+    sites: cuda.DeviceBuffer, // ops.RewindSite a stream's site
+    n_sites: usize,
+    widest: usize,
+
+    /// Bytes of a site's hist for its conv state of `state_bytes`: `ops.window_max_rows` rows of C fp32 against 3 rows of C.
+    pub fn histOffset(conv_offset: u64) u64 {
+        return conv_offset * ops.window_max_rows / cache_mod.state_rows;
+    }
+
+    pub fn init(d: *const cuda.Driver, gpa: std.mem.Allocator, cache: *const Cache, sched: *const visits.Schedule, t: *const config.Text) !Rec {
+        const streams = cache.layout.streams;
+        const n_sites = sched.n * cache_mod.conv_sites;
+        var hist = try cuda.DeviceBuffer.alloc(d, histOffset(cache.conv.len));
+        errdefer hist.free();
+        var backup = try cuda.DeviceBuffer.alloc(d, cache.conv.len);
+        errdefer backup.free();
+        var sites = try cuda.DeviceBuffer.alloc(d, streams * n_sites * @sizeOf(ops.RewindSite));
+        errdefer sites.free();
+        const table = try gpa.alloc(ops.RewindSite, streams * n_sites);
+        defer gpa.free(table);
+        var widest: usize = 0;
+        for (0..streams) |stream| for (sched.visits[0..sched.n], 0..) |v, i| for (0..cache_mod.conv_sites) |w| {
+            const which: cache_mod.Conv = @fromBackingInt(@intCast(w));
+            const state = cache.convAt(v.conv, @intCast(stream), which);
+            const off = state - cache.conv.ptr;
+            const width = cache_mod.convWidth(t, v.layer, which);
+            widest = @max(widest, width);
+            table[stream * n_sites + i * cache_mod.conv_sites + w] = .{ .state = state, .hist = @intCast(histOffset(off)), .backup = @intCast(off), .c = @intCast(width) };
+        };
+        try sites.upload(0, std.mem.sliceAsBytes(table));
+        return .{ .hist = hist, .backup = backup, .sites = sites, .n_sites = n_sites, .widest = widest };
+    }
+
+    pub fn deinit(r: *Rec) void {
+        r.sites.free();
+        r.backup.free();
+        r.hist.free();
+        r.* = undefined;
+    }
+};
+
+/// Where a forward leaves each row's tap vectors for the drafter: bf16 [rows][taps][hidden] from `dst`.
+pub const Taps = struct { dst: u64, taps: u32, by_position: bool = false }; // by_position: `dst` is row 0 of position 0, a forward's rows go to their positions
+
 /// What the engine's visits run against. Initialised in place: `env` points into it, so it never moves.
 pub const Ctx = struct {
     d: *const cuda.Driver,
@@ -246,6 +296,16 @@ pub const Ctx = struct {
     ablit_hook: AblitHook,
     /// A window of 2..8 rows runs the one-row 8-bit kernels per row, so its rows equal the one-token decodes bit for bit.
     window: bool,
+    rec: ?Rec, // TF_INK2_MTP: the window rollback record
+    recording: bool, // a window's forward keeps its conv inputs in `rec`
+    taps: ?Taps, // the drafter's tap rows of a forward
+
+    /// The hist of the conv site whose state is at `state`, or 0 when no window is recording.
+    pub fn histAt(c: *const Ctx, state: u64) u64 {
+        const r = c.rec orelse return 0;
+        if (!c.recording) return 0;
+        return r.hist.ptr + Rec.histOffset(state - c.cache.conv.ptr);
+    }
 
     pub fn init(c: *Ctx, gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, w: *const weights.Weights, sched: visits.Schedule, cache: *Cache, o: cache_mod.Options) !void {
         const g = try Geometry.of(&w.cfg.text, o);
@@ -274,10 +334,14 @@ pub const Ctx = struct {
         c.gpa = gpa;
         c.ablit_hook = applyAblit;
         c.window = false;
+        c.rec = null;
+        c.recording = false;
+        c.taps = null;
         c.ablit = try ablit.open(gpa, io, d, g.hidden, c.text.layers);
     }
 
     pub fn deinit(c: *Ctx) void {
+        if (c.rec) |*r| r.deinit();
         if (c.ablit) |*st| ablit.close(st, c.gpa);
         c.moe_sc.deinit();
         c.flow.deinit();

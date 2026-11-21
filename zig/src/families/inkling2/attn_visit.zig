@@ -112,6 +112,7 @@ fn shortConv(c: *const engine.Ctx, s: cuda.Stream, v: visits.Visit, which: cache
         .rows = @intCast(rows),
         .mode = 0,
         .x_bf16 = 1,
+        .hist = c.histAt(c.cache.convAt(v.conv, stream, which)),
     };
     if (v.global) {
         try shaped(w, "static_w", &.{ config.conv_taps, kv });

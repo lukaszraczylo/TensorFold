@@ -21,6 +21,7 @@ const usage =
     \\weights --model DIR [--layers A-B] [--readback NAME,...]: uploads the text weights (TF_INK2_EMBED_HOST=1 keeps the
     \\    embedding on the host), writes DIR/weights.json with peak_rss_mib and device_bytes, and one row per readback
     \\    tensor (names below model.llm., e.g. layers.0.attn.wo_ud.weight)
+    \\draftacc --model DIR --prompts FILE.json --n N [--chunk-rows R] --out DIR: needs TF_INK2_MTP=1; each prompt is prefilled and N tokens are picked greedily with the taps kept, then the draft head proposes 7 tokens after every anchor that has 7 greedy tokens after it; prints the mean tokens a window of 2..8 rows yields and the head's ms a proposal
     \\
 ;
 
@@ -141,6 +142,10 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (std.mem.eql(u8, a.sub, "greedy")) {
         try greedyRun(init, a, out);
+        return 0;
+    }
+    if (std.mem.eql(u8, a.sub, "draftacc")) {
+        try draftAcc(init, a);
         return 0;
     }
     if (std.mem.eql(u8, a.sub, "rowgate")) {
@@ -1125,6 +1130,100 @@ fn greedyRun(init: std.process.Init, a: Args, out: []const u8) !void {
     try rows_out.finish();
     const b = ink2.head.deviceBytes(&session.w.cfg.text, 1);
     std.debug.print("greedy: {d} prompts, {d} tokens each, chunk rows {d}, device_bytes {d}, head unembed {d} B (in device_bytes), scratch {d} B\n", .{ prompts.len, n, a.chunk_rows, session.w.device_bytes, b.unembed, b.scratch });
+}
+
+/// Teacher-forced acceptance of the draft head; see `usage`.
+fn draftAcc(init: std.process.Init, a: Args) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const model = a.model orelse return error.Usage;
+    const prompts_path = a.prompts orelse return error.Usage;
+    const n = a.n orelse return error.Usage;
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, prompts_path, gpa, .limited(1 << 22));
+    defer gpa.free(text);
+    const parsed = try std.json.parseFromSlice(GreedyPrompts, gpa, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    var session: Session = undefined;
+    try session.open(gpa, io, model, null, a.layers, a.chunk_rows);
+    defer session.deinit();
+    const c = &session.c;
+    const s = session.stream;
+    const hid: usize = c.text.hidden;
+    const m = c.w.cfg.mtp orelse return error.NoDraftHead;
+    const prop = ink2.drafter.proposals;
+
+    var drafter = try ink2.drafter.Drafter.init(gpa, io, c, model, 1, dev_context);
+    defer drafter.deinit();
+    std.debug.print("draft head: {d} MiB on the device\n", .{drafter.bytes >> 20});
+    var head_run = try HeadRun.init(gpa, c, s);
+    defer head_run.deinit(gpa);
+    const row_bytes = @as(u64, m.taps_n) * hid * 2;
+    var taps = try cuda.DeviceBuffer.alloc(c.d, dev_context * row_bytes);
+    defer taps.free();
+    c.taps = .{ .dst = taps.ptr, .taps = m.taps_n, .by_position = true };
+    const last = session.sched.n - 1;
+    const toks = try gpa.alloc(u32, n);
+    defer gpa.free(toks);
+
+    var t_start = try cuda.Event.init(c.d, true);
+    defer t_start.deinit();
+    var t_end = try cuda.Event.init(c.d, true);
+    defer t_end.deinit();
+    var sum_tokens = @as([9]f64, @splat(0));
+    var windows: f64 = 0;
+    var total_ms: f64 = 0;
+    var total_drafts: f64 = 0;
+    var by_depth = @as([8]f64, @splat(0));
+    for (parsed.value.prompts, 0..) |ids, p| {
+        if (ids.len + n > dev_context) return error.BadPrompts;
+        try session.cache.clear(s, 0);
+        try ink2.prefill.run(c, s, 0, ids, a.chunk_rows, head_run.scratch.r.logits, .{});
+        var pick = try head_run.finish();
+        for (0..n) |g| {
+            toks[g] = pick;
+            if (g + 1 == n) break;
+            try ink2.decode.step(c, s, 0, pick, ids.len + g, last, .{});
+            pick = try head_run.run(0);
+        }
+        var written: usize = 0;
+        var p_sum = @as([9]f64, @splat(0));
+        var p_windows: f64 = 0;
+        var k: usize = 0;
+        while (k + prop < n) : (k += 1) {
+            const pos = ids.len + k;
+            while (written < pos) {
+                const rows = @min(ink2.drafter.write_rows, pos - written);
+                try drafter.writeContext(s, 0, taps.ptr + written * row_bytes, rows, written);
+                written += rows;
+            }
+            try drafter.setRnnContext(s, 0, taps.ptr, pos - 1);
+            var out: [ink2.drafter.proposals]u32 = undefined;
+            try t_start.record(s);
+            try drafter.propose(s, 0, toks[k], pos, &out);
+            try t_end.record(s);
+            try s.synchronize();
+            total_ms += try cuda.Event.elapsedMs(t_start, t_end);
+            var accepted: usize = 0;
+            while (accepted < prop and out[accepted] == toks[k + 1 + accepted]) accepted += 1;
+            for (0..accepted) |j| by_depth[j] += 1;
+            total_drafts += 1;
+            for (2..9) |w| p_sum[w] += @floatFromInt(1 + @min(accepted, w - 1));
+            p_windows += 1;
+        }
+        std.debug.print("prompt {d}: {d} ids, {d} windows, tokens a window for 2..8 rows:", .{ p, ids.len, @as(usize, @intFromFloat(p_windows)) });
+        for (2..9) |w| {
+            std.debug.print(" {d:.3}", .{p_sum[w] / p_windows});
+            sum_tokens[w] += p_sum[w];
+        }
+        std.debug.print("\n", .{});
+        windows += p_windows;
+    }
+    std.debug.print("all: {d} windows, tokens a window for 2..8 rows:", .{@as(usize, @intFromFloat(windows))});
+    for (2..9) |w| std.debug.print(" {d:.3}", .{sum_tokens[w] / windows});
+    std.debug.print("\nP(draft j accepted | all before) j=1..7:", .{});
+    for (by_depth[0..prop]) |d| std.debug.print(" {d:.3}", .{d / total_drafts});
+    std.debug.print("\npropose: mean {d:.2} ms\n", .{total_ms / total_drafts});
 }
 
 /// Device bytes of everything a session holds beyond the weights: caches, attention, flow, MoE and head scratch.

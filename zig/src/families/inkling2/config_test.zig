@@ -136,7 +136,7 @@ test "mini parses as a loop model" {
     try t.expectEqual(@as(u32, 24), c.text.heads(5).q);
     try t.expectEqual(@as(u32, 8), c.text.heads(5).kv);
     try t.expectEqual(@as(u32, 200006), c.eos);
-    try t.expect(c.mtp == null);
+    try t.expectEqualSlices(u32, &.{ 5, 23, 41, 48 }, c.mtp.?.taps[0..c.mtp.?.taps_n]);
     try t.expectEqual(@as(u32, 48), c.loop.?.visitCount(24));
 }
 

@@ -66,6 +66,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_INK2_EMBED_HOST", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 gathers Inkling 2 embedding rows from the mapped checkpoint on the host; default 0)" },
     .{ .name = "TF_INK2_DENSE8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 stores the Inkling 2 attention projections as int8 with fp16 block scales, a numerics change; default 0)" },
     .{ .name = "TF_INK2_HEAD8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 stores the Inkling 2 unembedding as int8 with fp16 block scales, a numerics change; default 0)" },
+    .{ .name = "TF_INK2_MTP", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 loads the Inkling 2 Mini draft head from mtp.safetensors and verifies windows of up to 8 rows; default 0)" },
     .{ .name = "TF_QMMF_HALF_BELOW", .scope = .cuda, .kind = .size, .forms = "a whole nonnegative native-size block count (0 disables half tiles)" },
     // Qwen 3.5 CUDA and HIP settings, read through this table:
     .{ .name = "TENSORFOLD_MEMORY_RESERVE_GIB", .scope = .cuda, .kind = .real, .forms = "a finite GiB amount (the HIP admission's floor and the memory's size still bound it)" },

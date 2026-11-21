@@ -53,6 +53,8 @@ pub const Kernels = struct {
     rnn: cuda.Function,
     vocab: cuda.Function,
     pick: cuda.Function,
+    block_init: cuda.Function,
+    fold: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -70,6 +72,8 @@ pub const Kernels = struct {
             .rnn = try mod.function("tf_ink2_dsp_rnn"),
             .vocab = try mod.function("tf_ink2_dsp_vocab"),
             .pick = try mod.function("tf_ink2_dsp_pick"),
+            .block_init = try mod.function("tf_ink2_dsp_block_init"),
+            .fold = try mod.function("tf_ink2_dsp_fold"),
         };
     }
 
@@ -187,6 +191,28 @@ pub fn pick(k: *const Kernels, s: cuda.Stream, picks: u64, world: usize, walk: u
     a.add(walk);
     a.add(int(j));
     try go(k.pick, s, .{ .x = 1 }, 1, &a);
+}
+
+/// The block's input rows bf16 [t, c]: row 0 from `anchor`, the others from `mask`.
+pub fn blockInit(k: *const Kernels, s: cuda.Stream, anchor: u64, mask: u64, resid: u64, t: usize, c: usize) !void {
+    var a: cuda.Args = .{};
+    for ([_]u64{ anchor, mask, resid }) |v| a.add(v);
+    a.add(int(t));
+    a.add(int(c));
+    try go(k.block_init, s, .{ .x = @intCast((c + 255) / 256), .y = @intCast(t) }, 256, &a);
+}
+
+/// One tile of the Markov head's fold: src fp32 [r + 1, src_stride] is (hidden_out^T rows, then its bias) times `tile` unembedding rows from `row0`.
+pub fn foldTile(k: *const Kernels, s: cuda.Stream, src: u64, tile: usize, src_stride: usize, row0: usize, r: usize, fold: u64, fbias: u64) !void {
+    var a: cuda.Args = .{};
+    a.add(src);
+    a.add(int(tile));
+    a.add(@as(i64, @intCast(src_stride)));
+    a.add(int(row0));
+    a.add(int(r));
+    a.add(fold);
+    a.add(fbias);
+    try go(k.fold, s, .{ .x = @intCast((tile + 255) / 256) }, 256, &a);
 }
 
 test "dspark ops: argument structs keep dspark.cu's layouts; chunks by absolute position" {

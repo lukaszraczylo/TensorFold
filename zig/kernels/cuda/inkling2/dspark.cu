@@ -324,3 +324,22 @@ extern "C" __global__ void tf_ink2_dsp_pick(const float* __restrict__ picks, int
     }
     walk[j + 1] = bi;
 }
+
+// The block's input rows: row 0 the anchor's embedding, rows 1..T-1 the mask embedding, bf16 [T][C].
+extern "C" __global__ void tf_ink2_dsp_block_init(const uint16_t* __restrict__ anchor, const uint16_t* __restrict__ mask,
+                                                  uint16_t* __restrict__ resid, int T, int C) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (c < C && t < T) resid[static_cast<size_t>(t) * C + c] = t == 0 ? anchor[c] : mask[c];
+}
+
+// The Markov head's logit bias folded through the target's head, one launch a tile of `tile` vocabulary rows from row0:
+// src fp32 [R + 1][src_stride] holds (hidden_out^T rows, then hidden_out's bias) times the tile's unembedding rows; fold bf16 [V][R], fbias bf16 [V].
+extern "C" __global__ void tf_ink2_dsp_fold(const float* __restrict__ src, int tile, long long src_stride, int row0, int R,
+                                           uint16_t* __restrict__ fold, uint16_t* __restrict__ fbias) {
+    using namespace ink2d;
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= tile) return;
+    for (int r = 0; r < R; ++r) fold[static_cast<size_t>(row0 + v) * R + r] = tobf(src[static_cast<size_t>(r) * src_stride + v]);
+    fbias[row0 + v] = tobf(src[static_cast<size_t>(R) * src_stride + v]);
+}

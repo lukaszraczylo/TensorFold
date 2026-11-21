@@ -303,7 +303,8 @@ fn parseVision(o: std.json.ObjectMap, text_hidden: u32, why: *Why) !Vision {
     return v;
 }
 
-fn parseMtp(o: std.json.ObjectMap, t: *const Text, why: *Why) !Mtp {
+fn parseMtp(o: std.json.ObjectMap, t: *const Text, loop: ?Loop, why: *Why) !Mtp {
+    const taps_end = if (loop) |l| l.visitCount(t.layers) else t.layers; // a loop model's taps count visits
     var m = std.mem.zeroes(Mtp);
     m.layers = try int(o, "num_hidden_layers", why);
     m.q_heads = try int(o, "num_attention_heads", why);
@@ -330,7 +331,7 @@ fn parseMtp(o: std.json.ObjectMap, t: *const Text, why: *Why) !Mtp {
         m.local[@intCast(e.integer)] = true;
     }
     for (taps.array.items) |e| {
-        if (e != .integer or e.integer < 0 or e.integer > t.layers) {
+        if (e != .integer or e.integer < 0 or e.integer > taps_end) {
             why.set("mtp_config's target_layer_ids names a layer the backbone does not have", .{});
             return error.Layout;
         }
@@ -407,7 +408,7 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, why: *Why) !Config {
         return error.BadConfig;
     }
     const loop = if (is_loop) try parseLoop(try object(try object(o, "text_config", why), "loop_config", why), &t, why) else null;
-    const mtp = if (is_loop) null else if (o.get("mtp_config") != null) try parseMtp(try object(o, "mtp_config", why), &t, why) else null;
+    const mtp = if (o.get("mtp_config") != null) try parseMtp(try object(o, "mtp_config", why), &t, loop, why) else null;
     const image = if (o.get("image_token_id") != null) try int(o, "image_token_id", why) else default_image_token;
     return .{
         .text = t,

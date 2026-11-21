@@ -7,11 +7,11 @@ const visits = @import("visits.zig");
 
 /// The four conv sites of a visit: the K and V convs of attention and the two sublayer convs.
 pub const Conv = enum { k, v, attn, mlp };
-const conv_sites = std.enums.values(Conv).len;
+pub const conv_sites = std.enums.values(Conv).len;
 
 /// tf_ink2_conv keeps a state as fp32 [conv_taps - 1, C]; its values are bf16 inputs, so the reference's bf16 state is exact.
-const state_bytes_per_value = 4;
-const state_rows = config.conv_taps - 1;
+pub const state_bytes_per_value = 4;
+pub const state_rows = config.conv_taps - 1;
 
 pub const Options = struct { context: usize, streams: u32, chunk_rows: u32 };
 
@@ -22,7 +22,7 @@ const Slot = struct {
     conv_off: [conv_sites]u64,
 };
 
-fn convWidth(t: *const config.Text, layer: u32, which: Conv) usize {
+pub fn convWidth(t: *const config.Text, layer: u32, which: Conv) usize {
     const h = t.heads(layer);
     return switch (which) {
         .k, .v => @as(usize, h.kv) * h.dim,

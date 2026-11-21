@@ -80,6 +80,7 @@ pub const Kernels = struct {
     dense1_q8_rows: cuda.Function,
     q8_to_bf16: cuda.Function,
     put_words: cuda.Function,
+    put_rows: cuda.Function,
     rewind: cuda.Function,
     race1: cuda.Function,
 
@@ -110,6 +111,7 @@ pub const Kernels = struct {
             .dense1_q8_rows = try mod.function("tf_ink2_dense1_q8_rows"),
             .q8_to_bf16 = try mod.function("tf_ink2_q8_to_bf16"),
             .put_words = try mod.function("tf_ink2_put_words"),
+            .put_rows = try mod.function("tf_ink2_put_rows"),
             .rewind = try mod.function("tf_ink2_conv_rewind"),
             .race1 = try mod.function("tf_ink2_race1"),
         };
@@ -323,6 +325,17 @@ fn dense1With(k: *const Kernels, s: cuda.Stream, segs: []const DenseSeg, kdim: u
         return go(k.dense1_q8_rows, s, .{ .x = @intCast(blocks) }, dense_cols_per_block * 32, &a);
     }
     try go(k.dense1, s, .{ .x = @intCast(blocks) }, dense_cols_per_block * 32, &a);
+}
+
+/// bf16 [rows, c] from `src` into `dst`'s rows `dst_stride` elements apart.
+pub fn putRows(k: *const Kernels, s: cuda.Stream, src: u64, dst: u64, rows: usize, c: usize, dst_stride: usize) !void {
+    var a: cuda.Args = .{};
+    a.add(src);
+    a.add(dst);
+    a.add(int(rows));
+    a.add(int(c));
+    a.add(@as(i64, @intCast(dst_stride)));
+    try go(k.put_rows, s, .{ .x = @intCast((rows * c + 255) / 256) }, 256, &a);
 }
 
 /// ops.cu's Ink2Words: a link step's header and ids, passed by value.

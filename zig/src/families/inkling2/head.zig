@@ -21,16 +21,21 @@ fn unembedding(t: *const config.Text, w: *const weights.Weights) !u64 {
     return d.ptr;
 }
 
-/// Logits of `rows` bf16 rows `h` [rows, hidden]: out_f32 [rows, unpadded_vocab] = cap * tanh(h . unembed^T / cap), the
-/// product accumulated and left in fp32 (SPEC 3 steps 4-6).
-pub fn logits(c: *engine.Ctx, s: cuda.Stream, h: u64, rows: usize, out_f32: u64) !void {
+/// `logits` before the softcap: out_f32 [rows, unpadded_vocab] = h . unembed^T in fp32.
+pub fn logitsRaw(c: *engine.Ctx, s: cuda.Stream, h: u64, rows: usize, out_f32: u64) !void {
     const t = &c.text;
     const w = try unembedding(t, c.w);
     const n: usize = t.unpadded_vocab;
     if (c.w.unembed.q8) {
         try logits8(c, s, h, rows, out_f32, w);
     } else try c.dense.rows(s, h, t.hidden, w, out_f32, n, rows, n, t.hidden);
-    try ops.softcap(&c.ops, s, out_f32, rows * n, t.logit_cap);
+}
+
+/// Logits of `rows` bf16 rows `h` [rows, hidden]: out_f32 [rows, unpadded_vocab] = cap * tanh(h . unembed^T / cap), the
+/// product accumulated and left in fp32 (SPEC 3 steps 4-6).
+pub fn logits(c: *engine.Ctx, s: cuda.Stream, h: u64, rows: usize, out_f32: u64) !void {
+    try logitsRaw(c, s, h, rows, out_f32);
+    try ops.softcap(&c.ops, s, out_f32, rows * c.text.unpadded_vocab, c.text.logit_cap);
 }
 
 /// `logits` on the 8-bit unembedding: one row reads the codes directly, more rows expand `engine.dq_tile_rows` vocabulary rows
