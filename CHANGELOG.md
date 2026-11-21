@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Inkling 2: a weight loader uploads Inkling 2 Mini's text tensors one layer at a time and drops each layer's pages after its upload, keeps the NVFP4 and MXFP8 experts packed as stored, can leave the embedding on the host for row gathers, and refuses a tensor the weight map disagrees with or a budget above the caller's limit before any upload; `tf-ink2-check weights` stages a layer range and reads tensors back for a reference to compare (refs #3476). Thanks to @ajensenwaud.
+
 - Inkling 2: a memory budget for Inkling 2 Mini sums the text weights (17.6 GiB, 16.7 GiB with host-gathered embeddings), each visit's KV and conv state and the chunk scratch, so a serving or dev-gate setting that exceeds its limit is refused before upload (refs #3476). Thanks to @ajensenwaud.
 
 - Inkling 2: a `tf-ink2-check` tool (build step `ink2-check`) writes the CUDA engine's rows as raw files with a manifest for a reference to compare, and an `inkling2_loop` kernel image for Inkling 2 Mini's looped engine, with a smoke subcommand that checks the image loads and launches (refs #3476). Thanks to @ajensenwaud.
