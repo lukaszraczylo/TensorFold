@@ -206,10 +206,19 @@ extern "C" __global__ void tf_ink2l_actq_mxfp8_codes(
 // A stage's device template takes the stored format as a WeightFmt; the extern "C" wrappers are the only per-format code.
 constexpr int kExWarps = kThreads / 32;  // output columns a block computes
 constexpr int kSlots = 8;
+constexpr int kExUnroll = 12;  // weight reads a warp keeps in flight; divides both k (2304 and 1152) in 32-lane steps
 constexpr uint32_t kFloatInf = 0x7f800000u;
 
 __constant__ float kE2m1Lut[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
                                    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+
+// The same values by arithmetic: a constant-memory read with a lane-divergent index serialises (decode GEMV); the grouped
+// prompt path keeps the table, which measured faster there.
+__device__ __forceinline__ float e2m1Value(int code) {
+    const int m = code & 7;
+    const float mag = m < 4 ? 0.5f * (float)m : (float)((2 + (m & 1)) * (1 + ((m >> 1) & 1)));
+    return __uint_as_float(__float_as_uint(mag) | ((uint32_t)(code & 8) << 28));
+}
 
 __device__ __forceinline__ float bf16Round(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 
@@ -228,6 +237,10 @@ struct Nvfp4Fmt {
         const int code = (w[k >> 1] >> ((k & 1) * 4)) & 0xF;
         return bf16Round(__fmul_rn(__fmul_rn(kE2m1Lut[code], e4m3ToFloat(scale[k / kNvBlock])), outer));
     }
+    __device__ static float dequantFast(const uint8_t* w, const uint8_t* scale, int k, float outer) {
+        const int code = (w[k >> 1] >> ((k & 1) * 4)) & 0xF;
+        return bf16Round(__fmul_rn(__fmul_rn(e2m1Value(code), e4m3ToFloat(scale[k / kNvBlock])), outer));
+    }
 };
 
 // ref.weights.dequant_mxfp8: bf16(f32(e4m3) * 2^(ue8m0 - 127)), no outer scale.
@@ -240,6 +253,7 @@ struct Mxfp8Fmt {
         const float exp2 = biased == kUe8m0Nan ? __uint_as_float(kFloatInf) : ue8m0Value(biased);
         return bf16Round(__fmul_rn(e4m3ToFloat(w[k]), exp2));
     }
+    __device__ static float dequantFast(const uint8_t* w, const uint8_t* scale, int k, float outer) { return dequant(w, scale, k, outer); }
 };
 
 // One output column n of expert e against the activation row x: the warp's dot product, valid in every lane.
@@ -251,7 +265,21 @@ __device__ float expertColumn(const float* x, int e, int n, const uint8_t* w, co
     const uint8_t* sr = scale + row * (k_dim / Fmt::kBlock);
     const float outer = Fmt::expertOuter(amax, denominator, e);
     float acc = 0.0f;
-    for (int k = threadIdx.x & 31; k < k_dim; k += 32) acc = __fmaf_rn(x[k], Fmt::dequant(wr, sr, k, outer), acc);
+    // kExUnroll strided steps load before any of them is accumulated (the loads do not depend on acc), so the warp keeps
+    // that many weight reads in flight; the fmaf chain keeps its k order.
+    for (int k0 = threadIdx.x & 31; k0 < k_dim; k0 += 32 * kExUnroll) {
+        float wv[kExUnroll], xv[kExUnroll];
+        #pragma unroll
+        for (int u = 0; u < kExUnroll; ++u) {
+            const int k = k0 + 32 * u;
+            wv[u] = k < k_dim ? Fmt::dequantFast(wr, sr, k, outer) : 0.0f;
+            xv[u] = k < k_dim ? x[k] : 0.0f;
+        }
+        #pragma unroll
+        for (int u = 0; u < kExUnroll; ++u) {
+            if (k0 + 32 * u < k_dim) acc = __fmaf_rn(xv[u], wv[u], acc);
+        }
+    }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
     return acc;
