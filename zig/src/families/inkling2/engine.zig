@@ -1,6 +1,7 @@
 //! Device context of Inkling 2 Mini's engine: the kernel images, the visit caches and the attention scratch.
 const std = @import("std");
 const cuda = @import("cuda");
+const bank = @import("bank.zig");
 const cache_mod = @import("cache.zig");
 const config = @import("config.zig");
 const kernels = @import("kernels.zig");
@@ -138,6 +139,72 @@ pub const Scratch = struct {
     }
 };
 
+const bf16_bytes = 2;
+const f32_bytes = 4;
+const embed_ids_bytes = 4;
+/// Queries of a global layer's attention input: q, k and v.
+pub const max_inputs = 3;
+
+/// Addresses of the decode flow buffers: the residual stack and message bank, the carried input and the visit's
+/// intermediates. `of(0, rows, hidden)` sizes them.
+pub const FlowRegions = struct {
+    stack: [bank.stack_slots]u64, // bf16 [rows, hidden]: the embedding, three finished blocks and the partial
+    bank: [bank.bank_slots]u64, // bf16 [rows, hidden]: the two blocks a restart saves
+    dest: u64, // fp32 [rows, hidden]: the prelude destinations
+    inp: u64, // bf16 [3, rows, hidden]: the carried attention input
+    attn_pre: u64, // bf16 [rows, hidden]
+    attn_out: u64,
+    mlp_in: u64,
+    moe_out: u64,
+    resid: u64, // fp32 [rows, hidden]: partial plus attention output, then the new partial before its rounding
+    wide: u64, // fp32 [3, rows, hidden]: the carried input widened for a trace
+    ids: u64, // int32 [rows]
+    emb: u64, // bf16 [rows, hidden]: the embedding rows of a host-resident table
+    total: u64,
+
+    pub fn of(base: u64, rows: usize, hidden: usize) FlowRegions {
+        var at = base;
+        var r: FlowRegions = undefined;
+        const row = rows * hidden;
+        for (&r.stack) |*p| p.* = take(&at, row * bf16_bytes);
+        for (&r.bank) |*p| p.* = take(&at, row * bf16_bytes);
+        r.dest = take(&at, row * f32_bytes);
+        r.inp = take(&at, max_inputs * row * bf16_bytes);
+        r.attn_pre = take(&at, row * bf16_bytes);
+        r.attn_out = take(&at, row * bf16_bytes);
+        r.mlp_in = take(&at, row * bf16_bytes);
+        r.moe_out = take(&at, row * bf16_bytes);
+        r.resid = take(&at, row * f32_bytes);
+        r.wide = take(&at, max_inputs * row * f32_bytes);
+        r.ids = take(&at, rows * embed_ids_bytes);
+        r.emb = take(&at, row * bf16_bytes);
+        r.total = at - base;
+        return r;
+    }
+
+    fn take(at: *u64, len: usize) u64 {
+        const p = at.*;
+        at.* += std.mem.alignForward(u64, len, region_align);
+        return p;
+    }
+};
+
+/// The decode flow buffers for calls of up to `max_rows` rows; one call at a time.
+pub const Flow = struct {
+    mem: cuda.DeviceBuffer,
+    r: FlowRegions,
+
+    pub fn init(d: *const cuda.Driver, rows: usize, hidden: usize) !Flow {
+        const mem = try cuda.DeviceBuffer.alloc(d, FlowRegions.of(0, rows, hidden).total);
+        return .{ .mem = mem, .r = FlowRegions.of(mem.ptr, rows, hidden) };
+    }
+
+    pub fn deinit(f: *Flow) void {
+        f.mem.free();
+        f.* = undefined;
+    }
+};
+
 /// What the engine's visits run against. Initialised in place: `env` points into it, so it never moves.
 pub const Ctx = struct {
     d: *const cuda.Driver,
@@ -151,6 +218,8 @@ pub const Ctx = struct {
     w: *const weights.Weights,
     cache: *Cache,
     scratch: Scratch,
+    flow: Flow,
+    moe_sc: moe.Scratch,
 
     pub fn init(c: *Ctx, d: *const cuda.Driver, w: *const weights.Weights, sched: visits.Schedule, cache: *Cache, o: cache_mod.Options) !void {
         const g = try Geometry.of(&w.cfg.text, o);
@@ -168,10 +237,17 @@ pub const Ctx = struct {
         c.dense = try cuda.dense_rows.DenseRows.load(d);
         errdefer c.dense.unload();
         c.scratch = try Scratch.init(d, g);
+        errdefer c.scratch.deinit();
+        c.flow = try Flow.init(d, g.max_rows, g.hidden);
+        errdefer c.flow.deinit();
+        c.moe_sc = try moe.Scratch.init(d, g.max_rows);
+        errdefer c.moe_sc.deinit();
         c.env = .{ .driver = d, .loop = &c.loop, .ops = &c.ops };
     }
 
     pub fn deinit(c: *Ctx) void {
+        c.moe_sc.deinit();
+        c.flow.deinit();
         c.scratch.deinit();
         c.dense.unload();
         c.attn.unload();
@@ -235,4 +311,30 @@ test "scratch for a 512-row chunk stays small against the budget slack" {
     const cfg = try miniText();
     const g = try Geometry.of(&cfg.text, .{ .context = 65536, .streams = 2, .chunk_rows = 512 });
     try ts.expect(Regions.of(0, g).total < 256 << 20);
+}
+
+test "flow buffers for one row and for a 512-row chunk" {
+    const one = FlowRegions.of(0, 1, 2304);
+    try ts.expectEqual(@as(u64, 4608), one.stack[1] - one.stack[0]); // a bf16 row
+    try ts.expectEqual(@as(u64, 5 * 4608), one.bank[0]); // five stack slots
+    try ts.expectEqual(@as(u64, 7 * 4608), one.dest); // then two bank slots
+    try ts.expectEqual(@as(u64, 9216), one.inp - one.dest); // one fp32 dest row
+    try ts.expectEqual(@as(u64, 3 * 4608), one.attn_pre - one.inp);
+    try ts.expectEqual(@as(u64, 115456), one.total);
+    const big = FlowRegions.of(0, 512, 2304);
+    try ts.expectEqual(@as(u64, 512 * 4608), big.stack[1] - big.stack[0]);
+    try ts.expectEqual(@as(u64, 7 * 512 * 4608), big.dest);
+    try ts.expectEqual(@as(u64, 512 * 9216), big.inp - big.dest);
+    try ts.expectEqual(@as(u64, 58_984_448), big.total);
+}
+
+test "flow regions are aligned and disjoint" {
+    const r = FlowRegions.of(1 << 20, 64, 2304);
+    const ordered = r.stack ++ r.bank ++ [_]u64{ r.dest, r.inp, r.attn_pre, r.attn_out, r.mlp_in, r.moe_out, r.resid, r.wide, r.ids, r.emb };
+    var prev: u64 = 1 << 20;
+    for (ordered) |at| {
+        try ts.expect(at % region_align == 0 and at >= prev);
+        prev = at;
+    }
+    try ts.expect(r.emb + 64 * 2304 * 2 <= (1 << 20) + r.total);
 }

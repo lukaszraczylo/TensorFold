@@ -498,3 +498,76 @@ extern "C" __global__ void tf_ink2l_ablit(const float* q, const float* table, __
         row[i] = __float2bfloat16_rn(__fsub_rn(__bfloat162float(row[i]), __fmul_rn(s, acc)));
     }
 }
+
+// ---- Decode glue: the fp32 addend and the unnormed fp32 residual mix ----
+__device__ __forceinline__ float bf16Bits(uint16_t x) { return __uint_as_float(static_cast<uint32_t>(x) << 16); }
+
+// out[i] = bf16(a[i]) + bf16(b[i]) in fp32, no rounding (ref attn_res's `last + addend`); b null: the widened a.
+extern "C" __global__ void tf_ink2l_mix_add(float* __restrict__ out, const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = b ? __fadd_rn(bf16Bits(a[i]), bf16Bits(b[i])) : bf16Bits(a[i]);
+}
+
+// ops.cu's MixArgs, field for field; `out` here is fp32 [nq, rows, C] and `norm`, `eps` are unused.
+constexpr int kMixBlocks = 8;
+constexpr int kMixQueries = 3;
+struct MixF32Args {
+    const uint16_t* blocks[kMixBlocks];
+    const void* partial;
+    const float* query;
+    const uint16_t* norm[kMixQueries];
+    float* out;
+    int n_blocks, partial_bf16, nq, rows, C;
+    float eps;
+};
+
+// ref.ops.attn_res with w = None: softmax over [blocks, partial] of the rms-normed values dotted with each query
+// (already D^-0.5 scaled by the 1/sqrt(C) here), then the weighted sum of the normed values, fp32 and unnormalised.
+extern "C" __global__ void __launch_bounds__(256) tf_ink2l_mix_f32(const MixF32Args a) {
+    constexpr int kV = 1 + kMixQueries;
+    __shared__ float red[kThreads / 32][kV];
+    __shared__ float wts[kMixQueries][kMixBlocks + 1];
+    __shared__ float rr[kMixBlocks + 1];
+    const size_t row = blockIdx.x;
+    const int C = a.C, n = a.n_blocks + 1, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    auto entry = [&](int j, int c) -> float {
+        if (j < a.n_blocks) return bf16Bits(a.blocks[j][row * C + c]);
+        return a.partial_bf16 ? bf16Bits(static_cast<const uint16_t*>(a.partial)[row * C + c]) : static_cast<const float*>(a.partial)[row * C + c];
+    };
+    for (int j = 0; j < n; ++j) {
+        float v[kV] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int c = threadIdx.x; c < C; c += kThreads) {
+            const float x = entry(j, c);
+            v[0] += x * x;
+            for (int q = 0; q < a.nq; ++q) v[1 + q] += x * a.query[(size_t)q * C + c];
+        }
+        for (int i = 0; i < kV; ++i)
+            for (int off = 16; off > 0; off >>= 1) v[i] += __shfl_xor_sync(0xffffffffu, v[i], off);
+        if (lane == 0)
+            for (int i = 0; i < kV; ++i) red[warp][i] = v[i];
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t[kV] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int w = 0; w < kThreads / 32; ++w)
+                for (int i = 0; i < kV; ++i) t[i] += red[w][i];
+            const float r = rsqrtf(t[0] / C + 1e-6f);
+            rr[j] = r;
+            for (int q = 0; q < a.nq; ++q) wts[q][j] = t[1 + q] * r * rsqrtf(static_cast<float>(C));
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x < a.nq) {
+        float* l = wts[threadIdx.x];
+        float m = -__uint_as_float(kFloatInf), t = 0.0f;
+        for (int j = 0; j < n; ++j) m = fmaxf(m, l[j]);
+        for (int j = 0; j < n; ++j) t += expf(l[j] - m);
+        for (int j = 0; j < n; ++j) l[j] = expf(l[j] - m) / t;
+    }
+    __syncthreads();
+    for (int q = 0; q < a.nq; ++q)
+        for (int c = threadIdx.x; c < C; c += kThreads) {
+            float h = 0.0f;
+            for (int j = 0; j < n; ++j) h += wts[q][j] * (entry(j, c) * rr[j]);
+            a.out[((size_t)q * a.rows + row) * C + c] = h;
+        }
+}

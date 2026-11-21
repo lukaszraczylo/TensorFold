@@ -19,6 +19,17 @@ pub const Dtype = enum {
 
 pub const manifest_name = "manifest.json";
 
+/// What a run's manifest.json carries beside its files, in `ref.capture.write_golden`'s layout.
+pub const RunMeta = struct {
+    hidden: usize,
+    visits: usize,
+    unpadded_vocab: usize,
+    qn: []const u32,
+    steps: []const StepMeta,
+};
+
+pub const StepMeta = struct { n: usize, pos0: usize };
+
 pub const Writer = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -56,9 +67,28 @@ pub const Writer = struct {
     }
 
     pub fn finish(w: *Writer) !void {
+        try w.closeFiles();
+        try w.dir.writeFile(w.io, .{ .sub_path = manifest_name, .data = w.manifest.items });
+    }
+
+    /// As `finish`, but manifest.json is the run's dict: the reference's fields and the written rows under `files`.
+    pub fn finishRun(w: *Writer, meta: RunMeta) !void {
+        try w.closeFiles();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(w.gpa);
+        try out.print(w.gpa, "{{\"hidden\":{d},\"visits\":{d},\"unpadded_vocab\":{d},\"qn\":[", .{ meta.hidden, meta.visits, meta.unpadded_vocab });
+        for (meta.qn, 0..) |q, i| try out.print(w.gpa, "{s}{d}", .{ if (i == 0) "" else ",", q });
+        try out.appendSlice(w.gpa, "],\"steps\":[");
+        for (meta.steps, 0..) |st, i| try out.print(w.gpa, "{s}{{\"n\":{d},\"pos0\":{d}}}", .{ if (i == 0) "" else ",", st.n, st.pos0 });
+        try out.appendSlice(w.gpa, "],\"files\":");
+        try out.appendSlice(w.gpa, w.manifest.items);
+        try out.appendSlice(w.gpa, "}\n");
+        try w.dir.writeFile(w.io, .{ .sub_path = manifest_name, .data = out.items });
+    }
+
+    fn closeFiles(w: *Writer) !void {
         if (w.count == 0) try w.manifest.appendSlice(w.gpa, "[");
         try w.manifest.appendSlice(w.gpa, "\n]\n");
-        try w.dir.writeFile(w.io, .{ .sub_path = manifest_name, .data = w.manifest.items });
     }
 };
 
@@ -115,4 +145,51 @@ test "writer refuses a wrong byte count and an escaping name" {
     try std.testing.expectError(error.ShapeMismatch, w.put("x", .u32, &.{2}, &.{ 0, 0, 0, 0 }));
     try std.testing.expectError(error.InvalidName, w.put("../x", .u8, &.{1}, &.{0}));
     try std.testing.expectError(error.InvalidName, w.put("a\"b", .u8, &.{1}, &.{0}));
+}
+
+test "finishRun writes the reference's manifest layout with the rows under files" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/run", .{&tmp.sub_path});
+    defer gpa.free(out);
+
+    var w = try Writer.init(gpa, io, out);
+    defer w.deinit();
+    const vals = [_]f32{ 1, 2 };
+    try w.put("step0/visit00", .f32, &.{ 1, 2 }, std.mem.sliceAsBytes(&vals));
+    try w.finishRun(.{ .hidden = 2, .visits = 3, .unpadded_vocab = 9, .qn = &.{ 1, 3, 1 }, .steps = &.{ .{ .n = 1, .pos0 = 0 }, .{ .n = 1, .pos0 = 1 } } });
+
+    const data = try tmp.dir.readFileAlloc(io, "run/step0/visit00.f32", gpa, .limited(1 << 10));
+    defer gpa.free(data);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&vals), data);
+    const text = try tmp.dir.readFileAlloc(io, "run/" ++ manifest_name, gpa, .limited(1 << 10));
+    defer gpa.free(text);
+    const Entry = struct { name: []const u8, dtype: []const u8, shape: []const usize };
+    const Manifest = struct { hidden: usize, visits: usize, unpadded_vocab: usize, qn: []const u32, steps: []const StepMeta, files: []const Entry };
+    const parsed = try std.json.parseFromSlice(Manifest, gpa, text, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.hidden);
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.visits);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 3, 1 }, parsed.value.qn);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.steps[1].pos0);
+    try std.testing.expectEqualStrings("step0/visit00", parsed.value.files[0].name);
+}
+
+test "finishRun with no rows keeps files an empty array" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/run", .{&tmp.sub_path});
+    defer gpa.free(out);
+    var w = try Writer.init(gpa, io, out);
+    defer w.deinit();
+    try w.finishRun(.{ .hidden = 2, .visits = 0, .unpadded_vocab = 0, .qn = &.{}, .steps = &.{} });
+    const text = try tmp.dir.readFileAlloc(io, "run/" ++ manifest_name, gpa, .limited(1 << 10));
+    defer gpa.free(text);
+    const parsed = try std.json.parseFromSlice(struct { files: []const u8 }, gpa, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.files.len);
 }

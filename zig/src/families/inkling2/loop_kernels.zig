@@ -2,6 +2,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const names = @import("names.zig");
+const ops = @import("ops.zig");
 const plan = @import("plan.zig");
 
 /// Threads a row's quantiser block runs; loop.cu's kThreads.
@@ -41,6 +42,8 @@ pub const Kernels = struct {
     ctl_down: cuda.Function,
     ctl_blend: cuda.Function,
     ablit: cuda.Function,
+    mix_add: cuda.Function,
+    mix_f32: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -64,6 +67,8 @@ pub const Kernels = struct {
             .ctl_down = try mod.function("tf_ink2l_ctl_down"),
             .ctl_blend = try mod.function("tf_ink2l_ctl_blend"),
             .ablit = try mod.function("tf_ink2l_ablit"),
+            .mix_add = try mod.function("tf_ink2l_mix_add"),
+            .mix_f32 = try mod.function("tf_ink2l_mix_f32"),
         };
     }
 
@@ -81,6 +86,25 @@ pub fn roundBf16(k: *const Kernels, s: cuda.Stream, x: u64, n: usize) !void {
     args.add(@as(i32, @intCast(n)));
     const blocks = (n + elementwise_threads - 1) / elementwise_threads;
     try cuda.launch.launch(k.round_bf16, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = elementwise_threads } }, s, &args);
+}
+
+/// fp32 `out[i] = a[i] + b[i]` over `n` bf16 values, unrounded; `b` = 0 widens `a`.
+pub fn mixAdd(k: *const Kernels, s: cuda.Stream, out: u64, a: u64, b: u64, n: usize) !void {
+    if (n == 0) return;
+    var args: cuda.Args = .{};
+    for ([_]u64{ out, a, b }) |p| args.add(p);
+    args.add(@as(i32, @intCast(n)));
+    const blocks = (n + elementwise_threads - 1) / elementwise_threads;
+    try cuda.launch.launch(k.mix_add, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = elementwise_threads } }, s, &args);
+}
+
+/// `ops.mix` without the norm: `m.out` is float32 [nq, rows, c], the weighted sum of the normed blocks (the carried `dest`).
+pub fn mixF32(k: *const Kernels, s: cuda.Stream, m: ops.MixArgs) !void {
+    if (m.query == 0 or m.nq < 1 or m.nq > ops.max_queries or m.n_blocks < 0 or m.n_blocks >= ops.max_blocks) return error.Inkling2MixShape;
+    if (m.rows == 0) return;
+    var args: cuda.Args = .{};
+    args.add(m);
+    try cuda.launch.launch(k.mix_f32, .{ .grid = .{ .x = @intCast(m.rows) }, .block = .{ .x = actq_threads } }, s, &args);
 }
 
 /// `extra` are the codes kernels' output pointers, between `out` and the sizes.
@@ -221,7 +245,7 @@ test "actq launches one block a row and refuses a width off the block" {
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16), .mix_add = fun.of(&d, 17), .mix_f32 = fun.of(&d, 18) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     try actNvfp4(&k, s, 0x1000, 0x2000, 64, 2304);
     try std.testing.expectEqual(@as(u32, 64), Fake.grid_x);
@@ -253,7 +277,7 @@ test "expert stages pick the format's kernel and launch a block a pair by column
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15), .round_bf16 = fun.of(&d, 16), .mix_add = fun.of(&d, 17), .mix_f32 = fun.of(&d, 18) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     const g: ExpertGemm = .{ .w = 1, .scale = 2 };
     try expertGateUp(&k, s, .nvfp4, 0, 0, g, 0, 4, 2304, 2304);

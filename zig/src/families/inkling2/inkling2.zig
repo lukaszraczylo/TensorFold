@@ -20,6 +20,7 @@ pub const plan = @import("plan.zig");
 pub const config = @import("config.zig");
 pub const engine = @import("engine.zig");
 pub const attn_visit = @import("attn_visit.zig");
+pub const decode = @import("decode.zig");
 
 /// config.json's name in the release.
 pub const model_type = "inkling2";
@@ -43,4 +44,5 @@ test {
     _ = cache;
     _ = engine;
     _ = attn_visit;
+    _ = decode;
 }
