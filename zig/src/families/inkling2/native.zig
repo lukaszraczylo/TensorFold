@@ -57,16 +57,20 @@ fn clampContext(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, asked: usiz
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const cfg = try weights.readConfig(arena.allocator(), io, dir);
-    return clampTo(asked, cfg.text.max_context);
+    const cut = try clampTo(asked, cfg.text.max_context);
+    if (cut != asked) std.log.warn("--context {d} is past the checkpoint's model_max_length: using {d}", .{ asked, cut });
+    return cut;
 }
 
-fn clampTo(asked: usize, max_context: u32) usize {
+fn clampTo(asked: usize, max_context: u32) error{ZeroMaxContext}!usize {
+    if (max_context == 0) return error.ZeroMaxContext;
     return @min(asked, max_context);
 }
 
-test "a window past the checkpoint's maximum is cut to it" {
-    try std.testing.expectEqual(@as(usize, 1048576), clampTo(4194304, 1048576));
-    try std.testing.expectEqual(@as(usize, 65536), clampTo(65536, 1048576));
+test "a window past the checkpoint's maximum is cut to it, and a zero maximum is refused" {
+    try std.testing.expectEqual(@as(usize, 1048576), try clampTo(4194304, 1048576));
+    try std.testing.expectEqual(@as(usize, 65536), try clampTo(65536, 1048576));
+    try std.testing.expectError(error.ZeroMaxContext, clampTo(65536, 0));
 }
 
 /// Opens the model with `o.lanes` streams, or (`lanes_fixed` off) the most of them that fit the room; the plan refuses first.
@@ -129,6 +133,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.StructuresUnsupported => "structured output is not built for Inkling 2 Mini on CUDA yet",
         error.WindowTooWide => "Inkling 2 Mini on CUDA verifies one row a window: it takes no drafts",
         error.NonFiniteLogits => "the model's logits went non-finite at this row: the request is stopped rather than answered from them",
+        error.ZeroMaxContext => "the checkpoint's config.json gives model_max_length 0: it must be a positive token count",
         error.CapturedKernels => "Inkling 2 Mini runs on the engine's own kernels: unset TENSORFOLD_CUDA_KERNELS",
         error.OverBudget => "the CUDA memory budget does not hold Inkling 2 Mini's weights, caches and scratch at this --context and --parallel: lower either one, set TF_INK2_EMBED_HOST=1 to read the embedding rows from the host, or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
         error.InvalidEnvironment => "a TF_INK2_* setting is invalid: TF_INK2_EMBED_HOST is 0 or 1, TF_INK2_ABLIT a file path (or 0), TF_INK2_ABLIT_SCALE a number above 0 and up to 16",

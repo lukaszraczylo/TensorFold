@@ -11,6 +11,7 @@ const dsv41 = if (@hasDecl(dsv41_chat, "template")) dsv41_chat.template else dsv
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
+const inkling_off_effort: []const u8 = "none";
 const clear_thinking_env = "TF_GLM_CLEAR_THINKING";
 
 /// ``TF_GLM_CLEAR_THINKING`` (#236): false unless 1, null unless 0 or 1; given always, as TR3's template clears unset.
@@ -434,7 +435,10 @@ pub const HfText = struct {
         try globals.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
         var context: std.json.ObjectMap = .empty;
         try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
-        if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
+        const inkling_chat = t.speaksInkling();
+        // Inkling's effort 0 is the template's `none`; left unset it would render the default 0.9
+        const effort = options.reasoning_effort orelse if (inkling_chat and !options.enable_thinking) inkling_off_effort else null;
+        if (effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
         if (t.clear_thinking) |clear| try context.put(a, "clear_thinking", .{ .bool = options.clear_thinking orelse clear });
         var diag: template.Diag = .{};
         const tools: std.json.Value = if (options.tools) |tl| try toStd(a, tl) else .null;
@@ -443,7 +447,8 @@ pub const HfText = struct {
             problem.* = diag.msg;
             return error.Template;
         };
-        return .{ .text = if (options.add_generation_prompt and t.speaksInkling()) try std.mem.concat(a, u8, &.{ out.s, inkling.model }) else out.s, .spans = out.spans };
+        const open = options.add_generation_prompt and inkling_chat and !std.mem.endsWith(u8, out.s, inkling.model);
+        return .{ .text = if (open) try std.mem.concat(a, u8, &.{ out.s, inkling.model }) else out.s, .spans = out.spans };
     }
 
     /// Inkling 2's tokenizer holds the block markers; its template never opens the model turn, so the render does.
@@ -452,27 +457,85 @@ pub const HfText = struct {
     }
 };
 
-test "a chat render opens the model turn only for a tokenizer that holds the Inkling markers" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+const inkling_template = @embedFile("fixtures/inkling/chat_template.jinja");
+
+/// An HfText holding the Inkling markers (or only `markers` of them) and `source` as its chat template.
+fn testText(a: Allocator, source: []const u8, markers: []const []const u8) !HfText {
     var t: HfText = undefined;
     t.native_deepseek = false;
     t.specials = .null;
     t.tool_compiled = null;
     t.clear_thinking = null;
-    t.compiled = try template.compile(a, "{% for m in messages %}[{{ m.content }}]{% endfor %}", null);
+    t.compiled = try template.compile(a, source, null);
     t.tok.vocab = std.StringHashMap(u32).init(a);
+    for (markers, 0..) |m, i| try t.tok.vocab.put(m, @intCast(200005 + i));
+    return t;
+}
+
+fn renderText(a: Allocator, t: *HfText, messages: []const u8, tools: ?[]const u8, options: model_text.RenderOptions) ![]const u8 {
     var problem: []const u8 = "";
-    const messages = (try json.parse(a, "[{\"role\":\"user\",\"content\":\"hi\"}]")).ok;
-    const plain = try HfText.renderFn(&t, a, messages, .{}, &problem);
-    try std.testing.expectEqualStrings("[hi]", plain.text);
-    try t.tok.vocab.put(inkling.model, 200005);
-    try t.tok.vocab.put(inkling.end_sampling, 200006);
-    const opened = try HfText.renderFn(&t, a, messages, .{}, &problem);
-    try std.testing.expectEqualStrings("[hi]" ++ inkling.model, opened.text);
-    const prefilled = try HfText.renderFn(&t, a, messages, .{ .add_generation_prompt = false }, &problem);
-    try std.testing.expectEqualStrings("[hi]", prefilled.text);
+    var o = options;
+    if (tools) |x| o.tools = (try json.parse(a, x)).ok;
+    return (try HfText.renderFn(t, a, (try json.parse(a, messages)).ok, o, &problem)).text;
+}
+
+const both_markers = [_][]const u8{ inkling.model, inkling.end_sampling };
+
+test "a chat render opens the model turn only for a tokenizer that holds both Inkling markers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const msgs = "[{\"role\":\"user\",\"content\":\"hi\"}]";
+    const src = "{% for m in messages %}[{{ m.content }}]{% endfor %}";
+    var none = try testText(a, src, &.{});
+    try std.testing.expectEqualStrings("[hi]", try renderText(a, &none, msgs, null, .{}));
+    var one = try testText(a, src, &.{inkling.model});
+    try std.testing.expectEqualStrings("[hi]", try renderText(a, &one, msgs, null, .{}));
+    var other = try testText(a, src, &.{inkling.end_sampling});
+    try std.testing.expectEqualStrings("[hi]", try renderText(a, &other, msgs, null, .{}));
+    var both = try testText(a, src, &both_markers);
+    try std.testing.expectEqualStrings("[hi]" ++ inkling.model, try renderText(a, &both, msgs, null, .{}));
+    try std.testing.expectEqualStrings("[hi]", try renderText(a, &both, msgs, null, .{ .add_generation_prompt = false }));
+}
+
+test "a template that already opens the model turn is not opened twice" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t = try testText(a, "{% for m in messages %}[{{ m.content }}]{% endfor %}{% if add_generation_prompt %}<|message_model|>{% endif %}", &both_markers);
+    const msgs = "[{\"role\":\"user\",\"content\":\"hi\"}]";
+    try std.testing.expectEqualStrings("[hi]" ++ inkling.model, try renderText(a, &t, msgs, null, .{}));
+    try std.testing.expectEqualStrings("[hi]", try renderText(a, &t, msgs, null, .{ .add_generation_prompt = false }));
+}
+
+test "the Inkling template renders as the reference does: assistant-last, tool turn, effort 0 and the default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var t = try testText(a, inkling_template, &both_markers);
+    const sys = "<|message_system|><|content_text|>Thinking effort level: ";
+    // an assistant message closes with end-of-sampling; the reference still opens a fresh model turn after it
+    try std.testing.expectEqualStrings(
+        sys ++ "0.2<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|><|content_text|>Hello<|end_message|><|content_model_end_sampling|><|message_model|>",
+        try renderText(a, &t, "[{\"role\":\"user\",\"content\":\"Hi\"},{\"role\":\"assistant\",\"content\":\"Hello\"}]", null, .{ .reasoning_effort = "low", .enable_thinking = true }),
+    );
+    try std.testing.expectEqualStrings(
+        "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|>" ++
+            sys ++ "0.2<|end_message|><|message_user|><|content_text|>Weather in Paris?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>Sunny<|end_message|><|message_model|>",
+        try renderText(
+            a,
+            &t,
+            "[{\"role\":\"user\",\"content\":\"Weather in Paris?\"},{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"Sunny\"}]",
+            "[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}}]",
+            .{ .reasoning_effort = "low", .enable_thinking = true },
+        ),
+    );
+    const hi = "[{\"role\":\"user\",\"content\":\"Hi\"}]";
+    const tail = "<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|>";
+    // thinking off with no named effort is effort 0, not the template default
+    try std.testing.expectEqualStrings(sys ++ "0" ++ tail, try renderText(a, &t, hi, null, .{ .enable_thinking = false }));
+    try std.testing.expectEqualStrings(sys ++ "0.2" ++ tail, try renderText(a, &t, hi, null, .{ .enable_thinking = false, .reasoning_effort = "low" }));
+    try std.testing.expectEqualStrings(sys ++ "0.9" ++ tail, try renderText(a, &t, hi, null, .{ .enable_thinking = true }));
 }
 
 test "model EOS does not hide a different tokenizer chat end" {
