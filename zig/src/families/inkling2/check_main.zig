@@ -14,7 +14,8 @@ const usage =
     \\attn --model DIR --layer L --pass P --n N --rows R [--pos0 P0] --in DIR: reads DIR/xs.bf16 ([N, 3, 2304]: xq, xk, xv a step), runs the visit (L, P)'s attention on them R rows a call from position P0 with the visit's caches carried (P0 > 0: k0.bf16 and v0.bf16 [keep, 8, 128] fill the rows before it), writes out.bf16 ([N, 2304], the wo_ud projection)
     \\decode --model DIR --steps FILE.json --visits A-B [--teacher GOLDEN_DIR] [--layers staged] [--dump-kv L:P,...] --out DIR: runs the single-token steps of FILE.json ({"steps": [[id], ...]}) from position 0 through visits 0..B (B at most 47), the carried input after each visit, each visit's MoE input and a pass > 0 visit's messages replaced by GOLDEN_DIR's (ref.capture layout: visit<VV>.f32, mlp<VV>.f32, msg<VV>.f32) when given, and writes step<s>/visit<VV>.f32 and step<s>/mlp<VV>.f32 (the MoE input before the replacement), for a visit with pass > 0 step<s>/xs<VV>.f32 and msg<VV>.f32 (controller outputs, messages), for visits A..B, and a manifest.json in the reference's layout; --dump-kv writes the K and V rows of those (layer, pass) visits after the last step as kv/L<l>p<p>.<k|v>.bf16 ([steps, 8, 128])
     \\    With --visits ending at the last visit it also runs the head on the carried input after it (the golden's when --teacher is given, so the logits show the head alone) and writes step<s>/logits.f32 ([unpadded_vocab], softcapped fp32) and step<s>/argmax.u32 (the device pick, checked against a host pick); with --teacher also step<s>/logits_free.f32, the logits of the engine's own last-visit output
-    \\greedy --model DIR --prompts FILE.json --n N --out DIR: FILE.json is {"prompts": [[id, ...], ...]}; each prompt is fed one token at a time from position 0 (conv states cleared between prompts), then N tokens are picked greedily (lowest id on ties); writes tokens.u32 ([prompts, N]) and p<P>/logits<GG>.f32 ([unpadded_vocab]) for each picked token
+    \\greedy --model DIR --prompts FILE.json --n N [--chunk-rows R] --out DIR: FILE.json is {"prompts": [[id, ...], ...]}; each prompt is prefilled in chunks of R rows (default 512) from position 0 (conv states cleared between prompts), then N tokens are picked greedily (lowest id on ties); writes tokens.u32 ([prompts, N]) and p<P>/logits<GG>.f32 ([unpadded_vocab]) for each picked token
+    \\prefill --model DIR --ids FILE.json [--chunk-rows R] [--decode N] [--teacher GOLDEN_DIR] [--dump-kv L:P,...] --out DIR: FILE.json is {"steps": [[id, ...], [id], ...]}; step 0 is prefilled in chunks of R rows (default 512) from position 0, then steps 1..N run as single-token decode steps (teacher-forced ids); writes ref.capture's all-rows layout (step<s>/visit<VV>.f32 [rows, qn, 2304], mlp<VV>.f32, xs<VV>.f32, msg<VV>.f32), step<s>/logits.f32 and argmax.u32 (the last row's), and a manifest.json; with GOLDEN_DIR (captured with --all-rows) the carried input, the MoE input and the messages of every row are replaced by the reference's; --dump-kv writes the K and V rows of the given (layer, pass) visits for all positions
     \\weights --model DIR [--layers A-B] [--readback NAME,...]: uploads the text weights (TF_INK2_EMBED_HOST=1 keeps the
     \\    embedding on the host), writes DIR/weights.json with peak_rss_mib and device_bytes, and one row per readback
     \\    tensor (names below model.llm., e.g. layers.0.attn.wo_ud.weight)
@@ -51,6 +52,9 @@ const Args = struct {
     staged: bool = false,
     dump_kv: ?[]const u8 = null,
     prompts: ?[]const u8 = null,
+    ids: ?[]const u8 = null,
+    chunk_rows: u32 = ink2.prefill.default_chunk_rows,
+    decode: usize = 0,
 };
 
 fn parseLayers(text: []const u8) !ink2.budget.LayerRange {
@@ -67,7 +71,7 @@ fn parseArgs(args: []const [:0]const u8) !Args {
         const v: []const u8 = args[i + 1];
         if (std.mem.eql(u8, args[i], "--out")) a.out = v else if (std.mem.eql(u8, args[i], "--model")) a.model = v else if (std.mem.eql(u8, args[i], "--in")) a.in = v else if (std.mem.eql(u8, args[i], "--layers")) {
             if (std.mem.eql(u8, v, staged_layers)) a.staged = true else a.layers = try parseLayers(v);
-        } else if (std.mem.eql(u8, args[i], "--steps")) a.steps = v else if (std.mem.eql(u8, args[i], "--teacher")) a.teacher = v else if (std.mem.eql(u8, args[i], "--visits")) a.visits = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--dump-kv")) a.dump_kv = v else if (std.mem.eql(u8, args[i], "--prompts")) a.prompts = v else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else if (std.mem.eql(u8, args[i], "--pass")) a.pass = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--pos0")) a.pos0 = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--n")) a.n = try std.fmt.parseInt(usize, v, 10) else return error.Usage;
+        } else if (std.mem.eql(u8, args[i], "--steps")) a.steps = v else if (std.mem.eql(u8, args[i], "--teacher")) a.teacher = v else if (std.mem.eql(u8, args[i], "--visits")) a.visits = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--dump-kv")) a.dump_kv = v else if (std.mem.eql(u8, args[i], "--prompts")) a.prompts = v else if (std.mem.eql(u8, args[i], "--ids")) a.ids = v else if (std.mem.eql(u8, args[i], "--chunk-rows")) a.chunk_rows = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--decode")) a.decode = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else if (std.mem.eql(u8, args[i], "--pass")) a.pass = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--pos0")) a.pos0 = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--n")) a.n = try std.fmt.parseInt(usize, v, 10) else return error.Usage;
     }
     return a;
 }
@@ -130,6 +134,10 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (std.mem.eql(u8, a.sub, "greedy")) {
         try greedyRun(init, a, out);
+        return 0;
+    }
+    if (std.mem.eql(u8, a.sub, "prefill")) {
+        try prefillRun(init, a, out);
         return 0;
     }
     if (std.mem.eql(u8, a.sub, "conv")) {
@@ -656,92 +664,113 @@ fn attnPrefix(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, cache: *ink2.
 }
 
 const decode_chunk_rows = 1;
+const f32_size = @sizeOf(f32);
+/// Rows of a visit's carried vector, MoE input, controller outputs and messages: the most any of them has.
+const max_row_kinds = ink2.loop_kernels.n_streams;
 
 const DecodeSteps = struct { steps: []const []const u32 };
 
-/// Hands decode.step the golden's carried input of the step being run.
+/// Rows `first_row`.. of the all-rows file `path` (qn vectors a row); a later chunk of the same step adds to the file.
+fn writeRows(dir: std.Io.Dir, io: std.Io, path: []const u8, qn: usize, first_row: u64, data: []const f32) !void {
+    if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(io, parent);
+    const file = try dir.createFile(io, path, .{ .truncate = false });
+    defer file.close(io);
+    try file.writePositionalAll(io, std.mem.sliceAsBytes(data), first_row * qn * loop_hidden * f32_size);
+}
+
+fn readRows(dir: std.Io.Dir, io: std.Io, path: []const u8, qn: usize, first_row: u64, out: []f32) !void {
+    const file = try dir.openFile(io, path, .{});
+    defer file.close(io);
+    const got = try file.readPositionalAll(io, std.mem.sliceAsBytes(out), first_row * qn * loop_hidden * f32_size);
+    if (got != out.len * f32_size) return error.ShapeMismatch;
+}
+
+/// Hands decode.forward the golden's carried input, MoE input and messages of the rows of the step being run.
 const GoldenTeacher = struct {
-    gpa: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
     sched: *const ink2.visits.Schedule,
     step: usize = 0,
+    step_pos0: u64 = 0,
+    raw: []f32,
     buf: []f32,
     err: ?anyerror = null,
 
-    fn input(ctx: *anyopaque, v: u32) ?[]const f32 {
+    fn input(ctx: *anyopaque, v: u32, span: ink2.decode.Span) ?[]const f32 {
         const t: *GoldenTeacher = @ptrCast(@alignCast(ctx));
-        return t.read("visit", v, ink2.decode.carriedRows(t.sched, v) * loop_hidden) catch |e| {
+        return t.read("visit", v, span, ink2.decode.carriedRows(t.sched, v));
+    }
+
+    fn mlp(ctx: *anyopaque, v: u32, span: ink2.decode.Span) ?[]const f32 {
+        const t: *GoldenTeacher = @ptrCast(@alignCast(ctx));
+        return t.read("mlp", v, span, 1);
+    }
+
+    fn msg(ctx: *anyopaque, v: u32, span: ink2.decode.Span) ?[]const f32 {
+        const t: *GoldenTeacher = @ptrCast(@alignCast(ctx));
+        return t.read("msg", v, span, ink2.loop_kernels.n_streams);
+    }
+
+    fn read(t: *GoldenTeacher, kind: []const u8, v: u32, span: ink2.decode.Span, qn: usize) ?[]const f32 {
+        return t.load(kind, v, span, qn) catch |e| {
             t.err = e;
             return null;
         };
     }
 
-    fn mlp(ctx: *anyopaque, v: u32) ?[]const f32 {
-        const t: *GoldenTeacher = @ptrCast(@alignCast(ctx));
-        return t.read("mlp", v, loop_hidden) catch |e| {
-            t.err = e;
-            return null;
-        };
-    }
-
-    fn msg(ctx: *anyopaque, v: u32) ?[]const f32 {
-        const t: *GoldenTeacher = @ptrCast(@alignCast(ctx));
-        return t.read("msg", v, ink2.loop_kernels.n_streams * loop_hidden) catch |e| {
-            t.err = e;
-            return null;
-        };
-    }
-
-    fn read(t: *GoldenTeacher, kind: []const u8, v: u32, n: usize) ![]const f32 {
+    fn load(t: *GoldenTeacher, kind: []const u8, v: u32, span: ink2.decode.Span, qn: usize) ![]const f32 {
         var name: [64]u8 = undefined;
         const path = try std.fmt.bufPrint(&name, "step{d}/{s}{d:0>2}.f32", .{ t.step, kind, v });
-        const bytes = try t.dir.readFileAlloc(t.io, path, t.gpa, .limited(n * @sizeOf(f32) + 1));
-        defer t.gpa.free(bytes);
-        if (bytes.len != n * @sizeOf(f32)) return error.ShapeMismatch;
-        @memcpy(std.mem.sliceAsBytes(t.buf[0..n]), bytes);
+        const n = qn * span.rows * loop_hidden;
+        try readRows(t.dir, t.io, path, qn, span.p0 - t.step_pos0, t.raw[0..n]);
+        ink2.check_rows.toDeviceLayout(t.raw[0..n], t.buf[0..n], qn, span.rows, loop_hidden);
         return t.buf[0..n];
     }
 };
 
-/// Writes the rows of each visit from `first` on in the reference's layout: step<s>/<kind><VV>.f32.
+/// Writes the rows of each visit from `first` on in the reference's all-rows layout: step<s>/<kind><VV>.f32.
 const DecodeTrace = struct {
     d: *const cuda.Driver,
-    rows: *ink2.check_rows.Writer,
+    io: std.Io,
+    dir: std.Io.Dir,
+    rows_out: *ink2.check_rows.Writer,
     first: u32,
     step: usize = 0,
-    buf: []u8,
+    step_pos0: u64 = 0,
+    raw: []f32,
+    buf: []f32,
     /// Set with a teacher: the engine's own head input of the last visit goes through the head before the teacher's replaces it.
     head_free: ?*HeadRun = null,
 
-    fn put(t: *DecodeTrace, kind: []const u8, v: u32, ptr: u64, n: usize) !void {
+    fn put(t: *DecodeTrace, kind: []const u8, v: u32, span: ink2.decode.Span, ptr: u64, qn: usize) !void {
         if (v < t.first) return;
-        const bytes = n * loop_hidden * @sizeOf(f32);
-        try cuda.memory.download(t.d, ptr, t.buf[0..bytes]);
+        const n = qn * span.rows * loop_hidden;
+        try cuda.memory.download(t.d, ptr, std.mem.sliceAsBytes(t.raw[0..n]));
+        ink2.check_rows.toFileLayout(t.raw[0..n], t.buf[0..n], qn, span.rows, loop_hidden);
         var name: [64]u8 = undefined;
-        try t.rows.put(try std.fmt.bufPrint(&name, "step{d}/{s}{d:0>2}", .{ t.step, kind, v }), .f32, &.{ n, loop_hidden }, t.buf[0..bytes]);
+        try writeRows(t.dir, t.io, try std.fmt.bufPrint(&name, "step{d}/{s}{d:0>2}.f32", .{ t.step, kind, v }), qn, span.p0 - t.step_pos0, t.buf[0..n]);
     }
 
-    fn visit(ctx: *anyopaque, v: u32, inp: u64, qn: u32) anyerror!void {
+    fn visit(ctx: *anyopaque, v: u32, span: ink2.decode.Span, inp: u64, qn: u32) anyerror!void {
         const t: *DecodeTrace = @ptrCast(@alignCast(ctx));
-        try put(t, "visit", v, inp, qn);
+        try put(t, "visit", v, span, inp, qn);
         if (t.head_free) |h| if (v == h.last_visit) {
-            _ = try h.run();
+            _ = try h.run(span.rows - 1);
             var name: [64]u8 = undefined;
-            try h.put(t.rows, try std.fmt.bufPrint(&name, "step{d}/logits_free", .{t.step}));
+            try h.put(t.rows_out, try std.fmt.bufPrint(&name, "step{d}/logits_free", .{t.step}));
         };
     }
 
-    fn mlp(ctx: *anyopaque, v: u32, mlp_in: u64) anyerror!void {
-        try put(@ptrCast(@alignCast(ctx)), "mlp", v, mlp_in, 1);
+    fn mlp(ctx: *anyopaque, v: u32, span: ink2.decode.Span, mlp_in: u64) anyerror!void {
+        try put(@ptrCast(@alignCast(ctx)), "mlp", v, span, mlp_in, 1);
     }
 
-    fn xs(ctx: *anyopaque, v: u32, ptr: u64) anyerror!void {
-        try put(@ptrCast(@alignCast(ctx)), "xs", v, ptr, ink2.engine.max_inputs);
+    fn xs(ctx: *anyopaque, v: u32, span: ink2.decode.Span, ptr: u64) anyerror!void {
+        try put(@ptrCast(@alignCast(ctx)), "xs", v, span, ptr, ink2.engine.max_inputs);
     }
 
-    fn msg(ctx: *anyopaque, v: u32, ptr: u64) anyerror!void {
-        try put(@ptrCast(@alignCast(ctx)), "msg", v, ptr, ink2.loop_kernels.n_streams);
+    fn msg(ctx: *anyopaque, v: u32, span: ink2.decode.Span, ptr: u64) anyerror!void {
+        try put(@ptrCast(@alignCast(ctx)), "msg", v, span, ptr, ink2.loop_kernels.n_streams);
     }
 };
 
@@ -830,10 +859,16 @@ const HeadRun = struct {
         gpa.free(h.host);
     }
 
-    /// Logits of the carried input now in the flow, into `host`; returns the device pick, which a host pick must repeat.
-    fn run(h: *HeadRun) !u32 {
+    /// Logits of row `row` of the carried input now in the flow, into `host`; returns the device pick, which a host pick must repeat.
+    fn run(h: *HeadRun, row: usize) !u32 {
+        const at = h.c.flow.r.inp + row * h.c.text.hidden * @sizeOf(u16);
+        try ink2.head.logits(h.c, h.s, at, 1, h.scratch.r.logits);
+        return h.finish();
+    }
+
+    /// The pick and the host logits of the logits already in the scratch (`prefill.run` leaves its last row's there).
+    fn finish(h: *HeadRun) !u32 {
         const r = h.scratch.r;
-        try ink2.head.logits(h.c, h.s, h.c.flow.r.inp, 1, r.logits);
         try ink2.head.argmax(h.c, h.s, r.logits, 1, r.val, r.id);
         try h.s.synchronize();
         try cuda.memory.download(h.c.d, r.logits, std.mem.sliceAsBytes(h.host));
@@ -863,7 +898,7 @@ const Session = struct {
     c: ink2.engine.Ctx,
 
     /// Weights of the layers visits 0..`last_visit` (default: the whole schedule) read, or `layers` when given.
-    fn open(s: *Session, gpa: std.mem.Allocator, io: std.Io, model: []const u8, last_visit: ?u32, layers: ?ink2.budget.LayerRange) !void {
+    fn open(s: *Session, gpa: std.mem.Allocator, io: std.Io, model: []const u8, last_visit: ?u32, layers: ?ink2.budget.LayerRange, chunk_rows: u32) !void {
         s.driver = try cuda.Driver.open();
         errdefer s.driver.close();
         s.ctx = try cuda.Context.init(&s.driver, 0);
@@ -876,14 +911,14 @@ const Session = struct {
         const last = last_visit orelse planned.n - 1;
         if (last >= planned.n) return error.VisitsPastSchedule;
         const range = layers orelse ink2.budget.LayerRange{ .first = 0, .last = ink2.decode.layersRead(&planned, last) };
-        const o: ink2.budget.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = decode_chunk_rows, .embed_host = embed_host, .layers = range };
+        const o: ink2.budget.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = chunk_rows, .embed_host = embed_host, .layers = range };
         s.w = try ink2.weights.load(gpa, io, ink2.weights.deviceUploader(s.ctx.d), model, o, device_limit);
         errdefer s.w.deinit();
         const layer_plan = try ink2.plan.build(&s.w.cfg.text, s.w.prec[0..s.w.cfg.text.layers]);
         s.sched = try ink2.visits.build(&s.w.cfg, &layer_plan);
         if (s.sched.n != planned.n) return error.VisitsPastSchedule;
 
-        const co: ink2.cache.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = decode_chunk_rows };
+        const co: ink2.cache.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = chunk_rows };
         s.cache = try ink2.cache.Cache.init(s.ctx.d, &s.sched, &s.w.cfg.text, co);
         errdefer s.cache.deinit();
         try s.c.init(s.ctx.d, &s.w, s.sched, &s.cache, co);
@@ -920,22 +955,27 @@ fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
     const kv: []const KvVisit = if (a.dump_kv) |list| try parseKvVisits(list, &kv_buf) else &.{};
 
     var session: Session = undefined;
-    try session.open(gpa, io, model, range.last, a.layers);
+    try session.open(gpa, io, model, range.last, a.layers, decode_chunk_rows);
     defer session.deinit();
     const c = &session.c;
     const sched = session.sched;
 
     var rows_out = try ink2.check_rows.Writer.init(gpa, io, out);
     defer rows_out.deinit();
-    const trace_buf = try gpa.alloc(u8, ink2.loop_kernels.n_streams * loop_hidden * @sizeOf(f32));
+    const row_buf_len = max_row_kinds * decode_chunk_rows * loop_hidden;
+    const trace_raw = try gpa.alloc(f32, row_buf_len);
+    defer gpa.free(trace_raw);
+    const trace_buf = try gpa.alloc(f32, row_buf_len);
     defer gpa.free(trace_buf);
-    var tracer: DecodeTrace = .{ .d = c.d, .rows = &rows_out, .first = range.first, .buf = trace_buf };
+    var tracer: DecodeTrace = .{ .d = c.d, .io = io, .dir = rows_out.dir, .rows_out = &rows_out, .first = range.first, .raw = trace_raw, .buf = trace_buf };
 
     var golden_dir: ?std.Io.Dir = null;
     defer if (golden_dir) |*dir| dir.close(io);
-    const teacher_buf = try gpa.alloc(f32, ink2.loop_kernels.n_streams * loop_hidden);
+    const teacher_raw = try gpa.alloc(f32, row_buf_len);
+    defer gpa.free(teacher_raw);
+    const teacher_buf = try gpa.alloc(f32, row_buf_len);
     defer gpa.free(teacher_buf);
-    var teacher: GoldenTeacher = .{ .gpa = gpa, .io = io, .dir = undefined, .sched = &sched, .buf = teacher_buf };
+    var teacher: GoldenTeacher = .{ .io = io, .dir = undefined, .sched = &sched, .raw = teacher_raw, .buf = teacher_buf };
     if (a.teacher) |path| {
         golden_dir = try std.Io.Dir.cwd().openDir(io, path, .{});
         teacher.dir = golden_dir.?;
@@ -956,12 +996,14 @@ fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
     defer gpa.free(metas);
     for (steps, 0..) |ids, s| {
         tracer.step = s;
+        tracer.step_pos0 = s;
         teacher.step = s;
+        teacher.step_pos0 = s;
         metas[s] = .{ .n = 1, .pos0 = s };
         try ink2.decode.step(c, session.stream, 0, ids[0], s, range.last, hooks);
         if (teacher.err) |e| return e;
         if (with_head) {
-            const pick = try head_run.run();
+            const pick = try head_run.run(0);
             var name: [64]u8 = undefined;
             try head_run.put(&rows_out, try std.fmt.bufPrint(&name, "step{d}/logits", .{s}));
             try rows_out.put(try std.fmt.bufPrint(&name, "step{d}/argmax", .{s}), .u32, &.{1}, std.mem.asBytes(&pick));
@@ -970,8 +1012,16 @@ fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
 
     try dumpKv(gpa, &rows_out, &session.cache, &sched, &session.w.cfg.text, kv, range.last, steps.len);
     var qn: [ink2.visits.max_visits]u32 = undefined;
-    for (qn[0..sched.n], 0..) |*q, i| q.* = ink2.decode.carriedRows(&sched, @intCast(i));
-    try rows_out.finishRun(.{ .hidden = loop_hidden, .visits = sched.n, .unpadded_vocab = session.w.cfg.text.unpadded_vocab, .qn = qn[0..sched.n], .steps = metas });
+    var loop_visits: [ink2.visits.max_visits]u32 = undefined;
+    var n_loop: usize = 0;
+    for (qn[0..sched.n], 0..) |*q, i| {
+        q.* = ink2.decode.carriedRows(&sched, @intCast(i));
+        if (sched.visits[i].pass > 0) {
+            loop_visits[n_loop] = @intCast(i);
+            n_loop += 1;
+        }
+    }
+    try rows_out.finishRun(.{ .hidden = loop_hidden, .visits = sched.n, .unpadded_vocab = session.w.cfg.text.unpadded_vocab, .qn = qn[0..sched.n], .loop_visits = loop_visits[0..n_loop], .steps = metas });
     std.debug.print("decode: {d} steps, visits {d}-{d}, device_bytes {d}\n", .{ steps.len, range.first, range.last, session.w.device_bytes });
     if (with_head) {
         const b = ink2.head.deviceBytes(&session.w.cfg.text, 1);
@@ -981,7 +1031,7 @@ fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
 
 const GreedyPrompts = struct { prompts: []const []const u32 };
 
-/// Each prompt of `--prompts` one token at a time from position 0, then `--n` greedy tokens; see `usage`.
+/// Each prompt of `--prompts` prefilled in chunks, then `--n` greedy tokens; see `usage`.
 fn greedyRun(init: std.process.Init, a: Args, out: []const u8) !void {
     const gpa = init.gpa;
     const io = init.io;
@@ -997,7 +1047,7 @@ fn greedyRun(init: std.process.Init, a: Args, out: []const u8) !void {
     if (prompts.len == 0 or n == 0) return error.BadPrompts;
 
     var session: Session = undefined;
-    try session.open(gpa, io, model, null, a.layers);
+    try session.open(gpa, io, model, null, a.layers, a.chunk_rows);
     defer session.deinit();
     const c = &session.c;
     const vocab = c.text.unpadded_vocab;
@@ -1016,26 +1066,122 @@ fn greedyRun(init: std.process.Init, a: Args, out: []const u8) !void {
     const last = session.sched.n - 1;
     for (prompts, 0..) |ids, p| {
         try session.cache.clear(session.stream, 0);
-        var pos: usize = 0;
-        var cur: u32 = ids[0];
+        try ink2.prefill.run(c, session.stream, 0, ids, a.chunk_rows, head_run.scratch.r.logits, .{});
+        var pick = try head_run.finish();
+        var g: usize = 0;
         while (true) {
-            try ink2.decode.step(c, session.stream, 0, cur, pos, last, .{});
-            pos += 1;
-            if (pos < ids.len) {
-                cur = ids[pos];
-                continue;
-            }
-            const g = pos - ids.len;
-            const pick = try head_run.run();
             tokens[p * n + g] = pick;
             var name: [64]u8 = undefined;
             try head_run.put(&rows_out, try std.fmt.bufPrint(&name, "p{d}/logits{d:0>2}", .{ p, g }));
             if (g + 1 == n) break;
-            cur = pick;
+            try ink2.decode.step(c, session.stream, 0, pick, ids.len + g, last, .{});
+            pick = try head_run.run(0);
+            g += 1;
         }
     }
     try rows_out.put("tokens", .u32, &.{ prompts.len, n }, std.mem.sliceAsBytes(tokens));
     try rows_out.finish();
     const b = ink2.head.deviceBytes(&session.w.cfg.text, 1);
-    std.debug.print("greedy: {d} prompts, {d} tokens each, device_bytes {d}, head unembed {d} B (in device_bytes), scratch {d} B\n", .{ prompts.len, n, session.w.device_bytes, b.unembed, b.scratch });
+    std.debug.print("greedy: {d} prompts, {d} tokens each, chunk rows {d}, device_bytes {d}, head unembed {d} B (in device_bytes), scratch {d} B\n", .{ prompts.len, n, a.chunk_rows, session.w.device_bytes, b.unembed, b.scratch });
+}
+
+/// Device bytes of everything a session holds beyond the weights: caches, attention, flow, MoE and head scratch.
+fn sessionBytes(session: *const Session, head_scratch: u64) u64 {
+    const c = &session.c;
+    var total: u64 = session.cache.kv.len + session.cache.conv.len + c.scratch.mem.len + c.flow.mem.len + head_scratch;
+    inline for (.{ "scores", "pick", "gamma", "act", "gu", "y", "yq", "dn" }) |f| total += @field(c.moe_sc, f).len;
+    return total;
+}
+
+/// Step 0 of `--ids` prefilled in chunks, then `--decode` single-token steps; see `usage`.
+fn prefillRun(init: std.process.Init, a: Args, out: []const u8) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const model = a.model orelse return error.Usage;
+    const ids_path = a.ids orelse return error.Usage;
+
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, ids_path, gpa, .limited(1 << 22));
+    defer gpa.free(text);
+    const parsed = try std.json.parseFromSlice(DecodeSteps, gpa, text, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const steps = parsed.value.steps;
+    if (steps.len == 0 or a.decode + 1 > steps.len or a.chunk_rows == 0) return error.BadSteps;
+    var positions: usize = 0;
+    for (steps[0 .. a.decode + 1], 0..) |ids, s| {
+        if (ids.len == 0 or (s > 0 and ids.len != 1)) return error.BadSteps;
+        positions += ids.len;
+    }
+    if (positions > dev_context) return error.BadSteps;
+
+    var kv_buf: [max_kv_dumps]KvVisit = undefined;
+    const kv: []const KvVisit = if (a.dump_kv) |list| try parseKvVisits(list, &kv_buf) else &.{};
+
+    var session: Session = undefined;
+    try session.open(gpa, io, model, null, a.layers, a.chunk_rows);
+    defer session.deinit();
+    const c = &session.c;
+    const sched = session.sched;
+    const vocab = c.text.unpadded_vocab;
+    for (steps[0 .. a.decode + 1]) |ids| for (ids) |id| if (id >= vocab) return error.BadSteps;
+
+    var rows_out = try ink2.check_rows.Writer.init(gpa, io, out);
+    defer rows_out.deinit();
+    const row_buf_len = max_row_kinds * @max(a.chunk_rows, 1) * loop_hidden;
+    const bufs = try gpa.alloc(f32, 4 * row_buf_len);
+    defer gpa.free(bufs);
+    var tracer: DecodeTrace = .{ .d = c.d, .io = io, .dir = rows_out.dir, .rows_out = &rows_out, .first = 0, .raw = bufs[0..row_buf_len], .buf = bufs[row_buf_len .. 2 * row_buf_len] };
+    var golden_dir: ?std.Io.Dir = null;
+    defer if (golden_dir) |*dir| dir.close(io);
+    var teacher: GoldenTeacher = .{ .io = io, .dir = undefined, .sched = &sched, .raw = bufs[2 * row_buf_len .. 3 * row_buf_len], .buf = bufs[3 * row_buf_len ..] };
+    if (a.teacher) |path| {
+        golden_dir = try std.Io.Dir.cwd().openDir(io, path, .{});
+        teacher.dir = golden_dir.?;
+    }
+    var head_run = try HeadRun.init(gpa, c, session.stream);
+    defer head_run.deinit(gpa);
+    if (a.teacher != null) tracer.head_free = &head_run;
+    const hooks: ink2.decode.Hooks = .{
+        .trace = .{ .ctx = &tracer, .visit = DecodeTrace.visit, .mlp = DecodeTrace.mlp, .xs = DecodeTrace.xs, .msg = DecodeTrace.msg },
+        .teacher = if (a.teacher != null) .{ .ctx = &teacher, .input = GoldenTeacher.input, .mlp = GoldenTeacher.mlp, .msg = GoldenTeacher.msg } else null,
+    };
+
+    const metas = try gpa.alloc(ink2.check_rows.StepMeta, a.decode + 1);
+    defer gpa.free(metas);
+    var pos: usize = 0;
+    for (steps[0 .. a.decode + 1], 0..) |ids, s| {
+        tracer.step = s;
+        tracer.step_pos0 = pos;
+        teacher.step = s;
+        teacher.step_pos0 = pos;
+        metas[s] = .{ .n = ids.len, .pos0 = pos };
+        var pick: u32 = undefined;
+        if (s == 0) {
+            try ink2.prefill.run(c, session.stream, 0, ids, a.chunk_rows, head_run.scratch.r.logits, hooks);
+            pick = try head_run.finish();
+        } else {
+            try ink2.decode.step(c, session.stream, 0, ids[0], pos, sched.n - 1, hooks);
+            pick = try head_run.run(0);
+        }
+        if (teacher.err) |e| return e;
+        var name: [64]u8 = undefined;
+        try head_run.put(&rows_out, try std.fmt.bufPrint(&name, "step{d}/logits", .{s}));
+        try rows_out.put(try std.fmt.bufPrint(&name, "step{d}/argmax", .{s}), .u32, &.{1}, std.mem.asBytes(&pick));
+        pos += ids.len;
+    }
+
+    try dumpKv(gpa, &rows_out, &session.cache, &sched, &session.w.cfg.text, kv, sched.n - 1, pos);
+    var qn: [ink2.visits.max_visits]u32 = undefined;
+    var loop_visits: [ink2.visits.max_visits]u32 = undefined;
+    var n_loop: usize = 0;
+    for (qn[0..sched.n], 0..) |*q, i| {
+        q.* = ink2.decode.carriedRows(&sched, @intCast(i));
+        if (sched.visits[i].pass > 0) {
+            loop_visits[n_loop] = @intCast(i);
+            n_loop += 1;
+        }
+    }
+    try rows_out.finishRun(.{ .hidden = loop_hidden, .visits = sched.n, .unpadded_vocab = vocab, .qn = qn[0..sched.n], .loop_visits = loop_visits[0..n_loop], .steps = metas });
+    const extra = sessionBytes(&session, ink2.head.deviceBytes(&session.w.cfg.text, 1).scratch);
+    const caches = session.cache.kv.len + session.cache.conv.len;
+    std.debug.print("prefill: {d} ids in chunks of {d}, {d} decode steps, device_bytes {d} + {d} (caches {d}, scratch {d}) = {d}\n", .{ steps[0].len, a.chunk_rows, a.decode, session.w.device_bytes, extra, caches, extra - caches, session.w.device_bytes + extra });
 }

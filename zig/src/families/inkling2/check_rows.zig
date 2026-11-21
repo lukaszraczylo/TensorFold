@@ -26,6 +26,8 @@ pub const RunMeta = struct {
     unpadded_vocab: usize,
     qn: []const u32,
     steps: []const StepMeta,
+    /// Visits with pass > 0, the ones that carry messages and controller outputs.
+    loop_visits: []const u32 = &.{},
 };
 
 pub const StepMeta = struct { n: usize, pos0: usize };
@@ -78,6 +80,8 @@ pub const Writer = struct {
         defer out.deinit(w.gpa);
         try out.print(w.gpa, "{{\"hidden\":{d},\"visits\":{d},\"unpadded_vocab\":{d},\"qn\":[", .{ meta.hidden, meta.visits, meta.unpadded_vocab });
         for (meta.qn, 0..) |q, i| try out.print(w.gpa, "{s}{d}", .{ if (i == 0) "" else ",", q });
+        try out.appendSlice(w.gpa, "],\"loop_visits\":[");
+        for (meta.loop_visits, 0..) |v, i| try out.print(w.gpa, "{s}{d}", .{ if (i == 0) "" else ",", v });
         try out.appendSlice(w.gpa, "],\"steps\":[");
         for (meta.steps, 0..) |st, i| try out.print(w.gpa, "{s}{{\"n\":{d},\"pos0\":{d}}}", .{ if (i == 0) "" else ",", st.n, st.pos0 });
         try out.appendSlice(w.gpa, "],\"files\":");
@@ -91,6 +95,16 @@ pub const Writer = struct {
         try w.manifest.appendSlice(w.gpa, "\n]\n");
     }
 };
+
+/// ref.capture's all-rows layout [rows, qn, width] from the engine's [qn, rows, width].
+pub fn toFileLayout(dev: []const f32, out: []f32, qn: usize, rows: usize, width: usize) void {
+    for (0..rows) |r| for (0..qn) |q| @memcpy(out[(r * qn + q) * width ..][0..width], dev[(q * rows + r) * width ..][0..width]);
+}
+
+/// The engine's [qn, rows, width] from the file layout [rows, qn, width].
+pub fn toDeviceLayout(file: []const f32, out: []f32, qn: usize, rows: usize, width: usize) void {
+    for (0..rows) |r| for (0..qn) |q| @memcpy(out[(q * rows + r) * width ..][0..width], file[(r * qn + q) * width ..][0..width]);
+}
 
 /// A relative path of plain characters: it stays under the directory and needs no JSON escaping.
 fn validName(name: []const u8) bool {
@@ -159,7 +173,7 @@ test "finishRun writes the reference's manifest layout with the rows under files
     defer w.deinit();
     const vals = [_]f32{ 1, 2 };
     try w.put("step0/visit00", .f32, &.{ 1, 2 }, std.mem.sliceAsBytes(&vals));
-    try w.finishRun(.{ .hidden = 2, .visits = 3, .unpadded_vocab = 9, .qn = &.{ 1, 3, 1 }, .steps = &.{ .{ .n = 1, .pos0 = 0 }, .{ .n = 1, .pos0 = 1 } } });
+    try w.finishRun(.{ .hidden = 2, .visits = 3, .unpadded_vocab = 9, .qn = &.{ 1, 3, 1 }, .loop_visits = &.{2}, .steps = &.{ .{ .n = 1, .pos0 = 0 }, .{ .n = 1, .pos0 = 1 } } });
 
     const data = try tmp.dir.readFileAlloc(io, "run/step0/visit00.f32", gpa, .limited(1 << 10));
     defer gpa.free(data);
@@ -167,12 +181,13 @@ test "finishRun writes the reference's manifest layout with the rows under files
     const text = try tmp.dir.readFileAlloc(io, "run/" ++ manifest_name, gpa, .limited(1 << 10));
     defer gpa.free(text);
     const Entry = struct { name: []const u8, dtype: []const u8, shape: []const usize };
-    const Manifest = struct { hidden: usize, visits: usize, unpadded_vocab: usize, qn: []const u32, steps: []const StepMeta, files: []const Entry };
+    const Manifest = struct { hidden: usize, visits: usize, unpadded_vocab: usize, qn: []const u32, loop_visits: []const u32, steps: []const StepMeta, files: []const Entry };
     const parsed = try std.json.parseFromSlice(Manifest, gpa, text, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed.value.hidden);
     try std.testing.expectEqual(@as(usize, 3), parsed.value.visits);
     try std.testing.expectEqualSlices(u32, &.{ 1, 3, 1 }, parsed.value.qn);
+    try std.testing.expectEqualSlices(u32, &.{2}, parsed.value.loop_visits);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.steps[1].pos0);
     try std.testing.expectEqualStrings("step0/visit00", parsed.value.files[0].name);
 }
@@ -192,4 +207,22 @@ test "finishRun with no rows keeps files an empty array" {
     const parsed = try std.json.parseFromSlice(struct { files: []const u8 }, gpa, text, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed.value.files.len);
+}
+
+test "row layouts swap the row and query axes and invert each other" {
+    const qn = 3;
+    const rows = 4;
+    const width = 2;
+    var dev: [qn * rows * width]f32 = undefined;
+    for (&dev, 0..) |*x, i| x.* = @floatFromInt(i);
+    var file: [dev.len]f32 = undefined;
+    toFileLayout(&dev, &file, qn, rows, width);
+    // device (q = 1, r = 2) sits at (2 * qn + 1) in the file
+    try std.testing.expectEqualSlices(f32, dev[(1 * rows + 2) * width ..][0..width], file[(2 * qn + 1) * width ..][0..width]);
+    var back: [dev.len]f32 = undefined;
+    toDeviceLayout(&file, &back, qn, rows, width);
+    try std.testing.expectEqualSlices(f32, &dev, &back);
+    // one query: both layouts are the same bytes
+    toFileLayout(dev[0 .. rows * width], file[0 .. rows * width], 1, rows, width);
+    try std.testing.expectEqualSlices(f32, dev[0 .. rows * width], file[0 .. rows * width]);
 }

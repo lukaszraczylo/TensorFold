@@ -20,14 +20,15 @@ pub const Options = struct {
 
 pub const Budget = struct { weights: u64, kv: u64, conv: u64, scratch: u64, total: u64 };
 
-/// Chunk scratch per row: 5 bf16 and 3 f32 hidden-wide rows, 8 f32 rows of 2 * expert_inter (ASSUMPTION: Task 17 measures it).
+/// Hidden-wide bytes of chunk scratch per row, fitted to `tf-ink2-check prefill` at 128 and 512 rows (123.7 and 300.6 MB).
+const scratch_row_hidden_bytes: u64 = 200;
+
 pub fn scratchRowBytes(c: *const config.Text) u64 {
-    const h: u64 = c.hidden;
-    return 5 * h * 2 + 3 * h * 4 + 8 * 2 * @as(u64, c.expert_inter) * 4;
+    return scratch_row_hidden_bytes * c.hidden;
 }
 
-/// Attention partials and routing buffers, independent of the chunk.
-pub const scratch_fixed_bytes: u64 = 256 * MiB;
+/// Attention partials and routing buffers, independent of the chunk; the fit stays at or above both measured points.
+pub const scratch_fixed_bytes: u64 = 64 * MiB;
 
 const layer_prefix = "model.llm.layers.";
 const vision_prefix = "model.visual.";
@@ -178,6 +179,11 @@ test "scratch formula" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const m = try Mini.init(arena.allocator());
-    try t.expectEqual(@as(u64, 124416), scratchRowBytes(&m.cfg.text));
-    try t.expectEqual(@as(u64, 64 * 124416) + scratch_fixed_bytes, m.budget(dev_gate).scratch);
+    try t.expectEqual(@as(u64, 460800), scratchRowBytes(&m.cfg.text));
+    try t.expectEqual(@as(u64, 64 * 460800) + scratch_fixed_bytes, m.budget(dev_gate).scratch);
+    const measured = [_]struct { rows: u32, bytes: u64 }{ .{ .rows = 128, .bytes = 123_664_384 }, .{ .rows = 512, .bytes = 300_560_896 } };
+    for (measured) |p| {
+        const est = p.rows * scratchRowBytes(&m.cfg.text) + scratch_fixed_bytes;
+        try t.expect(est >= p.bytes and est - p.bytes <= p.bytes / 10);
+    }
 }

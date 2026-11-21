@@ -1,6 +1,6 @@
-//! Decode forward of Inkling 2 Mini at one row (ref.model.Model.forward, _visit and _next_input): embedding,
+//! Forward of Inkling 2 Mini over a chunk of rows (ref.model.Model.forward, _visit and _next_input): embedding,
 //! attention, the two sublayer convs, the routed MoE and the residual mixes, and for the loop the message bank, the
-//! prelude restart, the cross-pass messages and the controllers (SPEC 9).
+//! prelude restart, the cross-pass messages and the controllers (SPEC 9). One row is a decode step.
 const std = @import("std");
 const cuda = @import("cuda");
 const attn_visit = @import("attn_visit.zig");
@@ -14,11 +14,8 @@ const visits = @import("visits.zig");
 const weights = @import("weights.zig");
 
 const hidden = moe.hidden;
-const rows = 1;
 const bf16_bytes = 2;
 const f32_bytes = 4;
-const bf16_row = rows * hidden * bf16_bytes;
-const f32_row = rows * hidden * f32_bytes;
 /// The attention input of a global layer has q, k and v rows; a local layer's has one.
 const global_inputs = engine.max_inputs;
 const mlp_queries = 1;
@@ -27,31 +24,46 @@ const head_queries = 1;
 const attn_streams = 3;
 const mlp_stream = 3;
 const no_norms: [ops.max_queries]u64 = @splat(0);
+/// Embedding rows a host-resident table sends in one upload.
+const embed_piece_rows = 32;
 
 comptime {
     std.debug.assert(std.mem.eql(u8, loop_kernels.stream_names[mlp_stream], "mlp"));
     std.debug.assert(loop_kernels.n_streams == attn_streams + 1 and attn_streams == global_inputs);
 }
 
-/// Called after visit `v` with the carried float32 [qn, hidden] vector the next visit reads (SPEC 5 step E), by `mlp`
-/// with the visit's own float32 [hidden] MoE input before a teacher replaces it, and for a visit with pass > 0 by `xs`
-/// with its controller outputs xq, xk, xv (float32 [3, hidden]) and by `msg` with its messages (float32 [4, hidden]).
+/// Bytes of a bf16 or fp32 [n, hidden] buffer.
+fn bf16Bytes(n: usize) u64 {
+    return n * hidden * bf16_bytes;
+}
+
+fn f32Bytes(n: usize) u64 {
+    return n * hidden * f32_bytes;
+}
+
+/// The rows of a call: `rows` tokens at positions `p0`..`p0 + rows` of the stream.
+pub const Span = struct { p0: u64, rows: u32 };
+
+/// Called after visit `v` with the carried float32 [qn, rows, hidden] vector the next visit reads (SPEC 5 step E), by
+/// `mlp` with the visit's own float32 [rows, hidden] MoE input before a teacher replaces it, and for a visit with pass
+/// > 0 by `xs` with its controller outputs xq, xk, xv (float32 [3, rows, hidden]) and by `msg` with its messages
+/// (float32 [4, rows, hidden]).
 pub const Trace = struct {
     ctx: *anyopaque,
-    visit: *const fn (ctx: *anyopaque, v: u32, inp: u64, qn: u32) anyerror!void,
-    mlp: ?*const fn (ctx: *anyopaque, v: u32, mlp_in: u64) anyerror!void = null,
-    xs: ?*const fn (ctx: *anyopaque, v: u32, xs: u64) anyerror!void = null,
-    msg: ?*const fn (ctx: *anyopaque, v: u32, msg: u64) anyerror!void = null,
+    visit: *const fn (ctx: *anyopaque, v: u32, span: Span, inp: u64, qn: u32) anyerror!void,
+    mlp: ?*const fn (ctx: *anyopaque, v: u32, span: Span, mlp_in: u64) anyerror!void = null,
+    xs: ?*const fn (ctx: *anyopaque, v: u32, span: Span, xs: u64) anyerror!void = null,
+    msg: ?*const fn (ctx: *anyopaque, v: u32, span: Span, msg: u64) anyerror!void = null,
 };
 
 /// Gives the carried input of visit `v`, by `mlp` its MoE input and by `msg` a pass > 0 visit's messages (float32
-/// [4, hidden]), as the reference computed them; the engine reads them in place of its own. A carried input before a
-/// pass > 0 visit is the float32 `dest` mix, else bf16 values.
+/// [4, rows, hidden]), as the reference computed them for the rows of `span`; the engine reads them in place of its
+/// own. A carried input before a pass > 0 visit is the float32 `dest` mix, else bf16 values.
 pub const Teacher = struct {
     ctx: *anyopaque,
-    input: *const fn (ctx: *anyopaque, v: u32) ?[]const f32,
-    mlp: ?*const fn (ctx: *anyopaque, v: u32) ?[]const f32 = null,
-    msg: ?*const fn (ctx: *anyopaque, v: u32) ?[]const f32 = null,
+    input: *const fn (ctx: *anyopaque, v: u32, span: Span) ?[]const f32,
+    mlp: ?*const fn (ctx: *anyopaque, v: u32, span: Span) ?[]const f32 = null,
+    msg: ?*const fn (ctx: *anyopaque, v: u32, span: Span) ?[]const f32 = null,
 };
 
 pub const Hooks = struct { trace: ?Trace = null, teacher: ?Teacher = null };
@@ -103,28 +115,36 @@ fn inputNorms(lw: *const weights.LayerW, layer: u32) ![ops.max_queries]u64 {
     };
 }
 
-/// Row `token` of the embedding through embed_norm into `out`; a host-resident table goes up as one scratch row.
-fn embedToken(c: *engine.Ctx, s: cuda.Stream, token: u32, out: u64) !void {
+/// The embeddings of `ids` through embed_norm into `out` (bf16 [ids.len, hidden]); a host-resident table goes up in
+/// pieces of `embed_piece_rows` rows through the flow's `emb` region.
+fn embedTokens(c: *engine.Ctx, s: cuda.Stream, ids: []const u32, out: u64) !void {
     const w = c.w;
     const f = c.flow.r;
+    const n = ids.len;
     var table: u64 = undefined;
-    var id: i32 = undefined;
+    var dev_ids: [engine.max_chunk_rows]i32 = undefined;
     if (w.embed_host != null) {
-        var row: [hidden]u16 = undefined;
-        try w.gatherEmbed(&.{token}, &row);
-        try upload(c, s, f.emb, std.mem.sliceAsBytes(&row));
+        var piece: [embed_piece_rows * hidden]u16 = undefined;
+        var at: usize = 0;
+        while (at < n) {
+            const m: usize = @min(embed_piece_rows, n - at);
+            try w.gatherEmbed(ids[at..][0..m], piece[0 .. m * hidden]);
+            try upload(c, s, f.emb + bf16Bytes(at), std.mem.sliceAsBytes(piece[0 .. m * hidden]));
+            try s.synchronize(); // the piece buffer is reused
+            at += m;
+        }
         table = f.emb;
-        id = 0;
+        for (dev_ids[0..n], 0..) |*d, i| d.* = @intCast(i);
     } else {
         table = try present(w.embed orelse return error.Inkling2MissingWeight);
-        id = std.math.cast(i32, token) orelse return error.TokenOutOfRange;
+        for (dev_ids[0..n], ids) |*d, id| d.* = std.math.cast(i32, id) orelse return error.TokenOutOfRange;
     }
-    try upload(c, s, f.ids, std.mem.asBytes(&id));
-    try s.synchronize(); // the host row and id go out of scope
-    try ops.embed(&c.ops, s, f.ids, rows, table, try present(w.embed_norm), out, hidden, c.text.eps);
+    try upload(c, s, f.ids, std.mem.sliceAsBytes(dev_ids[0..n]));
+    try s.synchronize(); // the id list goes out of scope
+    try ops.embed(&c.ops, s, f.ids, n, table, try present(w.embed_norm), out, hidden, c.text.eps);
 }
 
-fn mixArgs(c: *const engine.Ctx, blocks: []const u64, partial: u64, partial_bf16: bool, query: u64, norms: [ops.max_queries]u64, nq: u32, out: u64) ops.MixArgs {
+fn mixArgs(c: *const engine.Ctx, blocks: []const u64, partial: u64, partial_bf16: bool, query: u64, norms: [ops.max_queries]u64, nq: u32, out: u64, n: usize) ops.MixArgs {
     var m: ops.MixArgs = .{
         .partial = partial,
         .query = query,
@@ -133,7 +153,7 @@ fn mixArgs(c: *const engine.Ctx, blocks: []const u64, partial: u64, partial_bf16
         .n_blocks = @intCast(blocks.len),
         .partial_bf16 = @intFromBool(partial_bf16),
         .nq = @intCast(nq),
-        .rows = rows,
+        .rows = @intCast(n),
         .c = hidden,
         .eps = c.text.eps,
     };
@@ -150,29 +170,29 @@ fn controllers(lw: *const weights.LayerW) !*const [loop_kernels.n_streams]weight
     return error.Inkling2MissingWeight;
 }
 
-/// Stream `stream` of a pass > 0 visit: blends the float32 `dest` row with that stream's message into the normed bf16 `out`.
-fn control(c: *engine.Ctx, s: cuda.Stream, w: weights.Controller, dest: u64, stream: u32, norm: u64, out: u64) !void {
+/// Stream `stream` of a pass > 0 visit: blends the float32 `dest` rows with that stream's messages into the normed bf16 `out`.
+fn control(c: *engine.Ctx, s: cuda.Stream, w: weights.Controller, dest: u64, stream: u32, norm: u64, out: u64, n: usize) !void {
     const f = c.flow.r;
     try loop_kernels.controller(&c.loop, s, .{
         .dest = dest,
-        .msg = f.msg + @as(u64, stream) * f32_row,
+        .msg = f.msg + @as(u64, stream) * f32Bytes(n),
         .down = try present(w.down),
         .gain = try present(w.gain),
         .forget = try present(w.forget),
         .norm = norm,
         .h = f.gate_h,
         .out = out,
-        .rows = rows,
+        .rows = n,
     });
 }
 
 /// The restart's bank: the previous pass's two blocks, copied before this pass overwrites their slots (SPEC 9.1).
-fn saveBank(c: *engine.Ctx, s: cuda.Stream, from: [2]u8) !void {
+fn saveBank(c: *engine.Ctx, s: cuda.Stream, from: [2]u8, n: usize) !void {
     const f = c.flow.r;
     if (from[1] < from[0] or from[1] + 1 - from[0] != bank.bank_slots or from[1] >= bank.stack_slots) return error.Inkling2BankSlots;
     for (f.bank, @as(usize, from[0])..) |dst, slot| {
-        const view: cuda.DeviceBuffer = .{ .d = c.d, .ptr = dst, .len = bf16_row, .borrowed = true };
-        try view.copyFrom(0, f.stack[slot], bf16_row, s.handle);
+        const view: cuda.DeviceBuffer = .{ .d = c.d, .ptr = dst, .len = bf16Bytes(n), .borrowed = true };
+        try view.copyFrom(0, f.stack[slot], bf16Bytes(n), s.handle);
     }
 }
 
@@ -180,21 +200,22 @@ fn saveBank(c: *engine.Ctx, s: cuda.Stream, from: [2]u8) !void {
 /// the unforced stack, whose outlier channels the controllers' cancellations amplify), then the controllers blend the
 /// carried float32 `dest` (the prelude destinations at a restart) with them into xq, xk, xv in `inp`. A local layer
 /// broadcasts its one `dest` row and its one norm to the three streams; a global layer has a row and a norm for each.
-fn attnInputs(c: *engine.Ctx, s: cuda.Stream, i: u32, v: visits.Visit, op: bank.Op, h: Hooks) !void {
+fn attnInputs(c: *engine.Ctx, s: cuda.Stream, i: u32, v: visits.Visit, op: bank.Op, span: Span, h: Hooks) !void {
     if (!op.messages) return;
     const f = c.flow.r;
+    const n: usize = span.rows;
     const loop = c.w.cfg.loop orelse return error.NotLoop;
     const lw = try layerWeights(c, v.layer);
     const qa = try present(c.w.cross_q orelse return error.Inkling2MissingWeight);
     const qkv = try present(c.w.cross_kv_q orelse return error.Inkling2MissingWeight);
     if (v.layer < loop.core_start or v.layer >= loop.core_end) return error.Inkling2LoopVisit;
-    try loop_kernels.messages(&c.loop, s, f.bank, qa, qkv, v.layer - loop.core_start, f.msg, rows);
+    try loop_kernels.messages(&c.loop, s, f.bank, qa, qkv, v.layer - loop.core_start, f.msg, n);
     if (h.trace) |tr| if (tr.msg) |put| {
         try s.synchronize();
-        try put(tr.ctx, i, f.msg);
+        try put(tr.ctx, i, span, f.msg);
     };
-    if (h.teacher) |te| if (te.msg) |get| if (get(te.ctx, i)) |vec| {
-        if (vec.len != loop_kernels.n_streams * rows * hidden) return error.Inkling2TeacherShape;
+    if (h.teacher) |te| if (te.msg) |get| if (get(te.ctx, i, span)) |vec| {
+        if (vec.len != loop_kernels.n_streams * n * hidden) return error.Inkling2TeacherShape;
         try upload(c, s, f.msg, std.mem.sliceAsBytes(vec));
         try s.synchronize(); // the host copy goes out of scope
     };
@@ -206,64 +227,77 @@ fn attnInputs(c: *engine.Ctx, s: cuda.Stream, i: u32, v: visits.Visit, op: bank.
     const ctl = try controllers(lw);
     for (0..attn_streams) |j| {
         const row: u32 = if (global) @intCast(j) else 0;
-        try control(c, s, ctl[j], dest + @as(u64, row) * f32_row, @intCast(j), norms[row], f.inp + j * bf16_row);
+        try control(c, s, ctl[j], dest + @as(u64, row) * f32Bytes(n), @intCast(j), norms[row], f.inp + j * bf16Bytes(n), n);
     }
 
     const tr = h.trace orelse return;
     if (tr.xs) |put| {
-        try loop_kernels.mixAdd(&c.loop, s, f.wide, f.inp, 0, attn_streams * rows * hidden);
+        try loop_kernels.mixAdd(&c.loop, s, f.wide, f.inp, 0, attn_streams * n * hidden);
         try s.synchronize();
-        try put(tr.ctx, i, f.wide);
+        try put(tr.ctx, i, span, f.wide);
     }
 }
 
 /// Visit `i`'s MoE input to the trace, then the teacher's in its place: the activation quantiser turns a sub-ulp input
 /// difference into a percent-level output difference, which the stack and the MLP conv state would carry on.
-fn moeInput(c: *engine.Ctx, s: cuda.Stream, i: u32, h: Hooks) !void {
+fn moeInput(c: *engine.Ctx, s: cuda.Stream, i: u32, span: Span, h: Hooks) !void {
     const f = c.flow.r;
+    const n: usize = span.rows;
     if (h.trace) |tr| if (tr.mlp) |put| {
-        try loop_kernels.mixAdd(&c.loop, s, f.wide, f.mlp_in, 0, rows * hidden);
+        try loop_kernels.mixAdd(&c.loop, s, f.wide, f.mlp_in, 0, n * hidden);
         try s.synchronize();
-        try put(tr.ctx, i, f.wide);
+        try put(tr.ctx, i, span, f.wide);
     };
     const te = h.teacher orelse return;
     const get = te.mlp orelse return;
-    const vec = get(te.ctx, i) orelse return;
-    if (vec.len != rows * hidden) return error.Inkling2TeacherShape;
-    var bits: [rows * hidden]u16 = undefined;
-    for (vec, &bits) |x, *b| b.* = bf16Bits(x);
-    try upload(c, s, f.mlp_in, std.mem.sliceAsBytes(&bits));
-    try s.synchronize(); // the host copy goes out of scope
+    const vec = get(te.ctx, i, span) orelse return;
+    if (vec.len != n * hidden) return error.Inkling2TeacherShape;
+    try uploadBf16(c, s, f.mlp_in, vec);
+}
+
+/// `vec` rounded to bf16 into the device at `addr`; waits, so the host copy may go out of scope.
+fn uploadBf16(c: *engine.Ctx, s: cuda.Stream, addr: u64, vec: []const f32) !void {
+    const chunk_elems = embed_piece_rows * hidden;
+    var bits: [chunk_elems]u16 = undefined;
+    var at: usize = 0;
+    while (at < vec.len) {
+        const m = @min(chunk_elems, vec.len - at);
+        for (vec[at..][0..m], bits[0..m]) |x, *b| b.* = bf16Bits(x);
+        try upload(c, s, addr + at * bf16_bytes, std.mem.sliceAsBytes(bits[0..m]));
+        try s.synchronize(); // the bit buffer is reused
+        at += m;
+    }
 }
 
 /// Steps A-D of ref `_visit`: attention, the attention conv, the MLP input mix (blended with the mlp message at
 /// pass > 0), the MoE, the MLP conv and the residual update.
-fn sublayers(c: *engine.Ctx, s: cuda.Stream, stream: u32, pos: u64, i: u32, v: visits.Visit, op: bank.Op, h: Hooks) !void {
+fn sublayers(c: *engine.Ctx, s: cuda.Stream, stream: u32, i: u32, v: visits.Visit, op: bank.Op, span: Span, h: Hooks) !void {
     const f = c.flow.r;
+    const n: usize = span.rows;
     const lw = try layerWeights(c, v.layer);
-    const x: [3]u64 = if (op.messages or config.isGlobal(v.layer)) .{ f.inp, f.inp + bf16_row, f.inp + 2 * bf16_row } else .{ f.inp, f.inp, f.inp };
-    try attn_visit.run(c, s, v, lw, x, rows, pos, stream, f.attn_pre);
-    try conv(c, s, .{ .x = f.attn_pre, .state = c.cache.convAt(v.conv, stream, .attn), .w = try present(lw.attn_sconv), .out = f.attn_out, .c = hidden, .rows = rows, .mode = 0, .x_bf16 = 1 });
+    const x: [3]u64 = if (op.messages or config.isGlobal(v.layer)) .{ f.inp, f.inp + bf16Bytes(n), f.inp + 2 * bf16Bytes(n) } else .{ f.inp, f.inp, f.inp };
+    try attn_visit.run(c, s, v, lw, x, n, span.p0, stream, f.attn_pre);
+    try conv(c, s, .{ .x = f.attn_pre, .state = c.cache.convAt(v.conv, stream, .attn), .w = try present(lw.attn_sconv), .out = f.attn_out, .c = hidden, .rows = @intCast(n), .mode = 0, .x_bf16 = 1 });
 
     const query = try present(c.w.attn_res.mlp[v.layer]);
     const norm = try present(lw.mlp_norm);
     const sources: []const u64 = if (op.first) f.stack[0 .. op.blocks + 1] else f.stack[0..op.blocks];
     const last = if (op.first) f.attn_out else f.resid;
-    if (!op.first) try loop_kernels.mixAdd(&c.loop, s, f.resid, f.stack[op.blocks], f.attn_out, rows * hidden);
+    if (!op.first) try loop_kernels.mixAdd(&c.loop, s, f.resid, f.stack[op.blocks], f.attn_out, n * hidden);
     if (op.messages) {
-        try loop_kernels.mixF32(&c.loop, s, mixArgs(c, sources, last, op.first, query, no_norms, mlp_queries, f.mlp_dest));
-        try control(c, s, (try controllers(lw))[mlp_stream], f.mlp_dest, mlp_stream, norm, f.mlp_in);
+        try loop_kernels.mixF32(&c.loop, s, mixArgs(c, sources, last, op.first, query, no_norms, mlp_queries, f.mlp_dest, n));
+        try control(c, s, (try controllers(lw))[mlp_stream], f.mlp_dest, mlp_stream, norm, f.mlp_in, n);
     } else {
-        try ops.mix(&c.ops, s, mixArgs(c, sources, last, op.first, query, .{ norm, 0, 0 }, mlp_queries, f.mlp_in));
+        try ops.mix(&c.ops, s, mixArgs(c, sources, last, op.first, query, .{ norm, 0, 0 }, mlp_queries, f.mlp_in, n));
     }
-    try moeInput(c, s, i, h);
-    try moe.forward(&c.env, s, lw, c.w.prec[v.layer], f.mlp_in, f.moe_out, rows, &c.moe_sc);
+    try moeInput(c, s, i, span, h);
+    try moe.forward(&c.env, s, lw, c.w.prec[v.layer], f.mlp_in, f.moe_out, n, &c.moe_sc);
 
-    var a: ops.ConvArgs = .{ .x = f.moe_out, .state = c.cache.convAt(v.conv, stream, .mlp), .w = try present(lw.mlp_sconv), .resid = f.resid, .c = hidden, .rows = rows, .mode = 1, .x_bf16 = 1, .y_f32 = 1 };
+    var a: ops.ConvArgs = .{ .x = f.moe_out, .state = c.cache.convAt(v.conv, stream, .mlp), .w = try present(lw.mlp_sconv), .resid = f.resid, .c = hidden, .rows = @intCast(n), .mode = 1, .x_bf16 = 1, .y_f32 = 1 };
     if (op.first) {
         a.base = f.attn_out;
         try conv(c, s, a);
-        try ops.tobf(&c.ops, s, f.resid, rows, hidden, hidden, f.stack[op.blocks + 1], hidden, 0, hidden);
+        try ops.tobf(&c.ops, s, f.resid, n, hidden, hidden, f.stack[op.blocks + 1], hidden, 0, hidden);
     } else {
         a.mode = 2;
         a.out = f.stack[op.blocks];
@@ -273,7 +307,7 @@ fn sublayers(c: *engine.Ctx, s: cuda.Stream, stream: u32, pos: u64, i: u32, v: v
 
 /// Step E: the vector the next visit reads: `inp` (bf16, normed) before a pass 0 visit and for the head, `mix` (the
 /// fp32 `dest`) before a pass > 0 visit; before a restart the saved prelude destinations stand in `dest`.
-fn nextInput(c: *engine.Ctx, s: cuda.Stream, i: u32, v: visits.Visit, op: bank.Op) !void {
+fn nextInput(c: *engine.Ctx, s: cuda.Stream, i: u32, v: visits.Visit, op: bank.Op, n: usize) !void {
     const f = c.flow.r;
     const blocks = op.blocks + @intFromBool(op.first);
     const sources = f.stack[0..blocks];
@@ -284,49 +318,48 @@ fn nextInput(c: *engine.Ctx, s: cuda.Stream, i: u32, v: visits.Visit, op: bank.O
             const nq = carriedRows(&c.sched, i);
             const query = try present(c.w.attn_res.attn[v.layer]);
             const norms = try inputNorms(nlw, nv.layer);
-            try ops.mix(&c.ops, s, mixArgs(c, sources, f.stack[blocks], true, query, norms, nq, f.inp));
+            try ops.mix(&c.ops, s, mixArgs(c, sources, f.stack[blocks], true, query, norms, nq, f.inp, n));
             if (op.save_dests) {
                 if (nq != 1) return error.Inkling2DestRows;
-                try loop_kernels.mixF32(&c.loop, s, mixArgs(c, sources, f.stack[blocks], true, query, no_norms, nq, f.dest));
+                try loop_kernels.mixF32(&c.loop, s, mixArgs(c, sources, f.stack[blocks], true, query, no_norms, nq, f.dest, n));
             }
         },
         .mix_fp32 => {
             const query = try present(c.w.attn_res.attn[v.layer]);
-            try loop_kernels.mixF32(&c.loop, s, mixArgs(c, sources, f.stack[blocks], true, query, no_norms, carriedRows(&c.sched, i), f.mix));
+            try loop_kernels.mixF32(&c.loop, s, mixArgs(c, sources, f.stack[blocks], true, query, no_norms, carriedRows(&c.sched, i), f.mix, n));
         },
         .head => {
             const query = try present(c.w.attn_res.output);
-            try ops.mix(&c.ops, s, mixArgs(c, sources, f.stack[blocks], true, query, .{ try present(c.w.norm), 0, 0 }, head_queries, f.inp));
+            try ops.mix(&c.ops, s, mixArgs(c, sources, f.stack[blocks], true, query, .{ try present(c.w.norm), 0, 0 }, head_queries, f.inp, n));
         },
         .prelude_dests => {},
     }
 }
 
 /// What the trace sees after a visit: the carried vector as float32 and its row count.
-fn traced(c: *engine.Ctx, s: cuda.Stream, i: u32, op: bank.Op) !struct { ptr: u64, qn: u32 } {
+fn traced(c: *engine.Ctx, s: cuda.Stream, i: u32, op: bank.Op, n: usize) !struct { ptr: u64, qn: u32 } {
     const f = c.flow.r;
     const qn = carriedRows(&c.sched, i);
     switch (op.next) {
         .prelude_dests => return .{ .ptr = f.dest, .qn = 1 },
         .mix_fp32 => return .{ .ptr = f.mix, .qn = qn },
         .mix_norm, .head => {
-            try loop_kernels.mixAdd(&c.loop, s, f.wide, f.inp, 0, qn * rows * hidden);
+            try loop_kernels.mixAdd(&c.loop, s, f.wide, f.inp, 0, qn * n * hidden);
             return .{ .ptr = f.wide, .qn = qn };
         },
     }
 }
 
-/// Replaces the carried input before visit `i + 1` with the teacher's vector (`qn` rows of float32).
-fn teach(c: *engine.Ctx, s: cuda.Stream, op: bank.Op, qn: u32, vec: []const f32) !void {
+/// Replaces the carried input before visit `i + 1` with the teacher's vector (`qn` rows of float32 per token).
+fn teach(c: *engine.Ctx, s: cuda.Stream, op: bank.Op, qn: u32, n: usize, vec: []const f32) !void {
     const f = c.flow.r;
-    if (vec.len != qn * rows * hidden) return error.Inkling2TeacherShape;
+    if (vec.len != qn * n * hidden) return error.Inkling2TeacherShape;
     switch (op.next) {
         .prelude_dests => try upload(c, s, f.dest, std.mem.sliceAsBytes(vec)),
         .mix_fp32 => try upload(c, s, f.mix, std.mem.sliceAsBytes(vec)),
         .mix_norm, .head => {
-            var bits: [global_inputs * hidden]u16 = undefined;
-            for (vec, bits[0..vec.len]) |x, *b| b.* = bf16Bits(x);
-            try upload(c, s, f.inp, std.mem.sliceAsBytes(bits[0..vec.len]));
+            try uploadBf16(c, s, f.inp, vec);
+            return;
         },
     }
     try s.synchronize(); // the host copy goes out of scope
@@ -338,39 +371,49 @@ fn teachesAfter(i: u32, last_visit: u32, op: bank.Op) bool {
     return i < last_visit or op.next == .head;
 }
 
-/// Visits `0..last_visit` of the schedule for one token at position `pos` of `stream`. The carried vector after each
+/// Visits `0..last_visit` of the schedule for `ids` at positions `p0`.. of `stream`. The carried vector after each
 /// visit, each visit's MoE input and a pass > 0 visit's messages and controller outputs go to `h.trace`; `h.teacher`
-/// replaces the carried vector, the messages and the MoE input, so errors cannot accumulate.
-pub fn step(c: *engine.Ctx, s: cuda.Stream, stream: u32, token: u32, pos: u64, last_visit: u32, h: Hooks) !void {
+/// replaces the carried vector, the messages and the MoE input, so errors cannot accumulate. Row `r` of a chunk sees
+/// the keys before it and its own, as a token-by-token run of the same ids does.
+pub fn forward(c: *engine.Ctx, s: cuda.Stream, stream: u32, ids: []const u32, p0: u64, last_visit: u32, h: Hooks) !void {
     if (c.w.cfg.loop == null) return error.NotLoop;
     if (last_visit >= c.sched.n) return error.Inkling2VisitRange;
     if (c.text.hidden != hidden) return error.Inkling2Hidden;
+    if (ids.len == 0) return;
+    if (ids.len > c.scratch.geometry.max_rows) return error.RowsExceedScratch;
+    const n = ids.len;
+    const span: Span = .{ .p0 = p0, .rows = @intCast(n) };
     const plan = bank.plan(&c.sched, &c.w.cfg);
     const f = c.flow.r;
 
-    try embedToken(c, s, token, f.stack[0]);
+    try embedTokens(c, s, ids, f.stack[0]);
     const first_norms = try inputNorms(try layerWeights(c, c.sched.visits[0].layer), c.sched.visits[0].layer);
     const nq: u32 = if (config.isGlobal(c.sched.visits[0].layer)) global_inputs else 1;
-    try ops.mix(&c.ops, s, mixArgs(c, &.{}, f.stack[0], true, 0, first_norms, nq, f.inp));
+    try ops.mix(&c.ops, s, mixArgs(c, &.{}, f.stack[0], true, 0, first_norms, nq, f.inp, n));
 
     for (0..last_visit + 1) |idx| {
         const i: u32 = @intCast(idx);
         const v = c.sched.visits[i];
         const op = plan[i];
-        if (op.bank_from) |from| try saveBank(c, s, from);
-        try attnInputs(c, s, i, v, op, h);
-        try sublayers(c, s, stream, pos, i, v, op, h);
-        try nextInput(c, s, i, v, op);
+        if (op.bank_from) |from| try saveBank(c, s, from, n);
+        try attnInputs(c, s, i, v, op, span, h);
+        try sublayers(c, s, stream, i, v, op, span, h);
+        try nextInput(c, s, i, v, op, n);
         if (i == last_visit and h.trace == null) break;
         if (h.trace == null and h.teacher == null) continue;
-        const t = try traced(c, s, i, op);
+        const t = try traced(c, s, i, op, n);
         if (h.trace) |tr| {
             try s.synchronize();
-            try tr.visit(tr.ctx, i, t.ptr, t.qn);
+            try tr.visit(tr.ctx, i, span, t.ptr, t.qn);
         }
-        if (teachesAfter(i, last_visit, op)) if (h.teacher) |te| if (te.input(te.ctx, i)) |vec| try teach(c, s, op, t.qn, vec);
+        if (teachesAfter(i, last_visit, op)) if (h.teacher) |te| if (te.input(te.ctx, i, span)) |vec| try teach(c, s, op, t.qn, n, vec);
     }
     try s.synchronize();
+}
+
+/// One token at position `pos` of `stream` through visits 0..`last_visit`.
+pub fn step(c: *engine.Ctx, s: cuda.Stream, stream: u32, token: u32, pos: u64, last_visit: u32, h: Hooks) !void {
+    try forward(c, s, stream, &.{token}, pos, last_visit, h);
 }
 
 const ts = std.testing;
