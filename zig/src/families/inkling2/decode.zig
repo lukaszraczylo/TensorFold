@@ -20,16 +20,20 @@ const f32_bytes = 4;
 const global_inputs = engine.max_inputs;
 const mlp_queries = 1;
 
-/// Called after visit `v` with the carried float32 [qn, hidden] vector the next visit reads (SPEC 5 step E).
+/// Called after visit `v` with the carried float32 [qn, hidden] vector the next visit reads (SPEC 5 step E), and by
+/// `mlp` with the visit's own float32 [hidden] MoE input before a teacher replaces it.
 pub const Trace = struct {
     ctx: *anyopaque,
     visit: *const fn (ctx: *anyopaque, v: u32, inp: u64, qn: u32) anyerror!void,
+    mlp: ?*const fn (ctx: *anyopaque, v: u32, mlp_in: u64) anyerror!void = null,
 };
 
-/// Gives the carried input of visit `v` as the reference computed it; the engine reads it in place of its own.
+/// Gives the carried input of visit `v`, and by `mlp` its MoE input, as the reference computed them; the engine reads
+/// them in place of its own.
 pub const Teacher = struct {
     ctx: *anyopaque,
     input: *const fn (ctx: *anyopaque, v: u32) ?[]const f32,
+    mlp: ?*const fn (ctx: *anyopaque, v: u32) ?[]const f32 = null,
 };
 
 pub const Hooks = struct { trace: ?Trace = null, teacher: ?Teacher = null };
@@ -119,8 +123,27 @@ fn conv(c: *engine.Ctx, s: cuda.Stream, a: ops.ConvArgs) !void {
     try ops.conv(&c.ops, s, a, 1);
 }
 
+/// Visit `i`'s MoE input to the trace, then the teacher's in its place: the activation quantiser turns a sub-ulp input
+/// difference into a percent-level output difference, which the stack and the MLP conv state would carry on.
+fn moeInput(c: *engine.Ctx, s: cuda.Stream, i: u32, h: Hooks) !void {
+    const f = c.flow.r;
+    if (h.trace) |tr| if (tr.mlp) |put| {
+        try loop_kernels.mixAdd(&c.loop, s, f.wide, f.mlp_in, 0, rows * hidden);
+        try s.synchronize();
+        try put(tr.ctx, i, f.wide);
+    };
+    const te = h.teacher orelse return;
+    const get = te.mlp orelse return;
+    const vec = get(te.ctx, i) orelse return;
+    if (vec.len != rows * hidden) return error.Inkling2TeacherShape;
+    var bits: [rows * hidden]u16 = undefined;
+    for (vec, &bits) |x, *b| b.* = bf16Bits(x);
+    try upload(c, s, f.mlp_in, std.mem.sliceAsBytes(&bits));
+    try s.synchronize(); // the host copy goes out of scope
+}
+
 /// Steps A-D of ref `_visit`: attention, the attention conv, the MLP input mix, the MoE, the MLP conv and the residual update.
-fn sublayers(c: *engine.Ctx, s: cuda.Stream, stream: u32, pos: u64, v: visits.Visit, op: bank.Op) !void {
+fn sublayers(c: *engine.Ctx, s: cuda.Stream, stream: u32, pos: u64, i: u32, v: visits.Visit, op: bank.Op, h: Hooks) !void {
     const f = c.flow.r;
     const lw = try layerWeights(c, v.layer);
     const row_bytes = rows * hidden * bf16_bytes;
@@ -136,6 +159,7 @@ fn sublayers(c: *engine.Ctx, s: cuda.Stream, stream: u32, pos: u64, v: visits.Vi
         try loop_kernels.mixAdd(&c.loop, s, f.resid, f.stack[op.blocks], f.attn_out, rows * hidden);
         try ops.mix(&c.ops, s, mixArgs(c, f.stack[0..op.blocks], f.resid, false, query, norm, mlp_queries, f.mlp_in));
     }
+    try moeInput(c, s, i, h);
     try moe.forward(&c.env, s, lw, c.w.prec[v.layer], f.mlp_in, f.moe_out, rows, &c.moe_sc);
 
     var a: ops.ConvArgs = .{ .x = f.moe_out, .state = c.cache.convAt(v.conv, stream, .mlp), .w = try present(lw.mlp_sconv), .resid = f.resid, .c = hidden, .rows = rows, .mode = 1, .x_bf16 = 1, .y_f32 = 1 };
@@ -196,7 +220,7 @@ fn teach(c: *engine.Ctx, s: cuda.Stream, op: bank.Op, qn: u32, vec: []const f32)
 }
 
 /// Visits `0..last_visit` of the schedule for one token at position `pos` of `stream`. The carried vector after each
-/// visit goes to `h.trace`; `h.teacher` replaces it before the next visit, so errors cannot accumulate.
+/// visit and each visit's MoE input go to `h.trace`; `h.teacher` replaces both, so errors cannot accumulate.
 pub fn step(c: *engine.Ctx, s: cuda.Stream, stream: u32, token: u32, pos: u64, last_visit: u32, h: Hooks) !void {
     const loop = c.w.cfg.loop orelse return error.NotLoop;
     if (last_visit > lastVisit(loop) or last_visit >= c.sched.n) return error.Inkling2LoopVisit;
@@ -213,7 +237,7 @@ pub fn step(c: *engine.Ctx, s: cuda.Stream, stream: u32, token: u32, pos: u64, l
         const i: u32 = @intCast(idx);
         const v = c.sched.visits[i];
         const op = plan[i];
-        try sublayers(c, s, stream, pos, v, op);
+        try sublayers(c, s, stream, pos, i, v, op, h);
         try nextInput(c, s, i, v, op);
         if (i == last_visit and h.trace == null) break;
         if (h.trace == null and h.teacher == null) continue;

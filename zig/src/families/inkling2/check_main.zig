@@ -12,7 +12,7 @@ const usage =
     \\loop --model DIR --layer L --rows N --in DIR: reads bank.bf16 ([2, N, 2304]), dest.f32 ([N, 2304]) and norm.bf16 ([2304]), runs core layer L's four cross-pass messages and controllers, writes msgs.f32 ([4, N, 2304]) and ctl_<attn|k|v|mlp>.bf16 ([N, 2304])
     \\ablit --file F --layer L --mult M --in DIR: reads DIR/y.bf16 ([N, 2304]), applies the edit file F at layer L with scale multiplier M, writes y.bf16
     \\attn --model DIR --layer L --pass P --n N --rows R [--pos0 P0] --in DIR: reads DIR/xs.bf16 ([N, 3, 2304]: xq, xk, xv a step), runs the visit (L, P)'s attention on them R rows a call from position P0 with the visit's caches carried (P0 > 0: k0.bf16 and v0.bf16 [keep, 8, 128] fill the rows before it), writes out.bf16 ([N, 2304], the wo_ud projection)
-    \\decode --model DIR --steps FILE.json --visits A-B [--teacher GOLDEN_DIR] [--layers staged] --out DIR: runs the single-token steps of FILE.json ({"steps": [[id], ...]}) from position 0 through visits 0..B (B at most 17), the carried input after each visit replaced by GOLDEN_DIR's (ref.capture layout) when given, and writes step<s>/visit<VV>.f32 for visits A..B and a manifest.json in the reference's layout
+    \\decode --model DIR --steps FILE.json --visits A-B [--teacher GOLDEN_DIR] [--layers staged] --out DIR: runs the single-token steps of FILE.json ({"steps": [[id], ...]}) from position 0 through visits 0..B (B at most 17), the carried input after each visit and each visit's MoE input replaced by GOLDEN_DIR's (ref.capture layout: visit<VV>.f32, mlp<VV>.f32) when given, and writes step<s>/visit<VV>.f32 and step<s>/mlp<VV>.f32 (the MoE input before the replacement) for visits A..B and a manifest.json in the reference's layout
     \\weights --model DIR [--layers A-B] [--readback NAME,...]: uploads the text weights (TF_INK2_EMBED_HOST=1 keeps the
     \\    embedding on the host), writes DIR/weights.json with peak_rss_mib and device_bytes, and one row per readback
     \\    tensor (names below model.llm., e.g. layers.0.attn.wo_ud.weight)
@@ -582,16 +582,23 @@ const GoldenTeacher = struct {
 
     fn input(ctx: *anyopaque, v: u32) ?[]const f32 {
         const t: *GoldenTeacher = @ptrCast(@alignCast(ctx));
-        return t.read(v) catch |e| {
+        return t.read("visit", v, ink2.decode.carriedRows(t.sched, v) * loop_hidden) catch |e| {
             t.err = e;
             return null;
         };
     }
 
-    fn read(t: *GoldenTeacher, v: u32) ![]const f32 {
-        const n = ink2.decode.carriedRows(t.sched, v) * loop_hidden;
+    fn mlp(ctx: *anyopaque, v: u32) ?[]const f32 {
+        const t: *GoldenTeacher = @ptrCast(@alignCast(ctx));
+        return t.read("mlp", v, loop_hidden) catch |e| {
+            t.err = e;
+            return null;
+        };
+    }
+
+    fn read(t: *GoldenTeacher, kind: []const u8, v: u32, n: usize) ![]const f32 {
         var name: [64]u8 = undefined;
-        const path = try std.fmt.bufPrint(&name, "step{d}/visit{d:0>2}.f32", .{ t.step, v });
+        const path = try std.fmt.bufPrint(&name, "step{d}/{s}{d:0>2}.f32", .{ t.step, kind, v });
         const bytes = try t.dir.readFileAlloc(t.io, path, t.gpa, .limited(n * @sizeOf(f32) + 1));
         defer t.gpa.free(bytes);
         if (bytes.len != n * @sizeOf(f32)) return error.ShapeMismatch;
@@ -615,6 +622,15 @@ const DecodeTrace = struct {
         try cuda.memory.download(t.d, inp, t.buf[0..bytes]);
         var name: [64]u8 = undefined;
         try t.rows.put(try std.fmt.bufPrint(&name, "step{d}/visit{d:0>2}", .{ t.step, v }), .f32, &.{ qn, loop_hidden }, t.buf[0..bytes]);
+    }
+
+    fn mlp(ctx: *anyopaque, v: u32, mlp_in: u64) anyerror!void {
+        const t: *DecodeTrace = @ptrCast(@alignCast(ctx));
+        if (v < t.first) return;
+        const bytes = loop_hidden * @sizeOf(f32);
+        try cuda.memory.download(t.d, mlp_in, t.buf[0..bytes]);
+        var name: [64]u8 = undefined;
+        try t.rows.put(try std.fmt.bufPrint(&name, "step{d}/mlp{d:0>2}", .{ t.step, v }), .f32, &.{ 1, loop_hidden }, t.buf[0..bytes]);
     }
 };
 
@@ -676,8 +692,8 @@ fn decodeRun(init: std.process.Init, a: Args, out: []const u8) !void {
     }
 
     const hooks: ink2.decode.Hooks = .{
-        .trace = .{ .ctx = &tracer, .visit = DecodeTrace.visit },
-        .teacher = if (a.teacher != null) .{ .ctx = &teacher, .input = GoldenTeacher.input } else null,
+        .trace = .{ .ctx = &tracer, .visit = DecodeTrace.visit, .mlp = DecodeTrace.mlp },
+        .teacher = if (a.teacher != null) .{ .ctx = &teacher, .input = GoldenTeacher.input, .mlp = GoldenTeacher.mlp } else null,
     };
     const metas = try gpa.alloc(ink2.check_rows.StepMeta, steps.len);
     defer gpa.free(metas);
