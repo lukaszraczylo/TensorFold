@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Inkling 2: the `inkling2_loop` kernel image has the loop's cross-pass message kernel (a two-source softmax mix of the previous pass's blocks for the attn, k, v and mlp streams, with the query scale applied once in the kernel) and the controller kernels (RMS-normalised pair, rank-64 down projection, gain and forget gates, tanh blend without fused multiply-add, and the sublayer RMS norm), and `tf-ink2-check loop` writes the messages and the four normed controller outputs of one core layer for a reference to compare (refs #3476). Thanks to @ajensenwaud.
+
 - Inkling 2: the `inkling2_loop` kernel image has the expert decode path for Inkling 2 Mini, one templated stage per step on a weight-format functor instantiated for NVFP4 and MXFP8 (GEMV on the packed weights with a fixed per-lane accumulation order, the softcapped SwiGLU, the slot-order combine), and `moe.forward` runs the router, activation quantisers and these stages; `tf-ink2-check moe` writes the output, picks and routing weights of one layer for a reference to compare (refs #3476). Thanks to @ajensenwaud.
 
 - Inkling 2: the `inkling2_loop` kernel image has NVFP4 (four-over-six block scales) and MXFP8 activation quantisers that follow the reference's arithmetic operation by operation, with correctly rounded division and no fused multiply-adds, and `tf-ink2-check actq` writes their dequantised rows plus the e2m1 values, e4m3 block scales, row amax and UE8M0 exponents a GEMM consumes, for a bit-for-bit comparison (refs #3476). Thanks to @ajensenwaud.

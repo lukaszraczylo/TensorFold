@@ -323,3 +323,150 @@ extern "C" __global__ void tf_ink2l_ex_sum(const float* dn, __nv_bfloat16* out, 
     for (int slot = 0; slot < kSlots; ++slot) sum = __fadd_rn(sum, dn[(row * kSlots + slot) * n_dim + c]);
     out[i] = __float2bfloat16_rn(sum);
 }
+
+// ---- Loop kernels: cross-pass messages (ref.loop.messages) and controllers (ref.loop.controller + the sublayer norm) ----
+// Every dot and every sum of squares is one warp's lane-strided fmaf (or square-then-add) chain and the xor-shuffle tree.
+constexpr int kLoopMaxC = 2304;
+constexpr int kLoopMaxRank = 64;
+constexpr int kStreams = 4;
+constexpr int kMsgSources = 2;
+constexpr int kMsgReductions = kMsgSources + kStreams * kMsgSources;
+constexpr float kLoopEps = 1e-6f;
+
+__device__ __forceinline__ float warpTree(float acc) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
+    return acc;
+}
+
+// Sum of x[k] * x[k] over k, each square rounded before the add as torch's square then mean does; valid in every lane.
+template <class Load>
+__device__ __forceinline__ float warpSumSq(Load x, int n) {
+    float acc = 0.0f;
+    for (int k = threadIdx.x & 31; k < n; k += 32) {
+        const float v = x(k);
+        acc = __fadd_rn(acc, __fmul_rn(v, v));
+    }
+    return warpTree(acc);
+}
+
+template <class A, class B>
+__device__ __forceinline__ float warpDot(A a, B b, int n) {
+    float acc = 0.0f;
+    for (int k = threadIdx.x & 31; k < n; k += 32) acc = __fmaf_rn(a(k), b(k), acc);
+    return warpTree(acc);
+}
+
+// torch's mean: the sum times the float 1/n; the caller adds eps and takes rsqrt.
+__device__ __forceinline__ float invRms(float sum_sq, int n) {
+    return rsqrtf(__fadd_rn(__fmul_rn(sum_sq, __fdiv_rn(1.0f, (float)n)), kLoopEps));
+}
+
+// One block a row, rows = grid. b0, b1 bf16 [rows, c] (the previous pass's blocks); qa, qkv float [24, c] raw (the two
+// cross-pass query tensors, rows 2m and 2m + 1 for core layer m); out float [4, rows, c], streams attn, k, v, mlp.
+// Stream s uses qa[2m], qkv[2m], qkv[2m + 1], qa[2m + 1]; `scale` multiplies each query element once.
+extern "C" __global__ void tf_ink2l_msg(const __nv_bfloat16* b0, const __nv_bfloat16* b1, const float* qa, const float* qkv, int m,
+                                        float scale, float* out, int rows, int c) {
+    __shared__ float red[kMsgReductions];
+    const int row = blockIdx.x;
+    if (row >= rows || c > kLoopMaxC) return;
+    const __nv_bfloat16* src[kMsgSources] = {b0 + (size_t)row * c, b1 + (size_t)row * c};
+    const float* qrow[kStreams] = {qa + (size_t)(2 * m) * c, qkv + (size_t)(2 * m) * c, qkv + (size_t)(2 * m + 1) * c,
+                                   qa + (size_t)(2 * m + 1) * c};
+    for (int j = threadIdx.x >> 5; j < kMsgReductions; j += kWarps) {
+        float v;
+        if (j < kMsgSources) {
+            const __nv_bfloat16* x = src[j];
+            v = warpSumSq([&](int k) { return __bfloat162float(x[k]); }, c);
+        } else {
+            const int s = (j - kMsgSources) / kMsgSources;
+            const __nv_bfloat16* x = src[(j - kMsgSources) % kMsgSources];
+            const float* q = qrow[s];
+            v = warpDot([&](int k) { return __bfloat162float(x[k]); }, [&](int k) { return __fmul_rn(q[k], scale); }, c);
+        }
+        if ((threadIdx.x & 31) == 0) red[j] = v;
+    }
+    __syncthreads();
+    const float inv0 = invRms(red[0], c);
+    const float inv1 = invRms(red[1], c);
+    float p0[kStreams], p1[kStreams];
+    #pragma unroll
+    for (int s = 0; s < kStreams; ++s) {
+        const float l0 = __fmul_rn(red[kMsgSources + s * kMsgSources], inv0);
+        const float l1 = __fmul_rn(red[kMsgSources + s * kMsgSources + 1], inv1);
+        const float mx = fmaxf(l0, l1);
+        const float e0 = expf(__fsub_rn(l0, mx));
+        const float e1 = expf(__fsub_rn(l1, mx));
+        const float total = __fadd_rn(e0, e1);
+        p0[s] = __fdiv_rn(e0, total);
+        p1[s] = __fdiv_rn(e1, total);
+    }
+    for (int d = threadIdx.x; d < c; d += kThreads) {
+        const float v0 = __fmul_rn(__bfloat162float(src[0][d]), inv0);
+        const float v1 = __fmul_rn(__bfloat162float(src[1][d]), inv1);
+        #pragma unroll
+        for (int s = 0; s < kStreams; ++s) out[((size_t)s * rows + row) * c + d] = __fmaf_rn(p1[s], v1, __fmul_rn(p0[s], v0));
+    }
+}
+
+// One block a row. dest, msg float [rows, c]; w_down bf16 [rank, 2c]; h bf16 [rows, rank].
+// pair = bf16([dest * rsqrt(mean(dest^2) + eps), msg * rsqrt(mean(msg^2) + eps)]); h = bf16(pair . w_down).
+extern "C" __global__ void tf_ink2l_ctl_down(const float* dest, const float* msg, const __nv_bfloat16* w_down, __nv_bfloat16* h,
+                                             int rows, int c, int rank) {
+    __shared__ float pair[2 * kLoopMaxC];
+    __shared__ float inv[2];
+    const int row = blockIdx.x;
+    if (row >= rows || c > kLoopMaxC) return;
+    const float* d = dest + (size_t)row * c;
+    const float* g = msg + (size_t)row * c;
+    const int warp = threadIdx.x >> 5;
+    if (warp < 2) {
+        const float* x = warp == 0 ? d : g;
+        const float s = warpSumSq([&](int k) { return x[k]; }, c);
+        if ((threadIdx.x & 31) == 0) inv[warp] = invRms(s, c);
+    }
+    __syncthreads();
+    for (int k = threadIdx.x; k < 2 * c; k += kThreads) {
+        pair[k] = k < c ? bf16Round(__fmul_rn(d[k], inv[0])) : bf16Round(__fmul_rn(g[k - c], inv[1]));
+    }
+    __syncthreads();
+    for (int r = warp; r < rank; r += kWarps) {
+        const __nv_bfloat16* wr = w_down + (size_t)r * 2 * c;
+        const float sum = warpDot([&](int k) { return pair[k]; }, [&](int k) { return __bfloat162float(wr[k]); }, 2 * c);
+        if ((threadIdx.x & 31) == 0) h[(size_t)row * rank + r] = __float2bfloat16_rn(sum);
+    }
+}
+
+// One block a row. h bf16 [rows, rank]; w_gain, w_forget bf16 [c, rank]; norm_w bf16 [c]; out bf16 [rows, c].
+// z = (1 - tanh(forget)) * dest + tanh(gain) * msg, then out = bf16(z * rsqrt(mean(z^2) + eps) * norm_w).
+extern "C" __global__ void tf_ink2l_ctl_blend(const float* dest, const float* msg, const __nv_bfloat16* h, const __nv_bfloat16* w_gain,
+                                              const __nv_bfloat16* w_forget, const __nv_bfloat16* norm_w, __nv_bfloat16* out,
+                                              int rows, int c, int rank) {
+    __shared__ float hr[kLoopMaxRank];
+    __shared__ float z[kLoopMaxC];
+    __shared__ float inv;
+    const int row = blockIdx.x;
+    if (row >= rows || c > kLoopMaxC || rank > kLoopMaxRank) return;
+    for (int r = threadIdx.x; r < rank; r += kThreads) hr[r] = __bfloat162float(h[(size_t)row * rank + r]);
+    __syncthreads();
+    const float* d = dest + (size_t)row * c;
+    const float* g = msg + (size_t)row * c;
+    for (int n = threadIdx.x >> 5; n < c; n += kWarps) {
+        const __nv_bfloat16* wg = w_gain + (size_t)n * rank;
+        const __nv_bfloat16* wf = w_forget + (size_t)n * rank;
+        const float gain = warpDot([&](int k) { return hr[k]; }, [&](int k) { return __bfloat162float(wg[k]); }, rank);
+        const float forget = warpDot([&](int k) { return hr[k]; }, [&](int k) { return __bfloat162float(wf[k]); }, rank);
+        if ((threadIdx.x & 31) == 0) {
+            z[n] = __fadd_rn(__fmul_rn(__fsub_rn(1.0f, tanhf(forget)), d[n]), __fmul_rn(tanhf(gain), g[n]));
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const float s = warpSumSq([&](int k) { return z[k]; }, c);
+        if (threadIdx.x == 0) inv = invRms(s, c);
+    }
+    __syncthreads();
+    for (int n = threadIdx.x; n < c; n += kThreads) {
+        out[(size_t)row * c + n] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(z[n], inv), __bfloat162float(norm_w[n])));
+    }
+}

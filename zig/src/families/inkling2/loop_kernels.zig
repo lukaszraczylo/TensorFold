@@ -1,6 +1,7 @@
 //! Inkling 2 Mini's loop kernels (inkling2/loop.cu): the image's module and its functions.
 const std = @import("std");
 const cuda = @import("cuda");
+const names = @import("names.zig");
 const plan = @import("plan.zig");
 
 /// Threads a row's quantiser block runs; loop.cu's kThreads.
@@ -12,6 +13,15 @@ pub const expert_tile = 8;
 /// Experts a row picks.
 pub const expert_slots = 8;
 const elementwise_threads = 256;
+/// Hidden width and controller rank of the loop kernels; loop.cu's kLoopMaxC and kLoopMaxRank bound them.
+pub const gate_rank = 64;
+pub const n_streams = 4;
+/// The streams in kernel order: attn, k, v, mlp.
+pub const stream_names = names.controller_streams;
+const loop_hidden = 2304;
+const msg_sources = 2;
+/// ref.model._message_queries: the queries are raw in memory and the kernel multiplies each by D^-0.5 once.
+const msg_scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, loop_hidden)));
 
 pub const Kernels = struct {
     mod: cuda.Module,
@@ -26,6 +36,9 @@ pub const Kernels = struct {
     ex_down_mxfp8: cuda.Function,
     situ: cuda.Function,
     ex_sum: cuda.Function,
+    msg: cuda.Function,
+    ctl_down: cuda.Function,
+    ctl_blend: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -44,6 +57,9 @@ pub const Kernels = struct {
             .ex_down_mxfp8 = try mod.function("tf_ink2l_ex_down_mxfp8"),
             .situ = try mod.function("tf_ink2l_situ"),
             .ex_sum = try mod.function("tf_ink2l_ex_sum"),
+            .msg = try mod.function("tf_ink2l_msg"),
+            .ctl_down = try mod.function("tf_ink2l_ctl_down"),
+            .ctl_blend = try mod.function("tf_ink2l_ctl_blend"),
         };
     }
 
@@ -136,6 +152,39 @@ pub fn expertSum(k: *const Kernels, s: cuda.Stream, dn: u64, out: u64, rows: usi
     try cuda.launch.launch(k.ex_sum, .{ .grid = .{ .x = @intCast(blocks) }, .block = .{ .x = elementwise_threads } }, s, &args);
 }
 
+/// Cross-pass messages of core layer `m`: bank = the previous pass's two blocks (bf16 [rows, 2304] each), qa and qkv =
+/// the raw cross-pass query tensors (float32 [24, 2304]), out float32 [4, rows, 2304] in stream order attn, k, v, mlp.
+pub fn messages(k: *const Kernels, s: cuda.Stream, bank: [msg_sources]u64, qa: u64, qkv: u64, m: u32, out: u64, rows: usize) !void {
+    if (rows == 0) return;
+    var args: cuda.Args = .{};
+    for (bank) |p| args.add(p);
+    args.add(qa);
+    args.add(qkv);
+    args.add(@as(i32, @intCast(m)));
+    args.add(msg_scale);
+    args.add(out);
+    args.add(@as(i32, @intCast(rows)));
+    args.add(@as(i32, loop_hidden));
+    try cuda.launch.launch(k.msg, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = actq_threads } }, s, &args);
+}
+
+/// One stream of one core layer: dest and msg float32 [rows, 2304], the controller's bf16 weights, the sublayer norm
+/// weight bf16 [2304]; h bf16 [rows, 64] is scratch and out bf16 [rows, 2304] the normed blend.
+pub const ControllerArgs = struct { dest: u64, msg: u64, down: u64, gain: u64, forget: u64, norm: u64, h: u64, out: u64, rows: usize };
+
+pub fn controller(k: *const Kernels, s: cuda.Stream, a: ControllerArgs) !void {
+    if (a.rows == 0) return;
+    const cfg: cuda.launch.Config = .{ .grid = .{ .x = @intCast(a.rows) }, .block = .{ .x = actq_threads } };
+    var down: cuda.Args = .{};
+    for ([_]u64{ a.dest, a.msg, a.down, a.h }) |p| down.add(p);
+    for ([_]usize{ a.rows, loop_hidden, gate_rank }) |v| down.add(@as(i32, @intCast(v)));
+    try cuda.launch.launch(k.ctl_down, cfg, s, &down);
+    var blend: cuda.Args = .{};
+    for ([_]u64{ a.dest, a.msg, a.h, a.gain, a.forget, a.norm, a.out }) |p| blend.add(p);
+    for ([_]usize{ a.rows, loop_hidden, gate_rank }) |v| blend.add(@as(i32, @intCast(v)));
+    try cuda.launch.launch(k.ctl_blend, cfg, s, &blend);
+}
+
 const Fake = struct {
     var grid_x: u32 = 0;
     var block_x: u32 = 0;
@@ -158,7 +207,7 @@ test "actq launches one block a row and refuses a width off the block" {
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     try actNvfp4(&k, s, 0x1000, 0x2000, 64, 2304);
     try std.testing.expectEqual(@as(u32, 64), Fake.grid_x);
@@ -190,7 +239,7 @@ test "expert stages pick the format's kernel and launch a block a pair by column
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     const g: ExpertGemm = .{ .w = 1, .scale = 2 };
     try expertGateUp(&k, s, .nvfp4, 0, 0, g, 0, 4, 2304, 2304);
