@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Inkling 2: a memory budget for Inkling 2 Mini sums the text weights (17.6 GiB, 16.7 GiB with host-gathered embeddings), each visit's KV and conv state and the chunk scratch, so a serving or dev-gate setting that exceeds its limit is refused before upload (refs #3476). Thanks to @ajensenwaud.
+
 - Inkling 2: a `tf-ink2-check` tool (build step `ink2-check`) writes the CUDA engine's rows as raw files with a manifest for a reference to compare, and an `inkling2_loop` kernel image for Inkling 2 Mini's looped engine, with a smoke subcommand that checks the image loads and launches (refs #3476). Thanks to @ajensenwaud.
 
 - Inkling 2: Inkling 2 Mini's 48 layer visits (prelude, three core passes, coda) get a schedule where each visit owns its KV cache and conv state, with 40 sliding and 8 global visits and the memory they need sized from the config (refs #3476). Thanks to @ajensenwaud.

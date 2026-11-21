@@ -7,6 +7,7 @@ pub const ops = @import("ops.zig");
 pub const experts = @import("experts.zig");
 pub const dspark_ops = @import("dspark_ops.zig");
 pub const visits = @import("visits.zig");
+pub const budget = @import("budget.zig");
 pub const loop_kernels = @import("loop_kernels.zig");
 pub const check_rows = @import("check_rows.zig");
 
@@ -21,6 +22,7 @@ test {
     _ = experts;
     _ = dspark_ops;
     _ = visits;
+    _ = budget;
     _ = loop_kernels;
     _ = check_rows;
 }

@@ -1,12 +1,27 @@
 //! Inkling 2's CUDA family in the build: its module, its check tools and its host regressions.
 const std = @import("std");
 
+/// The weight map's `safetensors` import, served from the core's copy: one file cannot sit in two modules.
+fn shim(b: *std.Build) std.Build.LazyPath {
+    const text =
+        \\const st = @import("core").safetensors;
+        \\pub const DType = st.DType;
+        \\pub const Entry = st.Entry;
+        \\pub const Header = st.Header;
+        \\pub const headerSize = st.headerSize;
+        \\pub const parseHeader = st.parseHeader;
+        \\
+    ;
+    return b.addWriteFiles().add("inkling2_safetensors.zig", text);
+}
+
 /// The Inkling 2 CUDA family over the runtime, the core and the lane core.
 pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
     const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/inkling2.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("cuda", cuda);
     m.addImport("core", core);
     m.addImport("lanes", lanes);
+    m.addImport("safetensors", b.createModule(.{ .root_source_file = shim(b), .target = target, .optimize = optimize, .imports = &.{.{ .name = "core", .module = core }} }));
     return m;
 }
 
