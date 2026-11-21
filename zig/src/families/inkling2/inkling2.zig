@@ -6,6 +6,7 @@ pub const kernels = @import("kernels.zig");
 pub const ops = @import("ops.zig");
 pub const experts = @import("experts.zig");
 pub const dspark_ops = @import("dspark_ops.zig");
+pub const visits = @import("visits.zig");
 
 /// config.json's name in the release.
 pub const model_type = "inkling2";
@@ -17,4 +18,5 @@ test {
     _ = ops;
     _ = experts;
     _ = dspark_ops;
+    _ = visits;
 }

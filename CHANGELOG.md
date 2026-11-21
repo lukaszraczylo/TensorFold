@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Inkling 2: Inkling 2 Mini's 48 layer visits (prelude, three core passes, coda) get a schedule where each visit owns its KV cache and conv state, with 40 sliding and 8 global visits and the memory they need sized from the config (refs #3476). Thanks to @ajensenwaud.
+
 - Inkling 2: the weight map names the loop checkpoint's per-layer controllers (down, gain and forget weights for the attn, k, v and mlp streams of the core layers) and its two cross-pass query tensors, and Inkling 2 Mini's real safetensors header (1244 tensors) matches it with no missing, wrong or extra tensor (refs #3476). Thanks to @ajensenwaud.
 
 - Inkling 2: the host config accepts the looped `inkling2_loop` checkpoint (Inkling 2 Mini) and reads its core range, pass count and gate rank; a variable-depth loop or a core range off the attention-residual blocks is refused by name (refs #3476). Thanks to @ajensenwaud.
