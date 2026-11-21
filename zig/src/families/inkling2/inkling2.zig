@@ -12,6 +12,7 @@ pub const loop_kernels = @import("loop_kernels.zig");
 pub const check_rows = @import("check_rows.zig");
 pub const weights = @import("weights.zig");
 pub const moe = @import("moe.zig");
+pub const bank = @import("bank.zig");
 pub const proc_status = @import("proc_status.zig");
 
 /// config.json's name in the release.
@@ -30,5 +31,6 @@ test {
     _ = check_rows;
     _ = weights;
     _ = moe;
+    _ = bank;
     _ = proc_status;
 }

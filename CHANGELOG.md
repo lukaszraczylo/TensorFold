@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Inkling 2: a host plan gives, for each of the 48 visits of Inkling 2 Mini, the finished-block count of the five-slot residual stack, whether the layer closes a block, the two blocks the prelude restart saves to the message bank, whether the visit reads messages, and what feeds the next visit (normalised mix, fp32 mix, the saved prelude destinations, or the head); a test runs the plan on physical slots against the reference's list semantics (refs #3476). Thanks to @ajensenwaud.
+
 - Inkling 2: the `inkling2_loop` kernel image has the loop's cross-pass message kernel (a two-source softmax mix of the previous pass's blocks for the attn, k, v and mlp streams, with the query scale applied once in the kernel) and the controller kernels (RMS-normalised pair, rank-64 down projection, gain and forget gates, tanh blend without fused multiply-add, and the sublayer RMS norm), and `tf-ink2-check loop` writes the messages and the four normed controller outputs of one core layer for a reference to compare (refs #3476). Thanks to @ajensenwaud.
 
 - Inkling 2: the `inkling2_loop` kernel image has the expert decode path for Inkling 2 Mini, one templated stage per step on a weight-format functor instantiated for NVFP4 and MXFP8 (GEMV on the packed weights with a fixed per-lane accumulation order, the softcapped SwiGLU, the slot-order combine), and `moe.forward` runs the router, activation quantisers and these stages; `tf-ink2-check moe` writes the output, picks and routing weights of one layer for a reference to compare (refs #3476). Thanks to @ajensenwaud.
