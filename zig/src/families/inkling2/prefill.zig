@@ -38,6 +38,7 @@ pub fn chunk(c: *engine.Ctx, s: cuda.Stream, stream: u32, ids: []const u32, p0: 
 /// A prompt from position 0 in chunks of `chunk_rows`; the final chunk gives `logits` (see `chunk`).
 pub fn run(c: *engine.Ctx, s: cuda.Stream, stream: u32, ids: []const u32, chunk_rows: u32, logits: ?u64, h: decode.Hooks) !void {
     if (chunk_rows == 0 or chunk_rows > c.scratch.geometry.max_rows) return error.RowsExceedScratch;
+    if (ids.len == 0) return error.Inkling2EmptyChunk;
     var it: Chunks = .{ .len = ids.len, .chunk_rows = chunk_rows };
     while (it.next()) |part| {
         const final = part.start + part.rows == ids.len;
@@ -86,5 +87,6 @@ test "run refuses a chunk size the scratch cannot hold before it touches the dev
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     try ts.expectError(error.RowsExceedScratch, run(&c, s, 0, &.{1}, 65, null, .{}));
     try ts.expectError(error.RowsExceedScratch, run(&c, s, 0, &.{1}, 0, null, .{}));
+    try ts.expectError(error.Inkling2EmptyChunk, run(&c, s, 0, &.{}, 64, null, .{}));
     try ts.expectError(error.Inkling2EmptyChunk, chunk(&c, s, 0, &.{}, 0, null, .{}));
 }
