@@ -158,6 +158,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const q35_install = b.addInstallArtifact(b.addExecutable(.{ .name = "tf-qwen35-cuda", .root_module = q35 }), .{});
     b.getInstallStep().dependOn(&q35_install.step);
     b.step("qwen35-cuda", "Build the Qwen CUDA forward and raw state receipt tool").dependOn(&q35_install.step);
+    @import("inkling2.zig").checkTool(b, target, optimize, strip, cuda, mods.core, mods.lanes);
     @import("moss_image_tools.zig").install(b, target, optimize, strip, cuda, mods.core);
     const d3_tool = b.createModule(.{ .root_source_file = b.path("zig/src/families/drama3/generate.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "drama3", .module = @import("drama3_host.zig").module(b, target, optimize, cuda, mods.core) } } });
     const d3_exe = b.addExecutable(.{ .name = "drama3-generate", .root_module = d3_tool });

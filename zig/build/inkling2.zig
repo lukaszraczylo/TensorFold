@@ -22,3 +22,13 @@ pub fn hostTests(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build
     b.step("test-inkling2-cuda-host", "Inkling 2's CUDA family host regressions (no GPU work)").dependOn(&run.step);
     all.dependOn(&run.step);
 }
+
+/// `tf-ink2-check`: Inkling 2 Mini's CUDA rows for the reference gates.
+pub fn checkTool(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: bool, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module) void {
+    const root = b.createModule(.{ .root_source_file = b.path("zig/src/families/inkling2/check_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
+    root.addImport("cuda", cuda);
+    root.addImport("inkling2", module(b, target, optimize, cuda, core, lanes));
+    const install = b.addInstallArtifact(b.addExecutable(.{ .name = "tf-ink2-check", .root_module = root }), .{});
+    b.getInstallStep().dependOn(&install.step);
+    b.step("ink2-check", "Build the Inkling 2 Mini CUDA check tool").dependOn(&install.step);
+}

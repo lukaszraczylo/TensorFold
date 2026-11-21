@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Inkling 2: a `tf-ink2-check` tool (build step `ink2-check`) writes the CUDA engine's rows as raw files with a manifest for a reference to compare, and an `inkling2_loop` kernel image for Inkling 2 Mini's looped engine, with a smoke subcommand that checks the image loads and launches (refs #3476). Thanks to @ajensenwaud.
+
 - Inkling 2: Inkling 2 Mini's 48 layer visits (prelude, three core passes, coda) get a schedule where each visit owns its KV cache and conv state, with 40 sliding and 8 global visits and the memory they need sized from the config (refs #3476). Thanks to @ajensenwaud.
 
 - Inkling 2: the weight map names the loop checkpoint's per-layer controllers (down, gain and forget weights for the attn, k, v and mlp streams of the core layers) and its two cross-pass query tensors, and Inkling 2 Mini's real safetensors header (1244 tensors) matches it with no missing, wrong or extra tensor (refs #3476). Thanks to @ajensenwaud.
