@@ -35,6 +35,16 @@ pub fn chunk(c: *engine.Ctx, s: cuda.Stream, stream: u32, ids: []const u32, p0: 
     try s.synchronize();
 }
 
+/// One chunk as `chunk` runs it, with the head's log-probs of the rows `want` selects into `out` (fp32 [want.count,
+/// unpadded_vocab]) in place of the last row's logits.
+pub fn chunkLogprobs(c: *engine.Ctx, s: cuda.Stream, stream: u32, ids: []const u32, p0: u64, want: head.RowRange, out: u64, h: decode.Hooks) !void {
+    if (ids.len == 0) return error.Inkling2EmptyChunk;
+    if (want.first + want.count > ids.len) return error.Inkling2RowsPastChunk;
+    try decode.forward(c, s, stream, ids, p0, c.sched.n - 1, h);
+    try head.logprobsRows(c, s, c.flow.r.inp, want.first + want.count, want.first, out);
+    try s.synchronize();
+}
+
 /// A prompt from position 0 in chunks of `chunk_rows`; the final chunk gives `logits` (see `chunk`).
 pub fn run(c: *engine.Ctx, s: cuda.Stream, stream: u32, ids: []const u32, chunk_rows: u32, logits: ?u64, h: decode.Hooks) !void {
     if (chunk_rows == 0 or chunk_rows > c.scratch.geometry.max_rows) return error.RowsExceedScratch;

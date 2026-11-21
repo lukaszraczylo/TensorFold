@@ -31,6 +31,23 @@ pub fn logits(c: *engine.Ctx, s: cuda.Stream, h: u64, rows: usize, out_f32: u64)
     try ops.softcap(&c.ops, s, out_f32, rows * n, t.logit_cap);
 }
 
+/// Rows `first_row..rows` of `h` [rows, hidden] as fp32 log-probs [rows - first_row, unpadded_vocab] in `out`: the logits of
+/// `logits`, then a max-subtracted fp32 log-softmax per row with `logf` of the fp32 sum.
+pub fn logprobsRows(c: *engine.Ctx, s: cuda.Stream, h: u64, rows: usize, first_row: usize, out: u64) !void {
+    if (first_row >= rows) return error.Inkling2EmptyRows;
+    const t = &c.text;
+    const n: usize = t.unpadded_vocab;
+    try logits(c, s, h + first_row * t.hidden * bf16_bytes, rows - first_row, out);
+    try ops.logSoftmax(&c.ops, s, out, rows - first_row, n, n);
+}
+
+/// The rows of an `n_ctx`-token window the llama.cpp base scores: positions `n_ctx / 2 .. n_ctx - 2`.
+pub const RowRange = struct { first: usize, count: usize };
+
+pub fn scoredRowRange(n_ctx: usize) RowRange {
+    return .{ .first = n_ctx / 2, .count = n_ctx - 1 - n_ctx / 2 };
+}
+
 /// NaN is never picked (torch.argmax picks it); the gates require finite logits.
 /// Each of `rows` logit rows [rows, unpadded_vocab]: the first index of its largest value into `id` (i32 [rows]), the value
 /// into `val` (f32 [rows]).
@@ -144,4 +161,9 @@ test "the host pick takes the first of equal maxima and skips NaN" {
     try ts.expectEqual(@as(?u32, 3), hostArgmax(&.{ nan, 1, nan, 9 }));
     try ts.expectEqual(@as(?u32, null), hostArgmax(&.{ nan, nan }));
     try ts.expectEqual(@as(?u32, null), hostArgmax(&.{}));
+}
+
+test "the scored rows are the upper half of the window less its last row" {
+    try ts.expectEqual(RowRange{ .first = 256, .count = 255 }, scoredRowRange(512));
+    try ts.expectEqual(RowRange{ .first = 4, .count = 3 }, scoredRowRange(8));
 }

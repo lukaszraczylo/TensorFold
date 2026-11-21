@@ -31,6 +31,7 @@ const dev_chunk_rows = 64;
 const device_limit: u64 = 30 << 30; // ASSUMPTION: the dev pod's GB10 pool shows about 31 GiB available
 const stats_name = "weights.json";
 const staged_layers = "staged";
+const default_n_ctx = 512;
 
 const Args = struct {
     sub: []const u8,
@@ -56,6 +57,9 @@ const Args = struct {
     chunk_rows: u32 = ink2.prefill.default_chunk_rows,
     decode: usize = 0,
     path: ?[]const u8 = null,
+    tokens: ?[]const u8 = null,
+    n_ctx: usize = default_n_ctx,
+    chunks: ?ink2.budget.LayerRange = null,
 };
 
 fn parseLayers(text: []const u8) !ink2.budget.LayerRange {
@@ -72,7 +76,7 @@ fn parseArgs(args: []const [:0]const u8) !Args {
         const v: []const u8 = args[i + 1];
         if (std.mem.eql(u8, args[i], "--out")) a.out = v else if (std.mem.eql(u8, args[i], "--model")) a.model = v else if (std.mem.eql(u8, args[i], "--in")) a.in = v else if (std.mem.eql(u8, args[i], "--layers")) {
             if (std.mem.eql(u8, v, staged_layers)) a.staged = true else a.layers = try parseLayers(v);
-        } else if (std.mem.eql(u8, args[i], "--steps")) a.steps = v else if (std.mem.eql(u8, args[i], "--teacher")) a.teacher = v else if (std.mem.eql(u8, args[i], "--visits")) a.visits = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--dump-kv")) a.dump_kv = v else if (std.mem.eql(u8, args[i], "--prompts")) a.prompts = v else if (std.mem.eql(u8, args[i], "--ids")) a.ids = v else if (std.mem.eql(u8, args[i], "--chunk-rows")) a.chunk_rows = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--decode")) a.decode = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--path")) a.path = v else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else if (std.mem.eql(u8, args[i], "--pass")) a.pass = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--pos0")) a.pos0 = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--n")) a.n = try std.fmt.parseInt(usize, v, 10) else return error.Usage;
+        } else if (std.mem.eql(u8, args[i], "--steps")) a.steps = v else if (std.mem.eql(u8, args[i], "--teacher")) a.teacher = v else if (std.mem.eql(u8, args[i], "--visits")) a.visits = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--dump-kv")) a.dump_kv = v else if (std.mem.eql(u8, args[i], "--prompts")) a.prompts = v else if (std.mem.eql(u8, args[i], "--ids")) a.ids = v else if (std.mem.eql(u8, args[i], "--chunk-rows")) a.chunk_rows = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--decode")) a.decode = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--path")) a.path = v else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else if (std.mem.eql(u8, args[i], "--pass")) a.pass = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--pos0")) a.pos0 = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--n")) a.n = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--tokens")) a.tokens = v else if (std.mem.eql(u8, args[i], "--n-ctx")) a.n_ctx = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--chunks")) a.chunks = try parseLayers(v) else return error.Usage;
     }
     return a;
 }
@@ -135,6 +139,10 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (std.mem.eql(u8, a.sub, "greedy")) {
         try greedyRun(init, a, out);
+        return 0;
+    }
+    if (std.mem.eql(u8, a.sub, "logprobs")) {
+        try logprobsRun(init, a, out);
         return 0;
     }
     if (std.mem.eql(u8, a.sub, "prefill")) {
@@ -1206,4 +1214,62 @@ fn prefillRun(init: std.process.Init, a: Args, out: []const u8) !void {
     const extra = sessionBytes(&session, ink2.head.deviceBytes(&session.w.cfg.text, 1).scratch);
     const caches = session.cache.kv.len + session.cache.conv.len;
     std.debug.print("prefill: {d} ids in chunks of {d}, {d} decode steps, device_bytes {d} + {d} (caches {d}, scratch {d}) = {d}\n", .{ steps[0].len, a.chunk_rows, a.decode, session.w.device_bytes, extra, caches, extra - caches, session.w.device_bytes + extra });
+}
+
+/// Each chunk of `--tokens` through the chunked prefill with the head's log-probs of the scored rows; see `usage`.
+fn logprobsRun(init: std.process.Init, a: Args, out: []const u8) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const model = a.model orelse return error.Usage;
+    const tokens_path = a.tokens orelse return error.Usage;
+    const range = a.chunks orelse return error.Usage;
+    const n_ctx = a.n_ctx;
+    if (n_ctx < 2 or n_ctx > dev_context or range.last < range.first) return error.BadChunks;
+
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, tokens_path, gpa, .limited(1 << 28));
+    defer gpa.free(bytes);
+    if (bytes.len % (n_ctx * @sizeOf(u32)) != 0) return error.BadTokens;
+    const n_chunks = bytes.len / (n_ctx * @sizeOf(u32));
+    if (range.last >= n_chunks) return error.BadChunks;
+    const ids_all = try gpa.alloc(u32, n_chunks * n_ctx);
+    defer gpa.free(ids_all);
+    @memcpy(std.mem.sliceAsBytes(ids_all), bytes);
+
+    var session: Session = undefined;
+    try session.open(gpa, io, model, null, a.layers, @intCast(n_ctx));
+    defer session.deinit();
+    const c = &session.c;
+    const vocab: usize = c.text.unpadded_vocab;
+    for (ids_all) |id| if (id >= vocab) return error.BadTokens;
+
+    const rows = ink2.head.scoredRowRange(n_ctx);
+    const out_floats = rows.count * vocab;
+    const host = try gpa.alloc(f32, out_floats);
+    defer gpa.free(host);
+    var dev = try cuda.DeviceBuffer.alloc(c.d, out_floats * @sizeOf(f32));
+    defer dev.free();
+    var rows_out = try ink2.check_rows.Writer.init(gpa, io, out);
+    defer rows_out.deinit();
+    var t_start = try cuda.Event.init(c.d, true);
+    defer t_start.deinit();
+    var t_end = try cuda.Event.init(c.d, true);
+    defer t_end.deinit();
+
+    var chunk_i: usize = range.first;
+    while (chunk_i <= range.last) : (chunk_i += 1) {
+        try session.cache.clear(session.stream, 0);
+        try t_start.record(session.stream);
+        try ink2.prefill.chunkLogprobs(c, session.stream, 0, ids_all[chunk_i * n_ctx ..][0..n_ctx], 0, rows, dev.ptr, .{});
+        try t_end.record(session.stream);
+        try session.stream.synchronize();
+        const ms = try cuda.Event.elapsedMs(t_start, t_end);
+        try cuda.memory.download(c.d, dev.ptr, std.mem.sliceAsBytes(host));
+        for (host) |x| if (!std.math.isFinite(x)) return error.Inkling2NonFiniteLogprob;
+        var name: [32]u8 = undefined;
+        try rows_out.put(try std.fmt.bufPrint(&name, "chunk{d}", .{chunk_i}), .f32, &.{ rows.count, vocab }, std.mem.sliceAsBytes(host));
+        std.debug.print("logprobs chunk {d}: {d} ids, {d:.1} ms\n", .{ chunk_i, n_ctx, ms });
+    }
+    try rows_out.finish();
+    const extra = sessionBytes(&session, out_floats * @sizeOf(f32));
+    std.debug.print("logprobs: chunks {d}-{d}, n_ctx {d}, device_bytes {d} + {d} = {d}\n", .{ range.first, range.last, n_ctx, session.w.device_bytes, extra, session.w.device_bytes + extra });
 }

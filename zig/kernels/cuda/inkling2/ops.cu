@@ -458,6 +458,30 @@ extern "C" __global__ void tf_ink2_softcap(float* __restrict__ x, long long n, f
     if (i < n) x[i] = tanhf(x[i] / cap) * cap;
 }
 
+// Each row's fp32 log-softmax over its first n columns in place: x - max - logf(sum(expf(x - max))), one block a row.
+extern "C" __global__ void __launch_bounds__(1024) tf_ink2_logsoftmax(float* __restrict__ x, long long stride, int n) {
+    __shared__ float red[32];
+    float* r = x + static_cast<size_t>(blockIdx.x) * stride;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, r[i]);
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    m = lane < nw ? red[lane] : -INFINITY;
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) sum += expf(r[i] - m);
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    if (lane == 0) red[warp] = sum;
+    __syncthreads();
+    sum = lane < nw ? red[lane] : 0.0f;
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float shift = m + logf(sum);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) r[i] -= shift;
+}
+
 namespace ink2o {
 
 __device__ __forceinline__ bool better(float v, int i, float bv, int bi) { return v > bv || (v == bv && i < bi); }

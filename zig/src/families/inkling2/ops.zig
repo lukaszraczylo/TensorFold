@@ -72,6 +72,7 @@ pub const Kernels = struct {
     gateup: cuda.Function,
     conv: cuda.Function,
     softcap: cuda.Function,
+    logsoftmax: cuda.Function,
     top1: cuda.Function,
     tobf: cuda.Function,
     put_words: cuda.Function,
@@ -97,6 +98,7 @@ pub const Kernels = struct {
             .gateup = try mod.function("tf_ink2_gateup"),
             .conv = try mod.function("tf_ink2_conv"),
             .softcap = try mod.function("tf_ink2_softcap"),
+            .logsoftmax = try mod.function("tf_ink2_logsoftmax"),
             .top1 = try mod.function("tf_ink2_top1"),
             .tobf = try mod.function("tf_ink2_tobf"),
             .put_words = try mod.function("tf_ink2_put_words"),
@@ -194,6 +196,15 @@ pub fn softcap(k: *const Kernels, s: cuda.Stream, x: u64, n: usize, cap: f32) !v
     a.add(@as(i64, @intCast(n)));
     a.add(cap);
     try go(k.softcap, s, .{ .x = @intCast((n + 255) / 256) }, 256, &a);
+}
+
+/// Each of `rows` fp32 rows (`stride` apart) into its log-softmax over the first `n` columns, in place.
+pub fn logSoftmax(k: *const Kernels, s: cuda.Stream, x: u64, rows: usize, stride: usize, n: usize) !void {
+    var a: cuda.Args = .{};
+    a.add(x);
+    a.add(@as(i64, @intCast(stride)));
+    a.add(int(n));
+    try go(k.logsoftmax, s, .{ .x = @intCast(rows) }, 1024, &a);
 }
 
 /// Each of `rows` fp32 rows (`stride` apart): its largest value among the first `n` (lowest id on ties), id + `base`.
