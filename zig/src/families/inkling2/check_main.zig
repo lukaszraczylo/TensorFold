@@ -125,6 +125,13 @@ pub fn main(init: std.process.Init) !u8 {
         try decodeRun(init, a, out);
         return 0;
     }
+    if (std.mem.eql(u8, a.sub, "conv")) {
+        try convRun(init, a.in orelse {
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }, out);
+        return 0;
+    }
     if (std.mem.eql(u8, a.sub, "actq")) {
         try actq(init, a.in orelse {
             std.debug.print("{s}", .{usage});
@@ -278,6 +285,81 @@ fn actq(init: std.process.Init, in: []const u8, out: []const u8) !void {
                 try putDevice(gpa, &rows_out, &side, "{s}scales_{s}", .{ kind.out, suffix }, .f32, &.{ rows, kdim / ink2.loop_kernels.nvfp4_block });
                 try putDevice(gpa, &rows_out, &amax, "{s}amax_{s}", .{ kind.out, suffix }, .f32, &.{rows});
             }
+        }
+    }
+    try rows_out.finish();
+}
+
+const conv_width = 2304;
+
+/// DIR's x, w, base and resid through tf_ink2_conv's static modes 1 and 2, `y_f32` 0 and 1, each from a zero state.
+fn convRun(init: std.process.Init, in: []const u8, out: []const u8) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    var driver = try cuda.Driver.open();
+    defer driver.close();
+    var ctx = try cuda.Context.init(&driver, 0);
+    defer ctx.deinit();
+    var stream = try cuda.Stream.init(ctx.d, true);
+    defer stream.deinit();
+    var op = try ink2.ops.Kernels.load(ctx.d);
+    defer op.unload();
+
+    const in_dir = try std.Io.Dir.cwd().openDir(io, in, .{});
+    defer in_dir.close(io);
+    const x_host = try in_dir.readFileAlloc(io, "x.bf16", gpa, .limited(1 << 26));
+    defer gpa.free(x_host);
+    const rows = x_host.len / (conv_width * 2);
+    if (rows == 0 or x_host.len != rows * conv_width * 2) return error.ShapeMismatch;
+    const w_host = try in_dir.readFileAlloc(io, "w.bf16", gpa, .limited(conv_width * 8 + 1));
+    defer gpa.free(w_host);
+    const base_host = try in_dir.readFileAlloc(io, "base.bf16", gpa, .limited(x_host.len + 1));
+    defer gpa.free(base_host);
+    const resid_host = try in_dir.readFileAlloc(io, "resid.f32", gpa, .limited(rows * conv_width * 4 + 1));
+    defer gpa.free(resid_host);
+    if (w_host.len != conv_width * 8 or base_host.len != x_host.len or resid_host.len != rows * conv_width * 4) return error.ShapeMismatch;
+
+    var x = try cuda.DeviceBuffer.alloc(ctx.d, x_host.len);
+    defer x.free();
+    var w = try cuda.DeviceBuffer.alloc(ctx.d, w_host.len);
+    defer w.free();
+    var base = try cuda.DeviceBuffer.alloc(ctx.d, base_host.len);
+    defer base.free();
+    var resid = try cuda.DeviceBuffer.alloc(ctx.d, resid_host.len);
+    defer resid.free();
+    var state = try cuda.DeviceBuffer.alloc(ctx.d, 3 * conv_width * 4);
+    defer state.free();
+    var out_bf = try cuda.DeviceBuffer.alloc(ctx.d, x_host.len);
+    defer out_bf.free();
+    try x.upload(0, x_host);
+    try w.upload(0, w_host);
+    try base.upload(0, base_host);
+
+    const zeros = try gpa.alloc(u8, 3 * conv_width * 4);
+    defer gpa.free(zeros);
+    @memset(zeros, 0);
+    var rows_out = try ink2.check_rows.Writer.init(gpa, io, out);
+    defer rows_out.deinit();
+    for ([_]i32{ 0, 1 }) |f| {
+        for ([_]i32{ 1, 2 }) |mode| {
+            try state.upload(0, zeros);
+            if (mode == 2) try resid.upload(0, resid_host);
+            const args: ink2.ops.ConvArgs = .{
+                .x = x.ptr,
+                .state = state.ptr,
+                .w = w.ptr,
+                .base = if (mode == 1) base.ptr else 0,
+                .resid = resid.ptr,
+                .out = out_bf.ptr,
+                .x_bf16 = 1,
+                .c = conv_width,
+                .rows = @intCast(rows),
+                .mode = mode,
+                .y_f32 = f,
+            };
+            try ink2.ops.conv(&op, stream, args, 1);
+            try stream.synchronize();
+            if (mode == 1) try putDevice(gpa, &rows_out, &resid, "m1_y{d}", .{f}, .f32, &.{ rows, conv_width }) else try putDevice(gpa, &rows_out, &out_bf, "m2_y{d}", .{f}, .bf16, &.{ rows, conv_width });
         }
     }
     try rows_out.finish();
