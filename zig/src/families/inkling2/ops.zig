@@ -40,6 +40,7 @@ pub const ConvArgs = extern struct {
     c: i32,
     rows: i32,
     mode: i32,
+    y_f32: i32 = 0, // modes 1 and 2: add the conv output unrounded
 };
 
 /// ops.cu's GateUpArgs, field for field.
@@ -248,7 +249,7 @@ pub fn putWords(k: *const Kernels, s: cuda.Stream, dst: u64, n: usize, words: Wo
 
 test "ops: the argument structs keep ops.cu's layouts" {
     try std.testing.expectEqual(@as(usize, 8 * 8 + 8 + 8 + 3 * 8 + 8 + 6 * 4), @sizeOf(MixArgs));
-    try std.testing.expectEqual(@as(usize, 9 * 8 + 2 * 8 + 7 * 4 + 4), @sizeOf(ConvArgs));
+    try std.testing.expectEqual(@as(usize, 9 * 8 + 2 * 8 + 8 * 4), @sizeOf(ConvArgs));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(RewindSite));
     try std.testing.expectEqual(@as(usize, 6 * 8 + 6 * 4), @sizeOf(GateUpArgs));
 }

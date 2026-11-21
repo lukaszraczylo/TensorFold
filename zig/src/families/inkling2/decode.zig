@@ -138,7 +138,7 @@ fn sublayers(c: *engine.Ctx, s: cuda.Stream, stream: u32, pos: u64, v: visits.Vi
     }
     try moe.forward(&c.env, s, lw, c.w.prec[v.layer], f.mlp_in, f.moe_out, rows, &c.moe_sc);
 
-    var a: ops.ConvArgs = .{ .x = f.moe_out, .state = c.cache.convAt(v.conv, stream, .mlp), .w = try present(lw.mlp_sconv), .resid = f.resid, .c = hidden, .rows = rows, .mode = 1, .x_bf16 = 1 };
+    var a: ops.ConvArgs = .{ .x = f.moe_out, .state = c.cache.convAt(v.conv, stream, .mlp), .w = try present(lw.mlp_sconv), .resid = f.resid, .c = hidden, .rows = rows, .mode = 1, .x_bf16 = 1, .y_f32 = 1 };
     if (op.first) {
         a.base = f.attn_out;
         try conv(c, s, a);

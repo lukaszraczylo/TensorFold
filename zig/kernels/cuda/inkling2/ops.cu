@@ -378,6 +378,7 @@ struct ConvArgs {
     long long part_stride;
     long long state_stride;  // elements between the streams' states
     int parts, x_bf16, round_in, heads, C, rows, mode;  // mode 0: out = y; 1: resid = base + bf16(y); 2: resid + bf16(y)
+    int y_f32;  // modes 1 and 2 add y unrounded (SPEC 5 step D: one rounding of the whole sum)
 };
 
 // Rows in blocks of 32 (z), each from its three prior inputs recomputed (same bits); block 0 owns the state.
@@ -414,9 +415,10 @@ extern "C" __global__ void __launch_bounds__(128) tf_ink2_conv(const ConvArgs a)
             y += bf(w[3]) * x;
             y = (y + x) / 2.2360679774997896f;
         }
+        const float yr = a.y_f32 ? y : bfr(y);
         if (a.mode == 0) a.out[at] = tobf(y);
-        else if (a.mode == 1) a.resid[at] = (a.base ? bf(a.base[at]) : 0.0f) + bfr(y);
-        else a.out[at] = tobf(a.resid[at] + bfr(y));
+        else if (a.mode == 1) a.resid[at] = (a.base ? bf(a.base[at]) : 0.0f) + yr;
+        else a.out[at] = tobf(a.resid[at] + yr);
         h0 = h1, h1 = h2, h2 = x;
     }
     if (r0 != 0) return;
