@@ -118,6 +118,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     };
 }
 
+/// The device bytes the host pre-check counts: the text weights, without the tower or a host-gathered embedding.
+pub fn tensorWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, vision: bool) !u64 {
+    _ = vision; // the engine never uploads the tower
+    const embed_host = try platform.environment.read(bool, embed_host_env, false);
+    return weights.deviceBytes(gpa, io, dir, .{ .context = 0, .streams = 0, .chunk_rows = 0, .embed_host = embed_host });
+}
+
 /// Whether a request could start now (the lane host's admission, on its engine thread).
 pub fn fits(p: *anyopaque, prompt: u32, max_tokens: u32) bool {
     const own: *const Owned = @ptrCast(@alignCast(p));

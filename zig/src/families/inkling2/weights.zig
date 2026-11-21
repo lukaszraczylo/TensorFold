@@ -344,6 +344,21 @@ pub const Diag = struct {
     }
 };
 
+/// The device bytes `load` would hold for `o`, read from the checkpoint's headers: no tower, no host-gathered embedding.
+pub fn deviceBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, o: budget.Options) !u64 {
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    var ck = try Checkpoint.openModel(gpa, io, dir);
+    defer ck.close();
+    const cfg = try readConfig(a, io, dir);
+    var header: st.Header = .empty;
+    for (ck.files.items) |f| try names.merge(a, &header, f.names);
+    var prec: [config.max_layers]layer_plan.Precision = undefined;
+    try names.precisions(header, cfg.text.layers, &prec);
+    return budget.weightBytes(&cfg, prec[0..cfg.text.layers], o);
+}
+
 /// Loads the text weights of the checkpoint under `dir`: refuses (`WeightShape`) a tensor the weight map disagrees
 /// with and (`OverBudget`) a budget above `limit` before any upload, then uploads one layer at a time.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, up: Uploader, dir: []const u8, o: budget.Options, limit: u64) !Weights {
@@ -715,4 +730,24 @@ test "host embedding stays in the mapping and gathers rows" {
     }
     try t.expectError(error.TokenOutOfRange, w.gatherEmbed(&.{4096}, out[0..hidden]));
     try t.expectError(error.BadOutput, w.gatherEmbed(&ids, out[0..hidden]));
+}
+
+test "deviceBytes excludes the tower always and the embedding only when it is read from the host" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var fx = try Fixture.init(arena.allocator(), null);
+    defer fx.deinit();
+    var fake: Fake = .{ .gpa = t.allocator };
+    defer fake.deinit();
+    var w = try load(t.allocator, t.io, fake.uploader(), fx.dir, test_options, test_limit);
+    defer w.deinit();
+    const device = try deviceBytes(t.allocator, t.io, fx.dir, test_options);
+    try t.expectEqual(w.device_bytes, device);
+    var host = test_options;
+    host.embed_host = true;
+    const embed: u64 = @as(u64, fx.cfg.text.vocab) * fx.cfg.text.hidden * 2;
+    try t.expectEqual(device - embed, try deviceBytes(t.allocator, t.io, fx.dir, host));
+    const file = try std.fmt.allocPrint(arena.allocator(), "{s}/model.safetensors", .{fx.dir});
+    const on_disk = (try std.Io.Dir.cwd().statFile(t.io, file, .{})).size;
+    try t.expect(on_disk > device); // the file also holds the tower
 }
