@@ -9,8 +9,8 @@ const plan = @import("plan.zig");
 pub const actq_threads = 256;
 pub const nvfp4_block = 16;
 pub const mxfp8_block = 32;
-/// Columns a block of the expert GEMVs computes (loop.cu's kExWarps: a warp a column).
-pub const expert_tile = 8;
+/// Columns a block of the expert GEMVs computes (loop.cu's kExWarps x kExRows: a warp kExRows columns).
+pub const expert_tile = 16;
 /// Pairs of one expert and columns a block of the grouped expert kernels computes; loop.cu's kGroupPairs and kGroupCols.
 pub const group_pairs = 16;
 pub const group_cols = 64;

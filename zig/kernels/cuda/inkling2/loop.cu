@@ -1,6 +1,6 @@
 // Inkling 2 Mini's looped-engine kernels: the check tool's smoke kernel, the activation quantisers and the expert decode path.
-// Accumulation order of every output dot (the expert GEMVs here; the prompt path must match): lane l of a warp adds its
-// elements k = l, l + 32, l + 64, ... of the K axis in increasing k with fmaf, then the xor-shuffle tree 16, 8, 4, 2, 1.
+// Accumulation order of an output dot: the grouped (prompt) expert kernels add elements k = l, l + 32, ... of the K axis a lane
+// with fmaf; the decode expert kernels add 16-value chunks c = l, l + 32, ... in order. Both then run the xor tree 16, 8, 4, 2, 1.
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -206,24 +206,34 @@ extern "C" __global__ void tf_ink2l_actq_mxfp8_codes(
 // A stage's device template takes the stored format as a WeightFmt; the extern "C" wrappers are the only per-format code.
 constexpr int kExWarps = kThreads / 32;  // output columns a block computes
 constexpr int kSlots = 8;
-constexpr int kExUnroll = 12;  // weight reads a warp keeps in flight; divides both k (2304 and 1152) in 32-lane steps
+constexpr int kExRows = 2;     // columns a warp computes together, sharing each activation chunk
+constexpr int kExChunk = 16;   // values a lane decodes per weight load
+constexpr int kExDepth = 5;    // chunk loads a lane keeps in flight per column: ceil(144 chunks / 32 lanes)
 constexpr uint32_t kFloatInf = 0x7f800000u;
 
 __constant__ float kE2m1Lut[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
                                    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
-// The same values by arithmetic: a constant-memory read with a lane-divergent index serialises (decode GEMV); the grouped
-// prompt path keeps the table, which measured faster there.
-__device__ __forceinline__ float e2m1Value(int code) {
-    const int m = code & 7;
-    const float mag = m < 4 ? 0.5f * (float)m : (float)((2 + (m & 1)) * (1 + ((m >> 1) & 1)));
-    return __uint_as_float(__float_as_uint(mag) | ((uint32_t)(code & 8) << 28));
-}
-
 __device__ __forceinline__ float bf16Round(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 
 __device__ __forceinline__ float e4m3ToFloat(uint8_t b) {
     return __half2float(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b, __NV_E4M3)));
+}
+
+// High bytes of the fp16 e2m1 magnitudes 0, 0.5, 1, 1.5, 2, 3, 4, 6: a byte-permute table indexed by the low three code bits.
+constexpr uint32_t kE2m1HalfLo = 0x3E3C3800u;
+constexpr uint32_t kE2m1HalfHi = 0x46444240u;
+
+template <class T>
+__device__ __forceinline__ uint32_t bits32(T v) { return *reinterpret_cast<uint32_t*>(&v); }
+
+// bf16(a) in the low half, bf16(b) in the high half.
+__device__ __forceinline__ uint32_t bf16Pair(float a, float b) { return bits32(__floats2bfloat162_rn(a, b)); }
+
+// acc + x_lo * lo + x_hi * hi, with lo and hi the two bf16 values of `packed` as float32.
+__device__ __forceinline__ float fmaPair(uint32_t packed, float x_lo, float x_hi, float acc) {
+    acc = __fmaf_rn(x_lo, __uint_as_float(packed << 16), acc);
+    return __fmaf_rn(x_hi, __uint_as_float(packed & 0xFFFF0000u), acc);
 }
 
 // ref.weights.dequant_nvfp4: bf16((lut[code] * f32(block scale)) * outer), outer = amax[e] / denominator, low nibble first.
@@ -237,9 +247,27 @@ struct Nvfp4Fmt {
         const int code = (w[k >> 1] >> ((k & 1) * 4)) & 0xF;
         return bf16Round(__fmul_rn(__fmul_rn(kE2m1Lut[code], e4m3ToFloat(scale[k / kNvBlock])), outer));
     }
-    __device__ static float dequantFast(const uint8_t* w, const uint8_t* scale, int k, float outer) {
-        const int code = (w[k >> 1] >> ((k & 1) * 4)) & 0xF;
-        return bf16Round(__fmul_rn(__fmul_rn(e2m1Value(code), e4m3ToFloat(scale[k / kNvBlock])), outer));
+    // The decode GEMV reads a chunk of 16 values (8 bytes, one block scale) a lane. A code times its scale is exact in fp16, so
+    // every weight is the same bf16((code * scale) * outer) as dequant; only the k order of the sum differs.
+    using Raw = uint2;
+    __device__ static Raw load(const uint8_t* wr, int c) { return __ldg(reinterpret_cast<const uint2*>(wr) + c); }
+    __device__ static uint32_t scaleOf(const uint8_t* sr, int c) { return sr[c]; }
+    __device__ static float dot(Raw w, uint32_t scale_byte, float outer, const float* xv, float acc) {
+        const __half2 sc = __half2half2(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)scale_byte, __NV_E4M3)));
+        acc = word(w.x, sc, outer, xv, acc);
+        return word(w.y, sc, outer, xv + 8, acc);
+    }
+    // Nibbles 0..7 of a word are elements 0..7; pair i joins nibbles i and i + 4 so their signs land on bits 15 and 31.
+    __device__ static float word(uint32_t w, __half2 sc, float outer, const float* xv, float acc) {
+        const uint32_t low = __byte_perm(kE2m1HalfLo, kE2m1HalfHi, w & 0x7777u);
+        const uint32_t high = __byte_perm(kE2m1HalfLo, kE2m1HalfHi, (w >> 16) & 0x7777u);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            uint32_t h = (__byte_perm(low, high, ((4 + i) << 12) | (i << 4)) & 0xFF00FF00u) | ((w << (12 - 4 * i)) & 0x80008000u);
+            const float2 f = __half22float2(__hmul2(*reinterpret_cast<__half2*>(&h), sc));
+            acc = fmaPair(bf16Pair(__fmul_rn(f.x, outer), __fmul_rn(f.y, outer)), xv[i], xv[i + 4], acc);
+        }
+        return acc;
     }
 };
 
@@ -253,47 +281,92 @@ struct Mxfp8Fmt {
         const float exp2 = biased == kUe8m0Nan ? __uint_as_float(kFloatInf) : ue8m0Value(biased);
         return bf16Round(__fmul_rn(e4m3ToFloat(w[k]), exp2));
     }
-    __device__ static float dequantFast(const uint8_t* w, const uint8_t* scale, int k, float outer) { return dequant(w, scale, k, outer); }
+    // A chunk is 16 e4m3 bytes, half of a 32-value scale block.
+    using Raw = uint4;
+    __device__ static Raw load(const uint8_t* wr, int c) { return __ldg(reinterpret_cast<const uint4*>(wr) + c); }
+    __device__ static uint32_t scaleOf(const uint8_t* sr, int c) { return sr[c >> 1]; }
+    __device__ static float dot(Raw w, uint32_t biased, float, const float* xv, float acc) {
+        const float exp2 = biased == kUe8m0Nan ? __uint_as_float(kFloatInf) : ue8m0Value((int)biased);
+        acc = word(w.x, exp2, xv, acc);
+        acc = word(w.y, exp2, xv + 4, acc);
+        acc = word(w.z, exp2, xv + 8, acc);
+        return word(w.w, exp2, xv + 12, acc);
+    }
+    __device__ static float word(uint32_t w, float exp2, const float* xv, float acc) {
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(w >> (16 * i)), __NV_E4M3);
+            const float2 f = __half22float2(__half2(raw));
+            acc = fmaPair(bf16Pair(__fmul_rn(f.x, exp2), __fmul_rn(f.y, exp2)), xv[2 * i], xv[2 * i + 1], acc);
+        }
+        return acc;
+    }
 };
 
-// One output column n of expert e against the activation row x: the warp's dot product, valid in every lane.
+// kExRows adjacent columns n0.. of expert e against the activation row x. A lane takes chunks lane, lane + 32, ... of each
+// column, kExDepth loads in flight before any is decoded; the lane sums its chunks in order, then the xor tree. sum is valid
+// in every lane. Columns at or past n_dim are read from the last column and not stored by the caller.
 template <class Fmt>
-__device__ float expertColumn(const float* x, int e, int n, const uint8_t* w, const uint8_t* scale, const float* amax,
-                              const float* denominator, int n_dim, int k_dim) {
-    const size_t row = (size_t)e * n_dim + n;
-    const uint8_t* wr = w + row * (k_dim / Fmt::kPack);
-    const uint8_t* sr = scale + row * (k_dim / Fmt::kBlock);
+__device__ void expertColumns(const float* x, int e, int n0, const uint8_t* w, const uint8_t* scale, const float* amax,
+                              const float* denominator, int n_dim, int k_dim, float (&sum)[kExRows]) {
+    const int lane = threadIdx.x & 31;
+    const int chunks = k_dim / kExChunk;
     const float outer = Fmt::expertOuter(amax, denominator, e);
-    float acc = 0.0f;
-    // kExUnroll strided steps load before any of them is accumulated (the loads do not depend on acc), so the warp keeps
-    // that many weight reads in flight; the fmaf chain keeps its k order.
-    for (int k0 = threadIdx.x & 31; k0 < k_dim; k0 += 32 * kExUnroll) {
-        float wv[kExUnroll], xv[kExUnroll];
+    const uint8_t* wr[kExRows];
+    const uint8_t* sr[kExRows];
+    #pragma unroll
+    for (int r = 0; r < kExRows; ++r) {
+        const size_t row = (size_t)e * n_dim + min(n0 + r, n_dim - 1);
+        wr[r] = w + row * (k_dim / Fmt::kPack);
+        sr[r] = scale + row * (k_dim / Fmt::kBlock);
+        sum[r] = 0.0f;
+    }
+    for (int base = 0; base < chunks; base += 32 * kExDepth) {
+        typename Fmt::Raw wv[kExRows][kExDepth];
+        uint32_t sv[kExRows][kExDepth];
         #pragma unroll
-        for (int u = 0; u < kExUnroll; ++u) {
-            const int k = k0 + 32 * u;
-            wv[u] = k < k_dim ? Fmt::dequantFast(wr, sr, k, outer) : 0.0f;
-            xv[u] = k < k_dim ? x[k] : 0.0f;
+        for (int j = 0; j < kExDepth; ++j) {
+            const int c = base + lane + 32 * j;
+            if (c < chunks) {
+                #pragma unroll
+                for (int r = 0; r < kExRows; ++r) {
+                    wv[r][j] = Fmt::load(wr[r], c);
+                    sv[r][j] = Fmt::scaleOf(sr[r], c);
+                }
+            }
         }
         #pragma unroll
-        for (int u = 0; u < kExUnroll; ++u) {
-            if (k0 + 32 * u < k_dim) acc = __fmaf_rn(xv[u], wv[u], acc);
+        for (int j = 0; j < kExDepth; ++j) {
+            const int c = base + lane + 32 * j;
+            if (c >= chunks) continue;
+            float xv[kExChunk];
+            #pragma unroll
+            for (int q = 0; q < kExChunk / 4; ++q) {
+                const float4 v = __ldg(reinterpret_cast<const float4*>(x) + c * (kExChunk / 4) + q);
+                xv[4 * q] = v.x; xv[4 * q + 1] = v.y; xv[4 * q + 2] = v.z; xv[4 * q + 3] = v.w;
+            }
+            #pragma unroll
+            for (int r = 0; r < kExRows; ++r) sum[r] = Fmt::dot(wv[r][j], sv[r][j], outer, xv, sum[r]);
         }
     }
     #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
-    return acc;
+    for (int r = 0; r < kExRows; ++r) {
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) sum[r] = __fadd_rn(sum[r], __shfl_xor_sync(0xffffffffu, sum[r], o));
+    }
 }
 
-// Grid: x = (row, slot) pairs, y = tiles of kExWarps columns. act float [rows, k]; gu bf16 [rows * 8, n].
+// Grid: x = (row, slot) pairs, y = tiles of kExWarps * kExRows columns. act float [rows, k]; gu bf16 [rows * 8, n].
 template <class Fmt>
 __device__ void exGateUp(const float* act, const int* pick, const uint8_t* w, const uint8_t* scale, const float* amax,
                          const float* denominator, __nv_bfloat16* gu, int pairs, int n_dim, int k_dim) {
     const int p = blockIdx.x;
-    const int n = blockIdx.y * kExWarps + (threadIdx.x >> 5);
-    if (p >= pairs || n >= n_dim) return;
-    const float sum = expertColumn<Fmt>(act + (size_t)(p / kSlots) * k_dim, pick[p], n, w, scale, amax, denominator, n_dim, k_dim);
-    if ((threadIdx.x & 31) == 0) gu[(size_t)p * n_dim + n] = __float2bfloat16_rn(sum);
+    const int n0 = (blockIdx.y * kExWarps + (threadIdx.x >> 5)) * kExRows;
+    if (p >= pairs || n0 >= n_dim) return;
+    float sum[kExRows];
+    expertColumns<Fmt>(act + (size_t)(p / kSlots) * k_dim, pick[p], n0, w, scale, amax, denominator, n_dim, k_dim, sum);
+    if ((threadIdx.x & 31) != 0) return;
+    for (int r = 0; r < kExRows && n0 + r < n_dim; ++r) gu[(size_t)p * n_dim + n0 + r] = __float2bfloat16_rn(sum[r]);
 }
 
 // act float [rows * 8, k] (the quantised SwiGLU output); dn float [rows * 8, n] holds the bf16-rounded value.
@@ -301,10 +374,12 @@ template <class Fmt>
 __device__ void exDown(const float* act, const int* pick, const uint8_t* w, const uint8_t* scale, const float* amax,
                        const float* denominator, float* dn, int pairs, int n_dim, int k_dim) {
     const int p = blockIdx.x;
-    const int n = blockIdx.y * kExWarps + (threadIdx.x >> 5);
-    if (p >= pairs || n >= n_dim) return;
-    const float sum = expertColumn<Fmt>(act + (size_t)p * k_dim, pick[p], n, w, scale, amax, denominator, n_dim, k_dim);
-    if ((threadIdx.x & 31) == 0) dn[(size_t)p * n_dim + n] = bf16Round(sum);
+    const int n0 = (blockIdx.y * kExWarps + (threadIdx.x >> 5)) * kExRows;
+    if (p >= pairs || n0 >= n_dim) return;
+    float sum[kExRows];
+    expertColumns<Fmt>(act + (size_t)p * k_dim, pick[p], n0, w, scale, amax, denominator, n_dim, k_dim, sum);
+    if ((threadIdx.x & 31) != 0) return;
+    for (int r = 0; r < kExRows && n0 + r < n_dim; ++r) dn[(size_t)p * n_dim + n0 + r] = bf16Round(sum[r]);
 }
 
 extern "C" __global__ void tf_ink2l_ex_gu_nvfp4(const float* act, const int* pick, const uint8_t* w, const uint8_t* scale,
@@ -332,8 +407,8 @@ extern "C" __global__ void tf_ink2l_ex_down_mxfp8(const float* act, const int* p
 }
 
 // ---- Grouped expert path (prompt rows): (row, slot) pairs sorted by expert, a block a tile of one expert's pairs ----
-// Every pair's dot keeps expertColumn's order (lane-strided fmaf over k, then the xor tree), so a pair's value is bit-identical
-// to the per-pair kernels'; the tile only shares each dequantised weight across its pairs.
+// Every pair's dot is lane-strided fmaf over k, then the xor tree; the tile shares each dequantised weight across its pairs.
+// The decode kernels above sum in chunk order instead, so the two paths agree to rounding, not bit for bit.
 constexpr int kGroupPairs = 16;                        // pairs of one expert a block holds
 constexpr int kGroupCols = 64;                         // output columns a block computes
 constexpr int kGroupPasses = kGroupCols / kExWarps;    // columns a warp computes in turn
