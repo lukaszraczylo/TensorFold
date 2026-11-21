@@ -676,8 +676,8 @@ constexpr int kQ8Block = 32;
 constexpr int kQ8Chunk = 16;  // codes a lane reads in one 16-byte load
 constexpr int kQ8Depth = 6;   // chunk loads a lane keeps in flight: 6 x 32 lanes x 16 = 3072 = the widest k
 
-// One-row projection of the segments' int8 weights: a lane adds a chunk's 16 products in fp32, scales the chunk's sum by the
-// block scale and adds it to its total; then the xor tree. f32_out writes fp32 logits, else bf16 as dense1 does. The scales start
+// One-row projection of the segments' int8 weights: each weight is bf16(code * scale), as the prompt path's expansion makes it; a
+// lane adds its chunks' products in fp32 in order, then the xor tree. f32_out writes fp32 logits, else bf16 as dense1 does. The scales start
 // after stored_rows rows of codes (0: the segment's n).
 extern "C" __global__ void __launch_bounds__(kDenseWarps * 32) tf_ink2_dense1_q8(const Ink2DenseSegs a, int count, int k, int f32_out, int stored_rows) {
     using namespace ink2o;
@@ -711,16 +711,20 @@ extern "C" __global__ void __launch_bounds__(kDenseWarps * 32) tf_ink2_dense1_q8
             const uint4 xb = *reinterpret_cast<const uint4*>(sg.x + c * kQ8Chunk + 8);
             const uint32_t xs[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
             const uint32_t ws[4] = {wv[j].x, wv[j].y, wv[j].z, wv[j].w};
-            float part = 0.0f;
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
+                const float s0 = static_cast<float>(static_cast<int8_t>(ws[i])) * sc[j];
+                const float s1 = static_cast<float>(static_cast<int8_t>(ws[i] >> 8)) * sc[j];
+                const float s2 = static_cast<float>(static_cast<int8_t>(ws[i] >> 16)) * sc[j];
+                const float s3 = static_cast<float>(static_cast<int8_t>(ws[i] >> 24)) * sc[j];
+                const __nv_bfloat162 p01 = __floats2bfloat162_rn(s0, s1), p23 = __floats2bfloat162_rn(s2, s3);
+                const uint32_t b01 = *reinterpret_cast<const uint32_t*>(&p01), b23 = *reinterpret_cast<const uint32_t*>(&p23);
                 const uint32_t x0 = xs[2 * i], x1 = xs[2 * i + 1];
-                part = __fmaf_rn(__uint_as_float(x0 << 16), static_cast<float>(static_cast<int8_t>(ws[i])), part);
-                part = __fmaf_rn(__uint_as_float(x0 & 0xffff0000u), static_cast<float>(static_cast<int8_t>(ws[i] >> 8)), part);
-                part = __fmaf_rn(__uint_as_float(x1 << 16), static_cast<float>(static_cast<int8_t>(ws[i] >> 16)), part);
-                part = __fmaf_rn(__uint_as_float(x1 & 0xffff0000u), static_cast<float>(static_cast<int8_t>(ws[i] >> 24)), part);
+                acc = __fmaf_rn(__uint_as_float(x0 << 16), __uint_as_float(b01 << 16), acc);
+                acc = __fmaf_rn(__uint_as_float(x0 & 0xffff0000u), __uint_as_float(b01 & 0xffff0000u), acc);
+                acc = __fmaf_rn(__uint_as_float(x1 << 16), __uint_as_float(b23 << 16), acc);
+                acc = __fmaf_rn(__uint_as_float(x1 & 0xffff0000u), __uint_as_float(b23 & 0xffff0000u), acc);
             }
-            acc = __fmaf_rn(part, sc[j], acc);
         }
     }
     for (int m = 16; m > 0; m >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xFFFFFFFFu, acc, m));
