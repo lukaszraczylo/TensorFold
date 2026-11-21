@@ -839,6 +839,7 @@ const HeadRun = struct {
         try cuda.memory.download(h.c.d, r.logits, std.mem.sliceAsBytes(h.host));
         var id: u32 = undefined;
         try cuda.memory.download(h.c.d, r.id, std.mem.asBytes(&id));
+        if (id >= h.host.len) return error.Inkling2PickMismatch; // an all-NaN row picks (-inf, base)
         if (ink2.head.hostArgmax(h.host)) |want| if (want != id) {
             std.debug.print("head: device pick {d} but host pick {d}\n", .{ id, want });
             return error.Inkling2PickMismatch;

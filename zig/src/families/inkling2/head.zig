@@ -31,6 +31,7 @@ pub fn logits(c: *engine.Ctx, s: cuda.Stream, h: u64, rows: usize, out_f32: u64)
     try ops.softcap(&c.ops, s, out_f32, rows * n, t.logit_cap);
 }
 
+/// NaN is never picked (torch.argmax picks it); the gates require finite logits.
 /// Each of `rows` logit rows [rows, unpadded_vocab]: the first index of its largest value into `id` (i32 [rows]), the value
 /// into `val` (f32 [rows]).
 pub fn argmax(c: *engine.Ctx, s: cuda.Stream, logit_rows: u64, rows: usize, val: u64, id: u64) !void {
