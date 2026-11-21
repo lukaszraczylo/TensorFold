@@ -671,6 +671,73 @@ extern "C" __global__ void __launch_bounds__(kDenseWarps * 32) tf_ink2_dense1(co
     if (lane == 0) sg.out[col] = tobf(acc);
 }
 
+// ---- 8-bit projections (TF_INK2_DENSE8 / TF_INK2_HEAD8): a weight [n, k] is int8 codes then fp16 scales [n, k / 32] ----
+constexpr int kQ8Block = 32;
+constexpr int kQ8Chunk = 16;  // codes a lane reads in one 16-byte load
+constexpr int kQ8Depth = 6;   // chunk loads a lane keeps in flight: 6 x 32 lanes x 16 = 3072 = the widest k
+
+// One-row projection of the segments' int8 weights: a lane adds a chunk's 16 products in fp32, scales the chunk's sum by the
+// block scale and adds it to its total; then the xor tree. f32_out writes fp32 logits, else bf16 as dense1 does. The scales start
+// after stored_rows rows of codes (0: the segment's n).
+extern "C" __global__ void __launch_bounds__(kDenseWarps * 32) tf_ink2_dense1_q8(const Ink2DenseSegs a, int count, int k, int f32_out, int stored_rows) {
+    using namespace ink2o;
+    int si = 0;
+    while (si + 1 < count && static_cast<int>(blockIdx.x) >= a.s[si + 1].block0) ++si;
+    const Ink2DenseSeg sg = a.s[si];
+    const int lane = threadIdx.x & 31;
+    const int col = (blockIdx.x - sg.block0) * kDenseWarps + (threadIdx.x >> 5);
+    if (col >= sg.n) return;
+    const int8_t* wr = reinterpret_cast<const int8_t*>(sg.w) + static_cast<size_t>(col) * k;
+    const __half* sr = reinterpret_cast<const __half*>(reinterpret_cast<const int8_t*>(sg.w) + static_cast<size_t>(stored_rows ? stored_rows : sg.n) * k) +
+                       static_cast<size_t>(col) * (k / kQ8Block);
+    const int chunks = k / kQ8Chunk;
+    float acc = 0.0f;
+    for (int base = 0; base < chunks; base += 32 * kQ8Depth) {
+        uint4 wv[kQ8Depth];
+        float sc[kQ8Depth];
+#pragma unroll
+        for (int j = 0; j < kQ8Depth; ++j) {
+            const int c = base + lane + 32 * j;
+            if (c < chunks) {
+                wv[j] = *reinterpret_cast<const uint4*>(wr + c * kQ8Chunk);
+                sc[j] = __half2float(sr[c >> 1]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < kQ8Depth; ++j) {
+            const int c = base + lane + 32 * j;
+            if (c >= chunks) continue;
+            const uint4 xa = *reinterpret_cast<const uint4*>(sg.x + c * kQ8Chunk);
+            const uint4 xb = *reinterpret_cast<const uint4*>(sg.x + c * kQ8Chunk + 8);
+            const uint32_t xs[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+            const uint32_t ws[4] = {wv[j].x, wv[j].y, wv[j].z, wv[j].w};
+            float part = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t x0 = xs[2 * i], x1 = xs[2 * i + 1];
+                part = __fmaf_rn(__uint_as_float(x0 << 16), static_cast<float>(static_cast<int8_t>(ws[i])), part);
+                part = __fmaf_rn(__uint_as_float(x0 & 0xffff0000u), static_cast<float>(static_cast<int8_t>(ws[i] >> 8)), part);
+                part = __fmaf_rn(__uint_as_float(x1 << 16), static_cast<float>(static_cast<int8_t>(ws[i] >> 16)), part);
+                part = __fmaf_rn(__uint_as_float(x1 & 0xffff0000u), static_cast<float>(static_cast<int8_t>(ws[i] >> 24)), part);
+            }
+            acc = __fmaf_rn(part, sc[j], acc);
+        }
+    }
+    for (int m = 16; m > 0; m >>= 1) acc = __fadd_rn(acc, __shfl_xor_sync(0xFFFFFFFFu, acc, m));
+    if (lane != 0) return;
+    if (f32_out) reinterpret_cast<float*>(sg.out)[col] = acc;
+    else sg.out[col] = tobf(acc);
+}
+
+// bf16(code * scale) of `count` elements (a multiple of 32) of an int8 plane and its fp16 scales: the weights a prompt GEMM reads.
+extern "C" __global__ void tf_ink2_q8_to_bf16(const int8_t* __restrict__ q, const __half* __restrict__ scales, uint16_t* __restrict__ out,
+                                              long long count) {
+    using namespace ink2o;
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    out[i] = tobf(static_cast<float>(q[i]) * __half2float(scales[i / kQ8Block]));
+}
+
 // A link step's words (header and ids) written to the device buffer every rank broadcasts from.
 struct Ink2Words {
     unsigned w[96];

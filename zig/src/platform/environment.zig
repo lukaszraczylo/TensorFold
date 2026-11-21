@@ -64,6 +64,8 @@ pub const rules = [_]Rule{
     .{ .name = "TF_INK2_ABLIT", .scope = .cuda, .kind = .path, .forms = "an Inkling 2 residual-edit file path without control characters (empty or 0 disables)" },
     .{ .name = "TF_INK2_ABLIT_SCALE", .scope = .cuda, .kind = .positive_real, .trim = " \t", .max = 16, .forms = "a decimal multiplier above 0 and at most 16 for every Inkling 2 edit scale (default 1)" },
     .{ .name = "TF_INK2_EMBED_HOST", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 gathers Inkling 2 embedding rows from the mapped checkpoint on the host; default 0)" },
+    .{ .name = "TF_INK2_DENSE8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 stores the Inkling 2 attention projections as int8 with fp16 block scales, a numerics change; default 0)" },
+    .{ .name = "TF_INK2_HEAD8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 stores the Inkling 2 unembedding as int8 with fp16 block scales, a numerics change; default 0)" },
     .{ .name = "TF_QMMF_HALF_BELOW", .scope = .cuda, .kind = .size, .forms = "a whole nonnegative native-size block count (0 disables half tiles)" },
     // Qwen 3.5 CUDA and HIP settings, read through this table:
     .{ .name = "TENSORFOLD_MEMORY_RESERVE_GIB", .scope = .cuda, .kind = .real, .forms = "a finite GiB amount (the HIP admission's floor and the memory's size still bound it)" },

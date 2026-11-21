@@ -141,6 +141,8 @@ pub const Scratch = struct {
 };
 
 const bf16_bytes = 2;
+/// Rows of an 8-bit weight a prompt GEMM expands to bf16 at a time; also holds any attention projection (at most 3072 rows).
+pub const dq_tile_rows = 8192;
 const f32_bytes = 4;
 const embed_ids_bytes = 4;
 /// Queries of a global layer's attention input: q, k and v.
@@ -239,6 +241,7 @@ pub const Ctx = struct {
     flow: Flow,
     moe_sc: moe.Scratch,
     gpa: std.mem.Allocator,
+    dq: cuda.DeviceBuffer, // bf16 expansion of an 8-bit weight a prompt GEMM reads; empty unless TF_INK2_DENSE8 or TF_INK2_HEAD8
     ablit: ?ablit.State, // TF_INK2_ABLIT: null leaves every visit unedited
     ablit_hook: AblitHook,
 
@@ -257,6 +260,8 @@ pub const Ctx = struct {
         errdefer c.attn.unload();
         c.dense = try cuda.dense_rows.DenseRows.load(d);
         errdefer c.dense.unload();
+        c.dq = try cuda.DeviceBuffer.alloc(d, if (w.dense8 or w.head8) @as(usize, dq_tile_rows) * w.cfg.text.hidden * bf16_bytes else 0);
+        errdefer c.dq.free();
         c.scratch = try Scratch.init(d, g);
         errdefer c.scratch.deinit();
         c.flow = try Flow.init(d, g.max_rows, g.hidden);
@@ -274,6 +279,7 @@ pub const Ctx = struct {
         c.moe_sc.deinit();
         c.flow.deinit();
         c.scratch.deinit();
+        c.dq.free();
         c.dense.unload();
         c.attn.unload();
         c.ops.unload();

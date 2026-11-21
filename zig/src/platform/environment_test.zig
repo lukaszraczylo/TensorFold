@@ -101,6 +101,8 @@ const valid = [_]Case{
     .{ .name = "TF_INK2_ABLIT_SCALE", .raw = "2.5", .n = @bitCast(@as(f64, 2.5)) },
     .{ .name = "TF_INK2_ABLIT_SCALE", .raw = "16", .n = @bitCast(@as(f64, 16.0)) },
     .{ .name = "TF_INK2_EMBED_HOST", .raw = "1", .n = 1 },
+    .{ .name = "TF_INK2_DENSE8", .raw = "1", .n = 1 },
+    .{ .name = "TF_INK2_HEAD8", .raw = "1", .n = 1 },
     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .raw = "0", .n = 0 },
     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .raw = "1", .n = 1 },
     .{ .name = "TF_PROMPT_INTERMEDIATE", .raw = "0", .n = 0 },

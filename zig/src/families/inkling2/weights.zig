@@ -3,6 +3,7 @@ const std = @import("std");
 const core = @import("core");
 const cuda = @import("cuda");
 const st = @import("safetensors");
+const platform = @import("sys");
 const config = @import("config.zig");
 const names = @import("names.zig");
 const layer_plan = @import("plan.zig");
@@ -22,8 +23,16 @@ const diag_bytes = 2048;
 
 const stream_order = names.controller_streams;
 
-/// A tensor on the device: its address, byte count and the checkpoint's dtype and shape.
-pub const Dev = struct { ptr: u64, bytes: usize, dtype: st.DType, shape: [max_rank]u64, rank: u8 };
+const dense8_env = "TF_INK2_DENSE8";
+const head8_env = "TF_INK2_HEAD8";
+const dense8_keys = [_][]const u8{ "attn.wq_du.weight", "attn.wk_dv.weight", "attn.wv_dv.weight", "attn.wr_du.weight", "attn.wo_ud.weight", "attn.gate_attn.weight", "attn.attn_sink_proj.weight" };
+pub const q8_block = 32;
+const q8_max = 127;
+
+/// A tensor on the device: its address, byte count and the checkpoint's dtype and shape. `q8` marks an 8-bit copy of a bf16
+/// [n, k] weight (TF_INK2_DENSE8, TF_INK2_HEAD8): n * k int8 codes, then n * k / 32 fp16 block scales; dtype and shape stay the
+/// checkpoint's.
+pub const Dev = struct { ptr: u64, bytes: usize, dtype: st.DType, shape: [max_rank]u64, rank: u8, q8: bool = false };
 
 const empty: Dev = .{ .ptr = 0, .bytes = 0, .dtype = .u8, .shape = @splat(0), .rank = 0 };
 
@@ -175,6 +184,36 @@ pub fn deviceUploader(d: *const cuda.Driver) Uploader {
     return .{ .ctx = @constCast(d), .vtable = &device_vtable };
 }
 
+/// Device bytes of an 8-bit [n, k] weight: the codes, then the fp16 block scales.
+pub fn q8Bytes(n: usize, k: usize) usize {
+    return n * k + n * (k / q8_block) * @sizeOf(f16);
+}
+
+/// Q8_0 planar: each block of 32 values of a row of bf16 `src` [n, k] gets scale = fp16(amax / 127) and codes round(v / scale)
+/// in [-127, 127]; `out` holds the n * k codes (int8), then the n * k / 32 scales (little-endian fp16).
+pub fn quantQ8(src: []const u8, n: usize, k: usize, out: []u8) void {
+    const codes = out[0 .. n * k];
+    const scales = out[n * k ..];
+    for (0..n) |r| {
+        for (0..k / q8_block) |b| {
+            var v: [q8_block]f32 = undefined;
+            var amax: f32 = 0;
+            for (&v, 0..) |*e, i| {
+                const at = (r * k + b * q8_block + i) * 2;
+                e.* = @bitCast(@as(u32, std.mem.readInt(u16, src[at..][0..2], .little)) << 16);
+                amax = @max(amax, @abs(e.*));
+            }
+            const scale: f16 = @floatCast(amax / q8_max);
+            const s32: f32 = scale;
+            for (v, 0..) |e, i| {
+                const q: i32 = if (s32 == 0) 0 else std.math.clamp(@as(i32, @intFromFloat(@round(e / s32))), -q8_max, q8_max);
+                codes[r * k + b * q8_block + i] = @bitCast(@as(i8, @intCast(q)));
+            }
+            std.mem.writeInt(u16, scales[(r * (k / q8_block) + b) * 2 ..][0..2], @bitCast(scale), .little);
+        }
+    }
+}
+
 const Held = struct { ptr: u64, bytes: usize };
 
 pub const Weights = struct {
@@ -196,6 +235,8 @@ pub const Weights = struct {
     cross_kv_q: ?Dev = null,
     plan: budget.Budget = undefined,
     device_bytes: u64 = 0,
+    dense8: bool = false, // TF_INK2_DENSE8: the attention projections are stored 8-bit
+    head8: bool = false, // TF_INK2_HEAD8: the unembedding is stored 8-bit
     held: std.ArrayList(Held) = .empty,
     index: std.StringArrayHashMapUnmanaged(Dev) = .empty,
     arena: std.heap.ArenaAllocator,
@@ -226,13 +267,31 @@ pub const Weights = struct {
         }
     }
 
+    fn wantsQ8(w: *const Weights, item: Item) bool {
+        if (item.dtype != .bf16 or item.rank != 2) return false;
+        if (item.layer == null) return w.head8 and std.mem.eql(u8, item.key, "unembed.weight");
+        if (!w.dense8) return false;
+        for (dense8_keys) |k| if (std.mem.eql(u8, item.key, k)) return true;
+        return false;
+    }
+
     fn put(w: *Weights, item: Item, tensor: core.checkpoint.Tensor) !void {
         try w.held.ensureUnusedCapacity(w.gpa, 1);
-        const ptr = try w.up.vtable.alloc(w.up.ctx, tensor.bytes.len);
-        w.held.appendAssumeCapacity(.{ .ptr = ptr, .bytes = tensor.bytes.len });
-        try w.up.vtable.upload(w.up.ctx, ptr, tensor.bytes);
-        w.device_bytes += tensor.bytes.len;
-        var dev: Dev = .{ .ptr = ptr, .bytes = tensor.bytes.len, .dtype = tensor.dtype, .shape = @splat(0), .rank = tensor.rank };
+        const q8 = w.wantsQ8(item);
+        const n: usize = if (q8) tensor.shape[0] else 0;
+        const k: usize = if (q8) tensor.shape[1] else 0;
+        if (q8 and k % q8_block != 0) return error.WeightShape;
+        const bytes = if (q8) q8Bytes(n, k) else tensor.bytes.len;
+        const ptr = try w.up.vtable.alloc(w.up.ctx, bytes);
+        w.held.appendAssumeCapacity(.{ .ptr = ptr, .bytes = bytes });
+        if (q8) {
+            const host = try w.gpa.alloc(u8, bytes);
+            defer w.gpa.free(host);
+            quantQ8(tensor.bytes, n, k, host);
+            try w.up.vtable.upload(w.up.ctx, ptr, host);
+        } else try w.up.vtable.upload(w.up.ctx, ptr, tensor.bytes);
+        w.device_bytes += bytes;
+        var dev: Dev = .{ .ptr = ptr, .bytes = bytes, .dtype = tensor.dtype, .shape = @splat(0), .rank = tensor.rank, .q8 = q8 };
         for (tensor.shape[0..tensor.rank], 0..) |d, i| dev.shape[i] = d;
         try w.index.put(w.arena.allocator(), try w.arena.allocator().dupe(u8, item.llm_name), dev);
         try w.assign(item, dev);
@@ -378,6 +437,8 @@ pub fn loadDiag(gpa: std.mem.Allocator, io: std.Io, up: Uploader, dir: []const u
     var w: Weights = .{ .gpa = gpa, .up = up, .ck = try Checkpoint.openModel(gpa, io, dir), .cfg = undefined, .arena = std.heap.ArenaAllocator.init(gpa) };
     errdefer w.deinit();
     w.cfg = try readConfig(a, io, dir);
+    w.dense8 = try platform.environment.read(bool, dense8_env, false);
+    w.head8 = try platform.environment.read(bool, head8_env, false);
     const layers = w.cfg.text.layers;
     if (o.layers) |r| if (r.first > r.last or r.last >= layers) return error.BadLayerRange;
     w.first = if (o.layers) |r| r.first else 0;
@@ -750,4 +811,25 @@ test "deviceBytes excludes the tower always and the embedding only when it is re
     const file = try std.fmt.allocPrint(arena.allocator(), "{s}/model.safetensors", .{fx.dir});
     const on_disk = (try std.Io.Dir.cwd().statFile(t.io, file, .{})).size;
     try t.expect(on_disk > device); // the file also holds the tower
+}
+
+test "quantQ8 reconstructs each value within half a scale and keeps zero blocks zero" {
+    const n = 3;
+    const k = 64;
+    var src: [n * k * 2]u8 = undefined;
+    var rng = std.Random.DefaultPrng.init(7);
+    for (0..n * k) |i| {
+        const v: f32 = if (i / q8_block == 1) 0 else (rng.random().float(f32) - 0.5) * 0.2;
+        const bits: u16 = @truncate(@as(u32, @bitCast(v)) >> 16);
+        std.mem.writeInt(u16, src[i * 2 ..][0..2], bits, .little);
+    }
+    var out: [q8Bytes(n, k)]u8 = undefined;
+    quantQ8(&src, n, k, &out);
+    for (0..n * k) |i| {
+        const sc: f32 = @as(f16, @bitCast(std.mem.readInt(u16, out[n * k + (i / q8_block) * 2 ..][0..2], .little)));
+        const code: f32 = @floatFromInt(@as(i8, @bitCast(out[i])));
+        const want: f32 = @bitCast(@as(u32, std.mem.readInt(u16, src[i * 2 ..][0..2], .little)) << 16);
+        try t.expect(@abs(code * sc - want) <= sc * 0.5 + 1e-9);
+        if (i / q8_block == 1) try t.expectEqual(@as(f32, 0), code);
+    }
 }

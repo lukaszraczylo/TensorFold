@@ -27,8 +27,28 @@ pub fn logits(c: *engine.Ctx, s: cuda.Stream, h: u64, rows: usize, out_f32: u64)
     const t = &c.text;
     const w = try unembedding(t, c.w);
     const n: usize = t.unpadded_vocab;
-    try c.dense.rows(s, h, t.hidden, w, out_f32, n, rows, n, t.hidden);
+    if (c.w.unembed.q8) {
+        try logits8(c, s, h, rows, out_f32, w);
+    } else try c.dense.rows(s, h, t.hidden, w, out_f32, n, rows, n, t.hidden);
     try ops.softcap(&c.ops, s, out_f32, rows * n, t.logit_cap);
+}
+
+/// `logits` on the 8-bit unembedding: one row reads the codes directly, more rows expand `engine.dq_tile_rows` vocabulary rows
+/// to bf16 at a time for the prompt GEMM.
+fn logits8(c: *engine.Ctx, s: cuda.Stream, h: u64, rows: usize, out_f32: u64, w: u64) !void {
+    const t = &c.text;
+    const n: usize = t.unpadded_vocab;
+    const stored: usize = c.w.unembed.shape[0];
+    if (rows == 1) {
+        const seg: ops.DenseSeg = .{ .x = h, .w = w, .out = out_f32, .n = @intCast(n), .block0 = 0 };
+        return ops.dense1Q8(&c.ops, s, &.{seg}, t.hidden, true, stored);
+    }
+    var row0: usize = 0;
+    while (row0 < n) : (row0 += engine.dq_tile_rows) {
+        const tile = @min(engine.dq_tile_rows, n - row0);
+        try ops.q8ToBf16(&c.ops, s, w, stored, t.hidden, row0, tile, c.dq.ptr);
+        try c.dense.rows(s, h, t.hidden, c.dq.ptr, out_f32 + row0 * f32_bytes, n, rows, tile, t.hidden);
+    }
 }
 
 /// Rows `first_row..rows` of `h` [rows, hidden] as fp32 log-probs [rows - first_row, unpadded_vocab] in `out`: the logits of

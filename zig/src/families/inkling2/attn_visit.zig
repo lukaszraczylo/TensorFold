@@ -59,7 +59,10 @@ fn upload(c: *const engine.Ctx, s: cuda.Stream, addr: u64, items: anytype) !void
 fn linear(c: *const engine.Ctx, s: cuda.Stream, x: u64, w: Dev, rows: usize, n: usize, k: usize, out: u64) !void {
     try shaped(w, "linear", &.{ n, k });
     const tmp = c.scratch.r.tmp;
-    try c.dense.rows(s, x, k, w.ptr, tmp, n, rows, n, k);
+    if (w.q8) {
+        try ops.q8ToBf16(&c.ops, s, w.ptr, n, k, 0, n, c.dq.ptr);
+        try c.dense.rows(s, x, k, c.dq.ptr, tmp, n, rows, n, k);
+    } else try c.dense.rows(s, x, k, w.ptr, tmp, n, rows, n, k);
     try ops.tobf(&c.ops, s, tmp, rows, n, n, out, n, 0, n);
 }
 
@@ -80,6 +83,7 @@ fn linearsOneRow(c: *const engine.Ctx, s: cuda.Stream, x: [3]u64, lw: *const wei
         try shaped(p.w, "linear", &.{ p.n, hidden });
         sg.* = .{ .x = p.x, .w = p.w.ptr, .out = p.out, .n = @intCast(p.n), .block0 = 0 };
     }
+    if (lw.wq_du.q8) return ops.dense1Q8(&c.ops, s, &segs, hidden, false, 0);
     try ops.dense1(&c.ops, s, &segs, hidden);
 }
 
@@ -163,7 +167,8 @@ pub fn run(c: *engine.Ctx, s: cuda.Stream, v: visits.Visit, lw: *const weights.L
     try kernels.attend(&c.attn, s, call, layer, g.stride, g.slots(), r.q, kv, r.table, r.part_o, r.part_ml, r.sink, r.gate, r.out);
     if (rows == 1) {
         try shaped(lw.wo_ud, "linear", &.{ g.hidden, q_dim });
-        try ops.dense1(&c.ops, s, &.{.{ .x = r.out, .w = lw.wo_ud.ptr, .out = out, .n = @intCast(g.hidden), .block0 = 0 }}, q_dim);
+        const seg: ops.DenseSeg = .{ .x = r.out, .w = lw.wo_ud.ptr, .out = out, .n = @intCast(g.hidden), .block0 = 0 };
+        if (lw.wo_ud.q8) try ops.dense1Q8(&c.ops, s, &.{seg}, q_dim, false, 0) else try ops.dense1(&c.ops, s, &.{seg}, q_dim);
     } else {
         try linear(c, s, r.out, lw.wo_ud, rows, g.hidden, q_dim, out);
     }

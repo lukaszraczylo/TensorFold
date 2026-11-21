@@ -76,6 +76,8 @@ pub const Kernels = struct {
     top1: cuda.Function,
     tobf: cuda.Function,
     dense1: cuda.Function,
+    dense1_q8: cuda.Function,
+    q8_to_bf16: cuda.Function,
     put_words: cuda.Function,
     rewind: cuda.Function,
     race1: cuda.Function,
@@ -103,6 +105,8 @@ pub const Kernels = struct {
             .top1 = try mod.function("tf_ink2_top1"),
             .tobf = try mod.function("tf_ink2_tobf"),
             .dense1 = try mod.function("tf_ink2_dense1"),
+            .dense1_q8 = try mod.function("tf_ink2_dense1_q8"),
+            .q8_to_bf16 = try mod.function("tf_ink2_q8_to_bf16"),
             .put_words = try mod.function("tf_ink2_put_words"),
             .rewind = try mod.function("tf_ink2_conv_rewind"),
             .race1 = try mod.function("tf_ink2_race1"),
@@ -257,6 +261,33 @@ const dense_cols_per_block = 8;
 /// Up to `dense_max_segs` one-row projections with a shared `k`, in one launch, rounded to bf16 in the epilogue; each sum keeps
 /// tf_dense_rows_1's order, so the result equals that kernel followed by `tobf`.
 pub fn dense1(k: *const Kernels, s: cuda.Stream, segs: []const DenseSeg, kdim: usize) !void {
+    return dense1With(k, s, segs, kdim, null);
+}
+
+/// `dense1` on int8 weights (`weights.Dev.q8`: codes then fp16 block scales at `w`), each sum fp32. `f32_out` writes fp32 instead
+/// of bf16; `stored_rows` is the rows of the stored weight when a segment reads fewer (0: each segment's n).
+pub fn dense1Q8(k: *const Kernels, s: cuda.Stream, segs: []const DenseSeg, kdim: usize, f32_out: bool, stored_rows: usize) !void {
+    if (kdim % q8_block != 0) return error.Misaligned;
+    return dense1With(k, s, segs, kdim, .{ .f32_out = f32_out, .stored_rows = stored_rows });
+}
+
+/// Weights of one 8-bit scale: loop.cu's kQ8Block.
+pub const q8_block = 32;
+
+/// bf16 [rows, k] = codes times scales of rows `row0..row0 + rows` of the int8 weight `w` [n, k] into `out`.
+pub fn q8ToBf16(k: *const Kernels, s: cuda.Stream, w: u64, n: usize, kdim: usize, row0: usize, rows: usize, out: u64) !void {
+    if (kdim % q8_block != 0 or row0 + rows > n) return error.Misaligned;
+    var a: cuda.Args = .{};
+    a.add(w + row0 * kdim);
+    a.add(w + n * kdim + row0 * (kdim / q8_block) * 2);
+    a.add(out);
+    a.add(@as(i64, @intCast(rows * kdim)));
+    try go(k.q8_to_bf16, s, .{ .x = @intCast((rows * kdim + 255) / 256) }, 256, &a);
+}
+
+const Q8Mode = struct { f32_out: bool, stored_rows: usize };
+
+fn dense1With(k: *const Kernels, s: cuda.Stream, segs: []const DenseSeg, kdim: usize, q8: ?Q8Mode) !void {
     if (segs.len == 0 or segs.len > dense_max_segs) return error.BadSegments;
     if (kdim % 8 != 0) return error.Misaligned;
     var args_segs: DenseSegs = .{ .s = @splat(.{ .x = 0, .w = 0, .out = 0, .n = 0, .block0 = 0 }) };
@@ -271,6 +302,11 @@ pub fn dense1(k: *const Kernels, s: cuda.Stream, segs: []const DenseSeg, kdim: u
     a.add(args_segs);
     a.add(int(segs.len));
     a.add(int(kdim));
+    if (q8) |m| {
+        a.add(int(@intFromBool(m.f32_out)));
+        a.add(int(m.stored_rows));
+        return go(k.dense1_q8, s, .{ .x = @intCast(blocks) }, dense_cols_per_block * 32, &a);
+    }
     try go(k.dense1, s, .{ .x = @intCast(blocks) }, dense_cols_per_block * 32, &a);
 }
 
