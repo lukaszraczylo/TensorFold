@@ -470,3 +470,25 @@ extern "C" __global__ void tf_ink2l_ctl_blend(const float* dest, const float* ms
         out[(size_t)row * c + n] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(z[n], inv), __bfloat162float(norm_w[n])));
     }
 }
+
+// ---- Abliteration (ref.ablit.Ablit.apply): y -= (table[layer]) * Q (Q^T y) on one row a block, rank <= kAblitMaxRank ----
+// Warp j computes c_j = sum_i q[i, j] * y[i] (lane-strided fmaf chain, xor-shuffle tree); the update sums j in increasing order.
+constexpr int kAblitMaxRank = 8;
+
+extern "C" __global__ void tf_ink2l_ablit(const float* q, const float* table, __nv_bfloat16* y, int hidden, int rank, int layer) {
+    __shared__ float c[kAblitMaxRank];
+    const float s = table[layer];
+    if (s == 0.0f || rank > kAblitMaxRank) return;
+    __nv_bfloat16* row = y + (size_t)blockIdx.x * hidden;
+    const int warp = threadIdx.x >> 5;
+    if (warp < rank) {
+        const float dot = warpDot([&](int i) { return __bfloat162float(row[i]); }, [&](int i) { return q[(size_t)i * rank + warp]; }, hidden);
+        if ((threadIdx.x & 31) == 0) c[warp] = dot;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < hidden; i += kThreads) {
+        float acc = 0.0f;
+        for (int j = 0; j < rank; ++j) acc = __fadd_rn(acc, __fmul_rn(q[(size_t)i * rank + j], c[j]));
+        row[i] = __float2bfloat16_rn(__fsub_rn(__bfloat162float(row[i]), __fmul_rn(s, acc)));
+    }
+}

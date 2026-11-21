@@ -39,6 +39,7 @@ pub const Kernels = struct {
     msg: cuda.Function,
     ctl_down: cuda.Function,
     ctl_blend: cuda.Function,
+    ablit: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -60,6 +61,7 @@ pub const Kernels = struct {
             .msg = try mod.function("tf_ink2l_msg"),
             .ctl_down = try mod.function("tf_ink2l_ctl_down"),
             .ctl_blend = try mod.function("tf_ink2l_ctl_blend"),
+            .ablit = try mod.function("tf_ink2l_ablit"),
         };
     }
 
@@ -207,7 +209,7 @@ test "actq launches one block a row and refuses a width off the block" {
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     try actNvfp4(&k, s, 0x1000, 0x2000, 64, 2304);
     try std.testing.expectEqual(@as(u32, 64), Fake.grid_x);
@@ -239,7 +241,7 @@ test "expert stages pick the format's kernel and launch a block a pair by column
             return .{ .d = drv, .handle = @ptrFromInt(i) };
         }
     };
-    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14) };
+    const k: Kernels = .{ .mod = .{ .d = &d, .handle = null }, .fill = fun.of(&d, 1), .actq_nvfp4 = fun.of(&d, 2), .actq_mxfp8 = fun.of(&d, 3), .actq_nvfp4_codes = fun.of(&d, 4), .actq_mxfp8_codes = fun.of(&d, 5), .ex_gu_nvfp4 = fun.of(&d, 6), .ex_gu_mxfp8 = fun.of(&d, 7), .ex_down_nvfp4 = fun.of(&d, 8), .ex_down_mxfp8 = fun.of(&d, 9), .situ = fun.of(&d, 10), .ex_sum = fun.of(&d, 11), .msg = fun.of(&d, 12), .ctl_down = fun.of(&d, 13), .ctl_blend = fun.of(&d, 14), .ablit = fun.of(&d, 15) };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     const g: ExpertGemm = .{ .w = 1, .scale = 2 };
     try expertGateUp(&k, s, .nvfp4, 0, 0, g, 0, 4, 2304, 2304);

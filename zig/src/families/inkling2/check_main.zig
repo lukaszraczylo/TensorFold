@@ -2,6 +2,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const ink2 = @import("inkling2");
+const environment = @import("sys").environment;
 
 const usage =
     \\usage: tf-ink2-check <subcommand> --out DIR [options]
@@ -9,12 +10,16 @@ const usage =
     \\actq --in DIR: reads x_nvfp4_<k>.bf16 and x_mxfp8_<k>.bf16 (shapes in DIR/shapes.json), writes nvfp4_<k>.f32 and mxfp8_<k>.f32 (dequantised), nvfp4_values_/nvfp4_scales_/nvfp4_amax_<k>.f32, mxfp8_values_<k>.f32 and mxfp8_exps_<k>.u8
     \\moe --model DIR --layers L-L --rows N --in DIR: reads DIR/x.bf16 ([N, 2304]), runs layer L's routed MoE, writes out.bf16, pick.i32 ([N, 8]) and gamma.f32 ([N, 8])
     \\loop --model DIR --layer L --rows N --in DIR: reads bank.bf16 ([2, N, 2304]), dest.f32 ([N, 2304]) and norm.bf16 ([2304]), runs core layer L's four cross-pass messages and controllers, writes msgs.f32 ([4, N, 2304]) and ctl_<attn|k|v|mlp>.bf16 ([N, 2304])
+    \\ablit --file F --layer L --mult M --in DIR: reads DIR/y.bf16 ([N, 2304]), applies the edit file F at layer L with scale multiplier M, writes y.bf16
     \\weights --model DIR [--layers A-B] [--readback NAME,...]: uploads the text weights (TF_INK2_EMBED_HOST=1 keeps the
     \\    embedding on the host), writes DIR/weights.json with peak_rss_mib and device_bytes, and one row per readback
     \\    tensor (names below model.llm., e.g. layers.0.attn.wo_ud.weight)
     \\
 ;
 
+const loop_hidden = 2304;
+const loop_max_rows = 4096;
+const ink2_layers = 24;
 const embed_host_env = "TF_INK2_EMBED_HOST";
 const dev_context = 2048;
 const dev_chunk_rows = 64;
@@ -30,6 +35,8 @@ const Args = struct {
     readback: ?[]const u8 = null,
     rows: ?usize = null,
     layer: ?u32 = null,
+    file: ?[]const u8 = null,
+    mult: f32 = 1.0,
 };
 
 fn parseLayers(text: []const u8) !ink2.budget.LayerRange {
@@ -44,7 +51,7 @@ fn parseArgs(args: []const [:0]const u8) !Args {
     while (i < args.len) : (i += 2) {
         if (i + 1 >= args.len) return error.Usage;
         const v: []const u8 = args[i + 1];
-        if (std.mem.eql(u8, args[i], "--out")) a.out = v else if (std.mem.eql(u8, args[i], "--model")) a.model = v else if (std.mem.eql(u8, args[i], "--in")) a.in = v else if (std.mem.eql(u8, args[i], "--layers")) a.layers = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else return error.Usage;
+        if (std.mem.eql(u8, args[i], "--out")) a.out = v else if (std.mem.eql(u8, args[i], "--model")) a.model = v else if (std.mem.eql(u8, args[i], "--in")) a.in = v else if (std.mem.eql(u8, args[i], "--layers")) a.layers = try parseLayers(v) else if (std.mem.eql(u8, args[i], "--readback")) a.readback = v else if (std.mem.eql(u8, args[i], "--rows")) a.rows = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, args[i], "--layer")) a.layer = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, args[i], "--file")) a.file = v else if (std.mem.eql(u8, args[i], "--mult")) a.mult = try std.fmt.parseFloat(f32, v) else return error.Usage;
     }
     return a;
 }
@@ -87,6 +94,13 @@ pub fn main(init: std.process.Init) !u8 {
         try loopLayer(init, a, in, out);
         return 0;
     }
+    if (std.mem.eql(u8, a.sub, "ablit")) {
+        try ablitRows(init, a, a.in orelse {
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }, out);
+        return 0;
+    }
     if (std.mem.eql(u8, a.sub, "actq")) {
         try actq(init, a.in orelse {
             std.debug.print("{s}", .{usage});
@@ -117,7 +131,7 @@ fn weights(init: std.process.Init, a: Args, out: []const u8) !void {
     var ctx = try cuda.Context.init(&driver, 0);
     defer ctx.deinit();
 
-    const embed_host = if (init.environ_map.get(embed_host_env)) |v| std.mem.eql(u8, v, "1") else false;
+    const embed_host = try environment.read(bool, embed_host_env, false);
     const o: ink2.budget.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = dev_chunk_rows, .embed_host = embed_host, .layers = a.layers };
     var w = try ink2.weights.load(init.gpa, init.io, ink2.weights.deviceUploader(ctx.d), model, o, device_limit);
     defer w.deinit();
@@ -257,6 +271,46 @@ fn putDevice(gpa: std.mem.Allocator, rows_out: *ink2.check_rows.Writer, buf: *cu
     try rows_out.put(name, dtype, shape, host);
 }
 
+const ablit_y_name = "y.bf16";
+
+/// DIR/y.bf16 ([N, 2304]) through the edit file's layer `--layer`, scales times `--mult`; the result is written as y.
+fn ablitRows(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const file_path = a.file orelse return error.Usage;
+    const layer = a.layer orelse return error.Usage;
+    const hidden = loop_hidden;
+    var driver = try cuda.Driver.open();
+    defer driver.close();
+    var ctx = try cuda.Context.init(&driver, 0);
+    defer ctx.deinit();
+    var stream = try cuda.Stream.init(ctx.d, true);
+    defer stream.deinit();
+    var k = try ink2.loop_kernels.Kernels.load(ctx.d);
+    defer k.unload();
+
+    const edit = try ink2.ablit.load(gpa, io, file_path, hidden, ink2_layers);
+    defer edit.deinit(gpa);
+    var st = try ink2.ablit.upload(gpa, ctx.d, edit, a.mult);
+    defer ink2.ablit.close(&st, gpa);
+
+    const in_dir = try std.Io.Dir.cwd().openDir(io, in, .{});
+    defer in_dir.close(io);
+    const y_host = try in_dir.readFileAlloc(io, ablit_y_name, gpa, .limited(loop_max_rows * hidden * 2 + 1));
+    defer gpa.free(y_host);
+    if (y_host.len == 0 or y_host.len % (hidden * 2) != 0) return error.ShapeMismatch;
+    const rows = y_host.len / (hidden * 2);
+    var y = try cuda.DeviceBuffer.fromHost(ctx.d, y_host);
+    defer y.free();
+    try ink2.ablit.apply(&k, &st, stream, layer, y.ptr, rows, hidden);
+    try stream.synchronize();
+
+    var rows_out = try ink2.check_rows.Writer.init(gpa, io, out);
+    defer rows_out.deinit();
+    try putDevice(gpa, &rows_out, &y, "y", .{}, .bf16, &.{ rows, hidden });
+    try rows_out.finish();
+}
+
 const moe_x_name = "x.bf16";
 const moe_max_rows = 16;
 
@@ -282,7 +336,7 @@ fn moe(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !void {
     var op = try ink2.ops.Kernels.load(ctx.d);
     defer op.unload();
 
-    const embed_host = if (init.environ_map.get(embed_host_env)) |v| std.mem.eql(u8, v, "1") else false;
+    const embed_host = try environment.read(bool, embed_host_env, false);
     const o: ink2.budget.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = dev_chunk_rows, .embed_host = embed_host, .layers = a.layers };
     var w = try ink2.weights.load(gpa, io, ink2.weights.deviceUploader(ctx.d), model, o, device_limit);
     defer w.deinit();
@@ -312,8 +366,6 @@ fn moe(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !void {
     try rows_out.finish();
 }
 
-const loop_hidden = 2304;
-const loop_max_rows = 4096;
 
 /// DIR/name must hold exactly `bytes`; returns it on the device.
 fn uploadFile(d: *const cuda.Driver, gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: usize) !cuda.DeviceBuffer {
@@ -343,7 +395,7 @@ fn loopLayer(init: std.process.Init, a: Args, in: []const u8, out: []const u8) !
     var k = try lk.Kernels.load(ctx.d);
     defer k.unload();
 
-    const embed_host = if (init.environ_map.get(embed_host_env)) |v| std.mem.eql(u8, v, "1") else false;
+    const embed_host = try environment.read(bool, embed_host_env, false);
     const o: ink2.budget.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = dev_chunk_rows, .embed_host = embed_host, .layers = .{ .first = layer, .last = layer } };
     var w = try ink2.weights.load(gpa, io, ink2.weights.deviceUploader(ctx.d), model, o, device_limit);
     defer w.deinit();

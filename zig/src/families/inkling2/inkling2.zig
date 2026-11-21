@@ -14,6 +14,7 @@ pub const weights = @import("weights.zig");
 pub const moe = @import("moe.zig");
 pub const bank = @import("bank.zig");
 pub const proc_status = @import("proc_status.zig");
+pub const ablit = @import("ablit.zig");
 
 /// config.json's name in the release.
 pub const model_type = "inkling2";
@@ -33,4 +34,5 @@ test {
     _ = moe;
     _ = bank;
     _ = proc_status;
+    _ = ablit;
 }
