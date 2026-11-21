@@ -121,3 +121,37 @@ test "a scoring function, a layer count, a quantization_config and a root that t
     try t.expectError(error.BadConfig, config.parse(t.allocator, "{", &why));
     try t.expectEqualStrings("config.json is not JSON", why.text());
 }
+
+pub const mini = @embedFile("fixtures/mini_config.json");
+
+test "mini parses as a loop model" {
+    var why: config.Why = .{};
+    const c = try config.parse(t.allocator, mini, &why);
+    try t.expectEqual(config.Loop{ .core_start = 6, .core_end = 18, .passes = 3, .gate_rank = 64 }, c.loop.?);
+    try t.expectEqual(@as(u32, 24), c.text.layers);
+    try t.expectEqual(@as(u32, 2304), c.text.hidden);
+    try t.expectEqual(@as(u32, 128), c.text.experts);
+    try t.expectEqual(@as(u32, 8), c.text.topk);
+    try t.expectEqual(@as(u32, 1152), c.text.expert_inter);
+    try t.expectEqual(@as(u32, 24), c.text.heads(5).q);
+    try t.expectEqual(@as(u32, 8), c.text.heads(5).kv);
+    try t.expectEqual(@as(u32, 200006), c.eos);
+    try t.expect(c.mtp == null);
+    try t.expectEqual(@as(u32, 48), c.loop.?.visitCount(24));
+}
+
+test "small still parses with no loop" {
+    var why: config.Why = .{};
+    const c = try config.parse(t.allocator, tiny, &why);
+    try t.expect(c.loop == null);
+    try t.expect(c.mtp != null);
+}
+
+test "the loop pair's refusals name their key" {
+    try refused(mini, "\"is_varloop\": false", "\"is_varloop\": true", error.Unsupported, "is_varloop");
+    try refused(mini, "\"core_end\": 18", "\"core_end\": 25", error.Layout, "core_end");
+    try refused(mini, "\"core_start\": 6", "\"core_start\": 7", error.Layout, "block");
+    try refused(mini, "\"num_passes\": 3", "\"num_passes\": 0", error.BadConfig, "num_passes");
+    try refused(mini, "\"model_type\": \"inkling2_loop\"", "\"model_type\": \"inkling2\"", error.NotInkling2, "not an Inkling 2 checkpoint");
+    try refused(tiny, "\"model_type\": \"inkling2\"", "\"model_type\": \"inkling2_loop\"", error.NotInkling2, "not an Inkling 2 checkpoint");
+}

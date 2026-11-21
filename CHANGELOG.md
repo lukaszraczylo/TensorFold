@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Inkling 2: the host config accepts the looped `inkling2_loop` checkpoint (Inkling 2 Mini) and reads its core range, pass count and gate rank; a variable-depth loop or a core range off the attention-residual blocks is refused by name (refs #3476). Thanks to @ajensenwaud.
+
 - Server: Inkling 2 replies split into reasoning, text and tool calls by vLLM's block table. Each tool call takes the request's id, and a stream holds a block header back until the block names its kind (refs #3476). Thanks to @ajensenwaud.
 
 - GLM-5.3-Flash on CUDA at tensor-parallel widths where a rank's fused KDA input is not a multiple of eight columns (TP=3, 5, 6 or 7): the stack is padded at load to its own width rounded up to eight columns and stays row-major bf16, so prompt windows take the staged B16 tiles with every byte as before; `TF_GLM_KDA_PAD=1` still tiles the stack for glm_mm (#3697, for #3516). Thanks to @ultradaoto.

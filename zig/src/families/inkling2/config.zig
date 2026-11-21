@@ -100,10 +100,29 @@ pub const Vision = struct {
     text_hidden: u32,
 };
 
+pub const model_type = "inkling2";
+pub const arch = "Inkling2ForConditionalGeneration";
+pub const model_type_loop = "inkling2_loop";
+pub const arch_loop = "Inkling2LoopForConditionalGeneration";
+
+/// A looped model runs layers core_start..core_end `passes` times; the layers outside run once.
+pub const Loop = struct {
+    core_start: u32,
+    core_end: u32,
+    passes: u32,
+    gate_rank: u32,
+
+    /// Layer visits in one forward over a model of `layers` layers.
+    pub fn visitCount(l: Loop, layers: u32) u32 {
+        return l.core_start + (l.core_end - l.core_start) * l.passes + (layers - l.core_end);
+    }
+};
+
 pub const Config = struct {
     text: Text,
     vision: Vision,
     mtp: ?Mtp,
+    loop: ?Loop,
     eos: u32,
     image_token: u32,
 };
@@ -321,6 +340,25 @@ fn parseMtp(o: std.json.ObjectMap, t: *const Text, why: *Why) !Mtp {
     return m;
 }
 
+fn parseLoop(o: std.json.ObjectMap, t: *const Text, why: *Why) !Loop {
+    try fixed(o, "is_varloop", false, why);
+    const l: Loop = .{
+        .core_start = try int(o, "core_start", why),
+        .core_end = try int(o, "core_end", why),
+        .passes = try int(o, "num_passes", why),
+        .gate_rank = try int(o, "gate_rank", why),
+    };
+    if (l.core_end > t.layers or l.core_start >= l.core_end) {
+        why.set("loop_config: core_start {d} and core_end {d} must give a non-empty range inside the {d} layers", .{ l.core_start, l.core_end, t.layers });
+        return error.Layout;
+    }
+    if (l.core_start % t.block != 0 or l.core_end % t.block != 0) {
+        why.set("loop_config: core_start {d} and core_end {d} must fall on a {d}-layer attention-residual block boundary", .{ l.core_start, l.core_end, t.block });
+        return error.Layout;
+    }
+    return l;
+}
+
 /// A quantization_config in config.json must be ModelOpt NVFP4, which the experts' header dtype refines per layer.
 fn quantization(o: std.json.ObjectMap, why: *Why) !void {
     const v = o.get("quantization_config") orelse return;
@@ -348,11 +386,16 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, why: *Why) !Config {
         return error.BadConfig;
     }
     const o = parsed.value.object;
-    const arch = o.get("architectures");
-    const ok = arch != null and arch.? == .array and arch.?.array.items.len == 1 and arch.?.array.items[0] == .string and
-        std.mem.eql(u8, arch.?.array.items[0].string, "Inkling2ForConditionalGeneration");
-    if (!ok or !std.mem.eql(u8, text(o, "model_type") orelse "", "inkling2")) {
-        why.set("not an Inkling 2 checkpoint: architectures Inkling2ForConditionalGeneration, model_type inkling2", .{});
+    const names = o.get("architectures");
+    const arch_name: []const u8 = if (names != null and names.? == .array and names.?.array.items.len == 1 and names.?.array.items[0] == .string)
+        names.?.array.items[0].string
+    else
+        "";
+    const kind = text(o, "model_type") orelse "";
+    const is_loop = std.mem.eql(u8, arch_name, arch_loop) and std.mem.eql(u8, kind, model_type_loop);
+    const is_plain = std.mem.eql(u8, arch_name, arch) and std.mem.eql(u8, kind, model_type);
+    if (!is_loop and !is_plain) {
+        why.set("not an Inkling 2 checkpoint: architectures {s} with model_type {s}, or {s} with {s}", .{ arch, model_type, arch_loop, model_type_loop });
         return error.NotInkling2;
     }
     try fixed(o, "tie_word_embeddings", false, why);
@@ -363,12 +406,14 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8, why: *Why) !Config {
         why.set("eos_token_id is not a token of the {d}-token vocabulary", .{t.vocab});
         return error.BadConfig;
     }
-    const mtp = if (o.get("mtp_config") != null) try parseMtp(try object(o, "mtp_config", why), &t, why) else null;
+    const loop = if (is_loop) try parseLoop(try object(try object(o, "text_config", why), "loop_config", why), &t, why) else null;
+    const mtp = if (is_loop) null else if (o.get("mtp_config") != null) try parseMtp(try object(o, "mtp_config", why), &t, why) else null;
     const image = if (o.get("image_token_id") != null) try int(o, "image_token_id", why) else default_image_token;
     return .{
         .text = t,
         .vision = try parseVision(try object(o, "vision_config", why), t.hidden, why),
         .mtp = mtp,
+        .loop = loop,
         .eos = eos,
         .image_token = image,
     };
