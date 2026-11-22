@@ -448,7 +448,9 @@ pub const HfText = struct {
             return error.Template;
         };
         const open = options.add_generation_prompt and inkling_chat and !std.mem.endsWith(u8, out.s, inkling.model);
-        return .{ .text = if (open) try std.mem.concat(a, u8, &.{ out.s, inkling.model }) else out.s, .spans = out.spans };
+        // effort 0 alone leaves the model free to open a thinking block; thinking off starts the text block itself
+        const tail = if (open and !options.enable_thinking) inkling.model ++ inkling.text else inkling.model;
+        return .{ .text = if (open) try std.mem.concat(a, u8, &.{ out.s, tail }) else out.s, .spans = out.spans };
     }
 
     /// Inkling 2's tokenizer holds the block markers; its template never opens the model turn, so the render does.
@@ -494,7 +496,8 @@ test "a chat render opens the model turn only for a tokenizer that holds both In
     var other = try testText(a, src, &.{inkling.end_sampling});
     try std.testing.expectEqualStrings("[hi]", try renderText(a, &other, msgs, null, .{}));
     var both = try testText(a, src, &both_markers);
-    try std.testing.expectEqualStrings("[hi]" ++ inkling.model, try renderText(a, &both, msgs, null, .{}));
+    try std.testing.expectEqualStrings("[hi]" ++ inkling.model, try renderText(a, &both, msgs, null, .{ .enable_thinking = true }));
+    try std.testing.expectEqualStrings("[hi]" ++ inkling.model ++ inkling.text, try renderText(a, &both, msgs, null, .{}));
     try std.testing.expectEqualStrings("[hi]", try renderText(a, &both, msgs, null, .{ .add_generation_prompt = false }));
 }
 
@@ -533,8 +536,9 @@ test "the Inkling template renders as the reference does: assistant-last, tool t
     const hi = "[{\"role\":\"user\",\"content\":\"Hi\"}]";
     const tail = "<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|>";
     // thinking off with no named effort is effort 0, not the template default
-    try std.testing.expectEqualStrings(sys ++ "0" ++ tail, try renderText(a, &t, hi, null, .{ .enable_thinking = false }));
-    try std.testing.expectEqualStrings(sys ++ "0.2" ++ tail, try renderText(a, &t, hi, null, .{ .enable_thinking = false, .reasoning_effort = "low" }));
+    try std.testing.expectEqualStrings(sys ++ "0" ++ tail ++ inkling.text, try renderText(a, &t, hi, null, .{ .enable_thinking = false }));
+    try std.testing.expectEqualStrings(sys ++ "0.2" ++ tail ++ inkling.text, try renderText(a, &t, hi, null, .{ .enable_thinking = false, .reasoning_effort = "low" }));
+    try std.testing.expectEqualStrings(sys ++ "0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>", try renderText(a, &t, hi, null, .{ .enable_thinking = false, .add_generation_prompt = false }));
     try std.testing.expectEqualStrings(sys ++ "0.9" ++ tail, try renderText(a, &t, hi, null, .{ .enable_thinking = true }));
 }
 
