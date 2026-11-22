@@ -11,7 +11,7 @@ namespace ink2p {
 
 constexpr int kWarps = 4;
 constexpr int kTj = 4;                       // n8 tiles a warp computes
-constexpr int kMt = 2;                       // m16 tiles a warp computes
+constexpr int kMt = 4;                       // m16 tiles a warp computes
 constexpr int kPairs = 16 * kMt;             // pairs of one expert a block holds
 constexpr int kBlockCols = kWarps * kTj * 8; // output columns a block computes
 constexpr float kNvOuter = 1536.0f;

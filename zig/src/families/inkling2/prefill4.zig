@@ -16,7 +16,7 @@ const hidden = 2304;
 const inter = 1152;
 const warps = 4;
 const tile_cols = warps * 4 * 8;
-const tile_pairs = 32;
+const tile_pairs = 64;
 const nvfp4_block = 16;
 const slots = loop_kernels.expert_slots;
 
