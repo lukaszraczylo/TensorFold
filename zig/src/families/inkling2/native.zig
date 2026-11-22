@@ -79,6 +79,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (kernels != null) return error.CapturedKernels;
     const embed_host = try platform.environment.read(bool, embed_host_env, false);
     const mtp = try platform.environment.read(bool, drafter.enable_env, false);
+    const kv8 = try platform.environment.read(bool, cache.kv8_env, false);
     const room: u64 = if (o.room) |r| r.read(r.ctx) orelse 0 else std.math.maxInt(u64);
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
@@ -88,7 +89,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const context = try clampContext(gpa, io, dir, o.context);
     var n: u32 = @max(o.lanes, 1);
     while (true) {
-        const wo: budget.Options = .{ .context = context, .streams = n, .chunk_rows = prompt_rows, .embed_host = embed_host };
+        const wo: budget.Options = .{ .context = context, .streams = n, .chunk_rows = prompt_rows, .embed_host = embed_host, .kv8 = kv8 };
         const draft_bytes: u64 = if (mtp) try draftBytes(gpa, io, dir, n) else 0;
         own.w = weights.load(gpa, io, weights.deviceUploader(ctx.d), dir, wo, room -| draft_bytes) catch |e| {
             if (e != error.OverBudget or o.lanes_fixed or n == 1) return e;
@@ -102,7 +103,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const text = &own.w.cfg.text;
     const layers = try plan.build(text, own.w.prec[0..text.layers]);
     own.sched = try visits.build(&own.w.cfg, &layers);
-    const co: cache.Options = .{ .context = context, .streams = n, .chunk_rows = prompt_rows };
+    const co: cache.Options = .{ .context = context, .streams = n, .chunk_rows = prompt_rows, .kv8 = kv8 };
     own.cache = try cache.Cache.init(ctx.d, &own.sched, text, co);
     errdefer own.cache.deinit();
     own.c.init(gpa, io, ctx.d, &own.w, own.sched, &own.cache, co) catch |e| return if (e == error.FileNotFound) error.AblitFileMissing else e; // the only file `Ctx.init` reads
@@ -113,7 +114,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .backend = own.ib.backend(),
         .facts = own.ib.facts(),
         .rows = if (mtp) be.mtp_rows else window_rows,
-        .stream_bytes = @intCast(cache.bytes(&own.sched, text, .{ .context = context, .streams = 1, .chunk_rows = prompt_rows })),
+        .stream_bytes = @intCast(cache.bytes(&own.sched, text, .{ .context = context, .streams = 1, .chunk_rows = prompt_rows, .kv8 = kv8 })),
         .free_streams = n,
         .ctx = own,
         .deinit = release,
@@ -164,7 +165,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.ZeroMaxContext => "the checkpoint's config.json gives model_max_length 0: it must be a positive token count",
         error.CapturedKernels => "Inkling 2 Mini runs on the engine's own kernels: unset TENSORFOLD_CUDA_KERNELS",
         error.OverBudget => "the CUDA memory budget does not hold Inkling 2 Mini's weights, caches and scratch at this --context and --parallel: lower either one, set TF_INK2_EMBED_HOST=1 to read the embedding rows from the host, or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB",
-        error.InvalidEnvironment => "a TF_INK2_* setting is invalid: TF_INK2_EMBED_HOST and TF_INK2_MTP are 0 or 1, TF_INK2_ABLIT a file path (or 0), TF_INK2_ABLIT_SCALE a number above 0 and up to 16",
+        error.InvalidEnvironment => "a TF_INK2_* setting is invalid: TF_INK2_EMBED_HOST, TF_INK2_MTP and TF_INK2_KV8 are 0 or 1, TF_INK2_ABLIT a file path (or 0), TF_INK2_ABLIT_SCALE a number above 0 and up to 16",
         error.AblitFileMissing => "TF_INK2_ABLIT names a file that does not exist: give the path of the TFINK2A1 edit file, or unset it",
         error.BadSize => "TF_INK2_ABLIT: the edit file's size does not match its header or this model",
         error.BadMagic => "TF_INK2_ABLIT: the file is not a TFINK2A1 edit file",

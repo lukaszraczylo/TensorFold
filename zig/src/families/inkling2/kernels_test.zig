@@ -52,15 +52,32 @@ const Fake = struct {
     }
 };
 
+fn fakeFun(drv: *const cuda.Driver, i: usize) cuda.Function {
+    return .{ .d = drv, .handle = @ptrFromInt(i) };
+}
+
+/// The bf16 kernels are handles 1..4 (attn, attn_fold and attn_prompt share 3), the 8-bit ones 5 (prep) and 6 (attention).
+fn fakeKernels(d: *const cuda.Driver) k.Kernels {
+    return .{
+        .mod = .{ .d = d, .handle = null },
+        .prep = fakeFun(d, 1),
+        .rel_table = fakeFun(d, 2),
+        .attn = fakeFun(d, 3),
+        .merge = fakeFun(d, 4),
+        .attn_fold = fakeFun(d, 3),
+        .pmod = .{ .d = d, .handle = null },
+        .attn_prompt = fakeFun(d, 3),
+        .prep_q8 = fakeFun(d, 5),
+        .attn_q8 = fakeFun(d, 6),
+        .attn_fold_q8 = fakeFun(d, 6),
+        .attn_prompt_q8 = fakeFun(d, 6),
+    };
+}
+
 test "inkling2 kernels: one decode row at 1M splits 64 chunks into sub-chunks for each of a rank's 4 key heads" {
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Fake.launch;
-    const fun = struct {
-        fn of(drv: *const cuda.Driver, i: usize) cuda.Function {
-            return .{ .d = drv, .handle = @ptrFromInt(i) };
-        }
-    };
-    const kern: k.Kernels = .{ .mod = .{ .d = &d, .handle = null }, .prep = fun.of(&d, 1), .rel_table = fun.of(&d, 2), .attn = fun.of(&d, 3), .merge = fun.of(&d, 4), .attn_fold = fun.of(&d, 3), .pmod = .{ .d = &d, .handle = null }, .attn_prompt = fun.of(&d, 3) };
+    const kern = fakeKernels(&d);
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     const r: k.Rows = .{ .rows = 1, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 1, .last_pos = 1048575 };
     const l = k.Layer.global(1048576);
@@ -97,6 +114,54 @@ test "inkling2 kernels: one decode row at 1M splits 64 chunks into sub-chunks fo
 test "inkling2 kernels: a stream's caches are 256 bytes a key head and token" {
     try t.expectEqual(@as(usize, 1048576 * 4 * 256), k.Layer.global(1048576).cacheBytes(4));
     try t.expectEqual(k.Layer.sliding(1024, 2048).cacheBytes(4), 3072 * 4 * 256);
+}
+
+test "inkling2 kernels: an 8-bit global cache is a token and key head's 128 codes and one fp32 scale" {
+    const l = k.Layer.globalOf(1048576, true);
+    try t.expectEqual(@as(usize, 1048576 * 4 * 132), l.cacheBytes(4));
+    try t.expectEqual(@as(usize, 1048576 * 4 * 128), l.scalesAt(4));
+    try t.expectEqual(k.Layer.global(1048576).ring, l.ring);
+    try t.expect(l.tau and l.window == 0 and l.q8);
+    try t.expect(!k.Layer.globalOf(1048576, false).q8);
+    try t.expectEqual(k.Layer.global(1048576), k.Layer.globalOf(1048576, false));
+    try t.expect(!k.Layer.sliding(1024, 512).q8);
+}
+
+test "inkling2 kernels: an 8-bit layer launches the 8-bit prep and each 8-bit attention path, a bf16 one none of them" {
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Fake.launch;
+    const kern = fakeKernels(&d);
+    const s: cuda.Stream = .{ .d = &d, .handle = null };
+    const r: k.Rows = .{ .rows = 1, .heads = 24, .kv_heads = 4, .pos = 0, .seg_of = 0, .segs = 0, .tiles = 0, .n_tiles = 1, .last_pos = 1048575 };
+    const cfg: k.Prep = .{ .qk_clip = 22.6, .rel_clip = 8, .floor = 128000, .alpha = 0.1, .eps = 1e-6 };
+    const none: k.Cache = .{ .k = 0, .v = 0 };
+    const all = 24 * 64 * k.subs;
+    const q8 = k.Layer.globalOf(1048576, true);
+    Fake.grids[4] = .{ 0, 0, 0 };
+    Fake.grids[5] = .{ 0, 0, 0 };
+    try k.prep(&kern, s, r, q8, cfg, .{ 0, 0, 0, 0 }, .{ 0, 0 }, 0, 0, none);
+    try t.expectEqual([3]u32{ 1, 32, 1 }, Fake.grids[4]);
+    // split decode, one stream's prompt kernel, the two-stream fold: each takes the 8-bit function
+    var cases = [_]struct { rows: u32, streams: u32, slots: usize, grid: [3]u32 }{
+        .{ .rows = 1, .streams = 1, .slots = all, .grid = .{ 1, 4, 64 * k.subs } },
+        .{ .rows = 1, .streams = 1, .slots = all - 1, .grid = .{ 1, 4, 64 } },
+        .{ .rows = 1, .streams = 2, .slots = all - 1, .grid = .{ 1, 4, 64 } },
+    };
+    for (&cases) |*c| {
+        var call = r;
+        call.rows = c.rows;
+        call.streams = c.streams;
+        Fake.grids[5] = .{ 0, 0, 0 };
+        Fake.grids[2] = .{ 0, 0, 0 };
+        try k.attend(&kern, s, call, q8, 64, c.slots, 0, none, 0, 0, 0, 0, 0, 0);
+        try t.expectEqual(c.grid, Fake.grids[5]);
+        try t.expectEqual([3]u32{ 0, 0, 0 }, Fake.grids[2]);
+    }
+    Fake.grids[2] = .{ 0, 0, 0 };
+    Fake.grids[5] = .{ 0, 0, 0 };
+    try k.attend(&kern, s, r, k.Layer.global(1048576), 64, all, 0, none, 0, 0, 0, 0, 0, 0);
+    try t.expectEqual([3]u32{ 1, 4, 64 * k.subs }, Fake.grids[2]);
+    try t.expectEqual([3]u32{ 0, 0, 0 }, Fake.grids[5]);
 }
 
 test "inkling2 kernels: sliding partials are a row's window at any depth, a tile's launch a fixed chunk count" {

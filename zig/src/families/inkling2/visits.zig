@@ -58,11 +58,11 @@ pub fn convBytes(c: *const config.Text) usize {
     return (config.conv_taps - 1) * (2 * kv_dim + 2 * @as(usize, c.hidden)) * 2;
 }
 
-/// All visits' K and V caches for one stream of `rows`-row calls over `context` tokens.
-pub fn kvBytes(s: *const Schedule, c: *const config.Text, context: usize, rows: u32) usize {
+/// All visits' K and V caches for one stream of `rows`-row calls over `context` tokens; the global ones 8-bit when `kv8`.
+pub fn kvBytes(s: *const Schedule, c: *const config.Text, context: usize, rows: u32, kv8: bool) usize {
     var total: usize = 0;
     for (s.visits[0..s.n]) |v| {
-        const layer = if (v.global) kernels.Layer.global(@intCast(context)) else kernels.Layer.sliding(c.window, rows);
+        const layer = if (v.global) kernels.Layer.globalOf(@intCast(context), kv8) else kernels.Layer.sliding(c.window, rows);
         total += layer.cacheBytes(c.heads(v.layer).kv) * 2;
     }
     return total;
@@ -136,8 +136,10 @@ test "restart flags" {
 test "sizes" {
     const m = try mini();
     try t.expectEqual(@as(usize, 39936), convBytes(&m.fx.cfg.text));
-    try t.expectEqual(@as(usize, 2_399_141_888), kvBytes(&m.s, &m.fx.cfg.text, 65536, 512));
-    try t.expectEqual(@as(usize, 8 * 65536 * 4096 + 40 * 1536 * 4096), kvBytes(&m.s, &m.fx.cfg.text, 65536, 512));
+    try t.expectEqual(@as(usize, 2_399_141_888), kvBytes(&m.s, &m.fx.cfg.text, 65536, 512, false));
+    try t.expectEqual(@as(usize, 8 * 65536 * 4096 + 40 * 1536 * 4096), kvBytes(&m.s, &m.fx.cfg.text, 65536, 512, false));
+    // 8-bit global caches: 8 visits x 65536 tokens x 8 heads x 2 (K, V) x (128 codes + 4 scale bytes)
+    try t.expectEqual(@as(usize, 8 * 65536 * 8 * 2 * 132 + 40 * 1536 * 4096), kvBytes(&m.s, &m.fx.cfg.text, 65536, 512, true));
 }
 
 test "small is refused" {

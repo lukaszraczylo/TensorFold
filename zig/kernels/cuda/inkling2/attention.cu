@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 
+#include "common/ink2_kv8.cuh"
 #include "common/qmm_frag.cuh"
 
 namespace ink2 {
@@ -43,6 +44,8 @@ __device__ __forceinline__ void clip(float* x, float thr) {
 }
 
 // Per row and head: q = clip(q * q_scale) (* tau), rel = clip(rel * rel_scale) (* tau), k = clip(k), v = rms(v).
+// Q8: k and v rows go to the cache as int8 codes and an fp32 scale, quantised from their bf16 values (ink2_kv8.cuh).
+template <bool Q8>
 __device__ __forceinline__ void prepRow(const uint16_t* __restrict__ q_raw, const uint16_t* __restrict__ k_raw,
                                         const uint16_t* __restrict__ v_raw, const uint16_t* __restrict__ rel_raw,
                                         const uint16_t* __restrict__ q_scale, const uint16_t* __restrict__ rel_scale,
@@ -84,6 +87,16 @@ __device__ __forceinline__ void prepRow(const uint16_t* __restrict__ q_raw, cons
         for (int i = 0; i < 4; ++i) x[i] *= r;
     }
     const Seg s = segs[rseg[row]];
+    if (Q8) {  // Seg.off is 0 in every call: a q8 cache is one stream's block, addressed by the caller
+        float v[4], scale;
+        for (int i = 0; i < 4; ++i) v[i] = bf(tobf(x[i]));
+        const uint32_t codes = ink2kv8::quant4(v, scale);
+        int8_t* base = reinterpret_cast<int8_t*>(key ? kc : vc);
+        const size_t slot = static_cast<size_t>(h) * ring + pos % ring;
+        *reinterpret_cast<uint32_t*>(base + slot * kDim + lane * 4) = codes;
+        if (lane == 0) reinterpret_cast<float*>(base + static_cast<size_t>(kv_heads) * ring * kDim)[slot] = scale;
+        return;
+    }
     uint16_t* dst = (key ? kc : vc) + s.off + (static_cast<size_t>(h) * ring + pos % ring) * kDim;
     for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = tobf(x[i]);
 }
@@ -104,7 +117,11 @@ using ink2::Seg;
         ring, global, qk_clip, rel_clip, floor_pos, alpha, eps
 
 extern "C" __global__ void tf_ink2_prep(TF_INK2_PREP_ARGS) {
-    ink2::prepRow(TF_INK2_PREP_PASS);
+    ink2::prepRow<false>(TF_INK2_PREP_PASS);
+}
+
+extern "C" __global__ void tf_ink2_prep_q8(TF_INK2_PREP_ARGS) {
+    ink2::prepRow<true>(TF_INK2_PREP_PASS);
 }
 
 // tab[row, head, d] = bf16(rel[row, head, :] . proj[:, d]) for d < 1024, fp32 sums in tap order (rel_logits_proj).
@@ -140,7 +157,8 @@ __device__ __forceinline__ float scaled(float o, float a, float p, float b) {
 }
 
 // 64 (row, head) pairs of a key head over a block's keys (FOLD: a global chunk, split: a sub-chunk, else a chunk).
-template <bool FOLD>
+// Q8: the caches are int8 codes and fp32 scales, widened to the bf16 tiles as they load.
+template <bool FOLD, bool Q8>
 __device__ __forceinline__ void attnTile(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
                                          const uint16_t* __restrict__ vc, const uint16_t* __restrict__ tab,
                                          const Seg* __restrict__ segs, const int2* __restrict__ tiles,
@@ -211,8 +229,16 @@ __device__ __forceinline__ void attnTile(const uint16_t* __restrict__ q, const u
                 uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
                 if (kp >= k_lo && kp <= k_hi) {
                     const size_t at = head_base + (slot0 + key) * kDim + col;
-                    kv = *reinterpret_cast<const uint4*>(kc + at);
-                    vv = *reinterpret_cast<const uint4*>(vc + at);
+                    if (Q8) {
+                        const size_t slot = static_cast<size_t>(kvh) * ring + slot0 + key;
+                        kv = ink2kv8::dequant8(*reinterpret_cast<const uint2*>(reinterpret_cast<const int8_t*>(kc) + at),
+                                               ink2kv8::scales(kc, kv_heads, ring)[slot]);
+                        vv = ink2kv8::dequant8(*reinterpret_cast<const uint2*>(reinterpret_cast<const int8_t*>(vc) + at),
+                                               ink2kv8::scales(vc, kv_heads, ring)[slot]);
+                    } else {
+                        kv = *reinterpret_cast<const uint4*>(kc + at);
+                        vv = *reinterpret_cast<const uint4*>(vc + at);
+                    }
                 }
                 *reinterpret_cast<uint4*>(ks + key * kPad + col) = kv;
                 *reinterpret_cast<uint4*>(vs + key * kPad + col) = vv;
@@ -311,30 +337,57 @@ __device__ __forceinline__ void attnTile(const uint16_t* __restrict__ q, const u
 
 }  // namespace ink2
 
-// Sliding layers (a chunk a block) and split global calls (a sub-chunk a block, `chunks` partials a row and head).
-extern "C" __global__ void __launch_bounds__(128)
-    tf_ink2_attn(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
-                 const uint16_t* __restrict__ tab, const Seg* __restrict__ segs, const int2* __restrict__ tiles,
-                 float* __restrict__ part_o, float2* __restrict__ part_ml, int heads, int kv_heads, int ring,
-                 int window, int chunk, int c0, int chunks, float scale, int split) {
-    using namespace ink2;
+#define TF_INK2_ATTN_ARGS                                                                                          \
+    const uint16_t *__restrict__ q, const uint16_t *__restrict__ kc, const uint16_t *__restrict__ vc,              \
+        const uint16_t *__restrict__ tab, const Seg *__restrict__ segs, const int2 *__restrict__ tiles,            \
+        float *__restrict__ part_o, float2 *__restrict__ part_ml, int heads, int kv_heads, int ring, int window,   \
+        int chunk, int c0, int chunks, float scale, int split
+#define TF_INK2_FOLD_ARGS                                                                                          \
+    const uint16_t *__restrict__ q, const uint16_t *__restrict__ kc, const uint16_t *__restrict__ vc,              \
+        const uint16_t *__restrict__ tab, const Seg *__restrict__ segs, const int2 *__restrict__ tiles,            \
+        float *__restrict__ part_o, float2 *__restrict__ part_ml, int heads, int kv_heads, int ring, int chunk,    \
+        int c0, int chunks, float scale
+
+namespace ink2 {
+
+template <bool Q8>
+__device__ __forceinline__ void attnKernel(TF_INK2_ATTN_ARGS) {
     __shared__ __align__(16) uint16_t ks[kKeys * kPad];
     __shared__ __align__(16) uint16_t vs[kKeys * kPad];
-    attnTile<false>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window, chunk, c0, chunks,
-                    scale, split, ks, vs);
+    attnTile<false, Q8>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window, chunk, c0, chunks,
+                        scale, split, ks, vs);
+}
+
+template <bool Q8>
+__device__ __forceinline__ void foldKernel(TF_INK2_FOLD_ARGS) {
+    __shared__ __align__(16) uint16_t ks[kKeys * kPad];
+    __shared__ __align__(16) uint16_t vs[kKeys * kPad];
+    attnTile<true, Q8>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, 0, chunk, c0, chunks, scale,
+                       0, ks, vs);
+}
+
+}  // namespace ink2
+
+// Sliding layers (a chunk a block) and split global calls (a sub-chunk a block, `chunks` partials a row and head).
+extern "C" __global__ void __launch_bounds__(128) tf_ink2_attn(TF_INK2_ATTN_ARGS) {
+    ink2::attnKernel<false>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window, chunk, c0,
+                            chunks, scale, split);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_ink2_attn_q8(TF_INK2_ATTN_ARGS) {
+    ink2::attnKernel<true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, window, chunk, c0,
+                           chunks, scale, split);
 }
 
 // Global layers a chunk a block, its sub-chunks folded in order (prompt calls: no partial a sub-chunk).
-extern "C" __global__ void __launch_bounds__(128)
-    tf_ink2_attn_fold(const uint16_t* __restrict__ q, const uint16_t* __restrict__ kc,
-                      const uint16_t* __restrict__ vc, const uint16_t* __restrict__ tab, const Seg* __restrict__ segs,
-                      const int2* __restrict__ tiles, float* __restrict__ part_o, float2* __restrict__ part_ml,
-                      int heads, int kv_heads, int ring, int chunk, int c0, int chunks, float scale) {
-    using namespace ink2;
-    __shared__ __align__(16) uint16_t ks[kKeys * kPad];
-    __shared__ __align__(16) uint16_t vs[kKeys * kPad];
-    attnTile<true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, 0, chunk, c0, chunks, scale,
-                   0, ks, vs);
+extern "C" __global__ void __launch_bounds__(128) tf_ink2_attn_fold(TF_INK2_FOLD_ARGS) {
+    ink2::foldKernel<false>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, chunk, c0, chunks,
+                            scale);
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_ink2_attn_fold_q8(TF_INK2_FOLD_ARGS) {
+    ink2::foldKernel<true>(q, kc, vc, tab, segs, tiles, part_o, part_ml, heads, kv_heads, ring, chunk, c0, chunks,
+                           scale);
 }
 
 // Per (row, head): its chunks folded in order (subs > 1: each from its sub-chunks first), the sink, then the gate.

@@ -16,6 +16,7 @@ pub const Options = struct {
     chunk_rows: u32,
     embed_host: bool,
     layers: ?LayerRange = null, // stages a partial upload for dev gates
+    kv8: bool = false, // global layers' K and V caches are 8-bit (TF_INK2_KV8)
 };
 
 pub const Budget = struct { weights: u64, kv: u64, conv: u64, scratch: u64, total: u64 };
@@ -68,7 +69,7 @@ pub fn weightBytes(c: *const config.Config, prec: []const layer_plan.Precision, 
 pub fn plan(c: *const config.Config, s: *const visits.Schedule, prec: []const layer_plan.Precision, o: Options) Budget {
     const streams: u64 = o.streams;
     const weights = weightBytes(c, prec, o);
-    const kv = streams * visits.kvBytes(s, &c.text, o.context, o.chunk_rows);
+    const kv = streams * visits.kvBytes(s, &c.text, o.context, o.chunk_rows, o.kv8);
     const conv = streams * s.n * visits.convBytes(&c.text);
     const scratch = o.chunk_rows * scratchRowBytes(&c.text) + scratch_fixed_bytes;
     return .{ .weights = weights, .kv = kv, .conv = conv, .scratch = scratch, .total = weights + kv + conv + scratch };
@@ -186,4 +187,35 @@ test "scratch formula" {
         const est = p.rows * scratchRowBytes(&m.cfg.text) + scratch_fixed_bytes;
         try t.expect(est >= p.bytes and est - p.bytes <= p.bytes / 10);
     }
+}
+
+test "8-bit global caches shrink the kv bytes by their codes and scales" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const m = try Mini.init(arena.allocator());
+    var o: Options = .{ .context = 262144, .streams = 1, .chunk_rows = 512, .embed_host = true };
+    const sliding_kv: u64 = 40 * 1536 * 4096;
+    try t.expectEqual(8 * GiB + sliding_kv, m.budget(o).kv);
+    o.kv8 = true;
+    // 8 visits x 262144 tokens x 8 heads x 2 (K, V) x (128 codes + 4 scale bytes)
+    const want: u64 = 8 * 262144 * 8 * 2 * 132 + sliding_kv;
+    try t.expectEqual(want, m.budget(o).kv);
+    try t.expectEqual(@as(u64, 4 * GiB + GiB / 8), want - sliding_kv);
+    // only the kv line moves
+    const off = m.budget(.{ .context = 262144, .streams = 1, .chunk_rows = 512, .embed_host = true });
+    try t.expectEqual(off.weights, m.budget(o).weights);
+    try t.expectEqual(off.conv, m.budget(o).conv);
+    try t.expectEqual(off.scratch, m.budget(o).scratch);
+}
+
+test "8-bit global caches save 3.875 GiB of the total at a 256k window" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const m = try Mini.init(arena.allocator());
+    var o: Options = .{ .context = 262144, .streams = 1, .chunk_rows = 512, .embed_host = true };
+    const off = m.budget(o).total;
+    o.kv8 = true;
+    try t.expectEqual(@as(u64, 3 * GiB + GiB * 7 / 8), off - m.budget(o).total);
+    try check(m.budget(o), off - 3 * GiB);
+    try t.expectError(error.OverBudget, check(m.budget(.{ .context = 262144, .streams = 1, .chunk_rows = 512, .embed_host = true }), off - 3 * GiB));
 }

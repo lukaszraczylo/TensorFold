@@ -3,6 +3,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const ink2 = @import("inkling2");
 const environment = @import("sys").environment;
+const kv8_check = @import("check_kv8.zig");
 
 const usage =
     \\usage: tf-ink2-check <subcommand> --out DIR [options]
@@ -18,6 +19,7 @@ const usage =
     \\prefill --model DIR --ids FILE.json [--chunk-rows R] [--decode N] [--teacher GOLDEN_DIR] [--dump-kv L:P,...] --out DIR: FILE.json is {"steps": [[id, ...], [id], ...]}; step 0 is prefilled in chunks of R rows (default 512) from position 0, then steps 1..N run as single-token decode steps (teacher-forced ids); writes ref.capture's all-rows layout (step<s>/visit<VV>.f32 [rows, qn, 2304], mlp<VV>.f32, xs<VV>.f32, msg<VV>.f32), step<s>/logits.f32 and argmax.u32 (the last row's), and a manifest.json; with GOLDEN_DIR (captured with --all-rows) the carried input, the MoE input and the messages of every row are replaced by the reference's; --dump-kv writes the K and V rows of the given (layer, pass) visits for all positions
     \\rowcost --model DIR --ids FILE.json [--chunk-rows R] [--pass W] --out DIR: FILE.json's step 0 (2048 ids at most) is prefilled up to 8 ids short of its end; prints ms of a forward and head over R = 1..8 rows at that position (W = 1: window kernels)
     \\rowgate --model DIR --ids FILE.json [--chunk-rows R] --out DIR: as rowcost's prompt; checks that one R-row window forward gives the logits of R one-token forwards byte for byte, for R = 2..8, and names the first visit that differs
+    \\kv8 --out DIR: no model; random rows through the 8-bit and bf16 attention caches: the codes must equal the host quantiser's, every 8-bit attention path (decode, window, fold, prompt) must equal the bf16 kernels on the widened rows bit for bit and stay within 5% of the bf16 cache; prints a verdict line, exits 1 on a failure
     \\weights --model DIR [--layers A-B] [--readback NAME,...]: uploads the text weights (TF_INK2_EMBED_HOST=1 keeps the
     \\    embedding on the host), writes DIR/weights.json with peak_rss_mib and device_bytes, and one row per readback
     \\    tensor (names below model.llm., e.g. layers.0.attn.wo_ud.weight)
@@ -171,6 +173,7 @@ pub fn main(init: std.process.Init) !u8 {
         }, out);
         return 0;
     }
+    if (std.mem.eql(u8, a.sub, "kv8")) return kv8_check.run(init);
     if (std.mem.eql(u8, a.sub, "actq")) {
         try actq(init, a.in orelse {
             std.debug.print("{s}", .{usage});
@@ -847,6 +850,23 @@ fn scheduleOf(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !ink2.visits.
     return ink2.visits.build(&cfg, &p);
 }
 
+/// One cache (K or V) as bf16 [kv_heads, ring, head_dim] into `out`: an 8-bit cache widens as the attention kernels' tiles do.
+fn downloadRows(gpa: std.mem.Allocator, d: *const cuda.Driver, at: u64, layer: ink2.kernels.Layer, kv_heads: usize, out: []u8) !void {
+    if (!layer.q8) return cuda.memory.download(d, at, out);
+    const dim = ink2.kernels.head_dim;
+    const raw = try gpa.alloc(u8, layer.cacheBytes(kv_heads));
+    defer gpa.free(raw);
+    try cuda.memory.download(d, at, raw);
+    const scales = layer.scalesAt(kv_heads);
+    for (0..kv_heads * layer.ring) |slot| {
+        const codes: *const [dim]i8 = @ptrCast(raw[slot * dim ..][0..dim]);
+        const scale: f32 = @bitCast(std.mem.readInt(u32, raw[scales + slot * 4 ..][0..4], .little));
+        var row: [dim]u16 = undefined;
+        ink2.kv8.dequantRow(&row, codes, scale);
+        @memcpy(out[slot * dim * 2 ..][0 .. dim * 2], std.mem.sliceAsBytes(&row));
+    }
+}
+
 /// The K and V rows of each visit in `kv` after `steps` single-token steps from position 0, as kv/L<l>p<p>.<k|v>.bf16
 /// ([steps, kv_heads, head_dim], ref.capture's layout); the cache holds a head's rows at slot pos % ring.
 fn dumpKv(gpa: std.mem.Allocator, rows_out: *ink2.check_rows.Writer, cache: *const ink2.cache.Cache, sched: *const ink2.visits.Schedule, t: *const ink2.config.Text, kv: []const KvVisit, last_visit: u32, steps: usize) !void {
@@ -867,7 +887,7 @@ fn dumpKv(gpa: std.mem.Allocator, rows_out: *ink2.check_rows.Writer, cache: *con
         const out = try gpa.alloc(u8, steps * kv_heads * head_row);
         defer gpa.free(out);
         for ([_]struct { kind: []const u8, at: u64 }{ .{ .kind = "k", .at = slots.k }, .{ .kind = "v", .at = slots.v } }) |f| {
-            try cuda.memory.download(cache.d, f.at, staging);
+            try downloadRows(gpa, cache.d, f.at, layer, kv_heads, staging);
             for (0..steps) |pos| for (0..kv_heads) |h| {
                 @memcpy(out[(pos * kv_heads + h) * head_row ..][0..head_row], staging[(h * ring + pos % ring) * head_row ..][0..head_row]);
             };
@@ -950,14 +970,15 @@ const Session = struct {
         const last = last_visit orelse planned.n - 1;
         if (last >= planned.n) return error.VisitsPastSchedule;
         const range = layers orelse ink2.budget.LayerRange{ .first = 0, .last = ink2.decode.layersRead(&planned, last) };
-        const o: ink2.budget.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = chunk_rows, .embed_host = embed_host, .layers = range };
+        const kv8 = try environment.read(bool, ink2.cache.kv8_env, false);
+        const o: ink2.budget.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = chunk_rows, .embed_host = embed_host, .layers = range, .kv8 = kv8 };
         s.w = try ink2.weights.load(gpa, io, ink2.weights.deviceUploader(s.ctx.d), model, o, device_limit);
         errdefer s.w.deinit();
         const layer_plan = try ink2.plan.build(&s.w.cfg.text, s.w.prec[0..s.w.cfg.text.layers]);
         s.sched = try ink2.visits.build(&s.w.cfg, &layer_plan);
         if (s.sched.n != planned.n) return error.VisitsPastSchedule;
 
-        const co: ink2.cache.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = chunk_rows };
+        const co: ink2.cache.Options = .{ .context = dev_context, .streams = 1, .chunk_rows = chunk_rows, .kv8 = kv8 };
         s.cache = try ink2.cache.Cache.init(s.ctx.d, &s.sched, &s.w.cfg.text, co);
         errdefer s.cache.deinit();
         try s.c.init(gpa, io, s.ctx.d, &s.w, s.sched, &s.cache, co);

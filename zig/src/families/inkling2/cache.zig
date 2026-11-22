@@ -13,7 +13,14 @@ pub const conv_sites = std.enums.values(Conv).len;
 pub const state_bytes_per_value = 4;
 pub const state_rows = config.conv_taps - 1;
 
-pub const Options = struct { context: usize, streams: u32, chunk_rows: u32 };
+pub const kv8_env = "TF_INK2_KV8";
+
+pub const Options = struct {
+    context: usize,
+    streams: u32,
+    chunk_rows: u32,
+    kv8: bool = false, // global layers' K and V caches are int8 codes with fp32 scales (TF_INK2_KV8)
+};
 
 const Slot = struct {
     layer: kernels.Layer,
@@ -41,7 +48,7 @@ pub const Layout = struct {
     pub fn build(sched: *const visits.Schedule, t: *const config.Text, o: Options) Layout {
         var l: Layout = .{ .slots = undefined, .n = sched.n, .streams = o.streams, .kv_stream = 0, .conv_stream = 0 };
         for (sched.visits[0..sched.n], 0..) |v, i| {
-            const layer = if (v.global) kernels.Layer.global(@intCast(o.context)) else kernels.Layer.sliding(t.window, o.chunk_rows);
+            const layer = if (v.global) kernels.Layer.globalOf(@intCast(o.context), o.kv8) else kernels.Layer.sliding(t.window, o.chunk_rows);
             const kv = t.heads(v.layer).kv;
             const s = &l.slots[i];
             s.* = .{ .layer = layer, .kv_heads = kv, .kv_off = l.kv_stream, .conv_off = undefined };
@@ -66,7 +73,7 @@ pub const Layout = struct {
 /// The device bytes the budget accounts for (`budget.plan`'s kv + conv): the conv states at their bf16 reference width.
 pub fn bytes(sched: *const visits.Schedule, t: *const config.Text, o: Options) u64 {
     const streams: u64 = o.streams;
-    return streams * (visits.kvBytes(sched, t, o.context, o.chunk_rows) + sched.n * visits.convBytes(t));
+    return streams * (visits.kvBytes(sched, t, o.context, o.chunk_rows, o.kv8) + sched.n * visits.convBytes(t));
 }
 
 /// Zeroes a device span on a fresh non-blocking stream and waits: a legacy-stream memset does not order against the engine's streams.
@@ -321,4 +328,45 @@ test "headRing places a head's rows at pos % ring and zeroes the rest" {
     try ts.expectEqual(@as(u8, 1 + 5), dst[1 * row_bytes]);
     try ts.expectEqual(@as(u8, 0), dst[2 * row_bytes]);
     try ts.expectEqual(@as(u8, 0), dst[2 * row_bytes + row_bytes - 1]);
+}
+
+test "8-bit global caches: sizes, scale offsets and 16-byte aligned regions" {
+    var arena = std.heap.ArenaAllocator.init(ts.allocator);
+    defer arena.deinit();
+    const m = try Mini.init(arena.allocator());
+    const o: Options = .{ .context = 4096, .streams = 2, .chunk_rows = 64, .kv8 = true };
+    const c = fake(&m, o);
+    const global = c.layerAt(5);
+    try ts.expect(global.q8);
+    try ts.expect(!c.layerAt(0).q8);
+    try ts.expectEqual(@as(usize, 4096 * 8 * 132), global.cacheBytes(8));
+    try ts.expectEqual(@as(usize, 4096 * 8 * 128), global.scalesAt(8));
+    try ts.expectEqual(@as(u64, global.cacheBytes(8)), c.kvAt(5, 0).v - c.kvAt(5, 0).k);
+    for (0..m.sched.n) |v| {
+        const a = c.kvAt(@intCast(v), 1);
+        try ts.expectEqual(@as(u64, 0), a.k % 16);
+        try ts.expectEqual(@as(u64, 0), a.v % 16);
+    }
+    try ts.expectEqual(c.layout.kv_stream * 2, c.layout.kvTotal());
+    try ts.expect(c.layout.kv_stream < Layout.build(&m.sched, &m.cfg.text, .{ .context = 4096, .streams = 1, .chunk_rows = 64 }).kv_stream);
+}
+
+test "8-bit cache bytes equal the budget's kv and conv" {
+    var arena = std.heap.ArenaAllocator.init(ts.allocator);
+    defer arena.deinit();
+    const m = try Mini.init(arena.allocator());
+    const o: Options = .{ .context = 65536, .streams = 2, .chunk_rows = 512, .kv8 = true };
+    const b = budget.plan(&m.cfg, &m.sched, m.prec[0..m.cfg.text.layers], .{ .context = o.context, .streams = o.streams, .chunk_rows = o.chunk_rows, .embed_host = false, .kv8 = true });
+    try ts.expectEqual(b.kv + b.conv, bytes(&m.sched, &m.cfg.text, o));
+    try ts.expectEqual(Layout.build(&m.sched, &m.cfg.text, o).kvTotal(), b.kv);
+}
+
+test "flags off keep the bf16 layout" {
+    var arena = std.heap.ArenaAllocator.init(ts.allocator);
+    defer arena.deinit();
+    const m = try Mini.init(arena.allocator());
+    const l = Layout.build(&m.sched, &m.cfg.text, .{ .context = 2048, .streams = 1, .chunk_rows = 1 });
+    try ts.expectEqual(@as(u64, 8 * 2048 * 4096 + 40 * 1024 * 4096), l.kv_stream);
+    const g = fake(&m, .{ .context = 2048, .streams = 1, .chunk_rows = 1 }).layerAt(5);
+    try ts.expect(!g.q8);
 }
