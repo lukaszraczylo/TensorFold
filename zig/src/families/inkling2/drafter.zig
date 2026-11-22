@@ -10,6 +10,7 @@ const dk = @import("dspark_ops.zig");
 const engine = @import("engine.zig");
 const head = @import("head.zig");
 const ops = @import("ops.zig");
+const prefill4 = @import("prefill4.zig");
 const weights = @import("weights.zig");
 
 const platform = @import("sys");
@@ -352,6 +353,7 @@ pub const Drafter = struct {
 
     /// out fp32 [m, n] = x bf16 [m, k] times w bf16 [n, k] transposed.
     fn gemm(x: *const Drafter, s: cuda.Stream, a: u64, w: u64, out: u64, m: usize, n: usize, k: usize) !void {
+        if (x.c.pf4) |*st| if (st.dense and m >= prefill4.prompt_from and k % 16 == 0 and n % 8 == 0 and a % 4 == 0 and w % 4 == 0) return prefill4.denseRows(&st.k, s, a, k, w, out, n, m, n, k);
         try x.c.dense.rows(s, a, k, w, out, n, m, n, k);
     }
 
