@@ -287,6 +287,7 @@ pub const Inkling = struct {
 
     fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
         const x = self(ptr);
+        prof.roundEnd();
         const l = try x.opening(s);
         errdefer x.dropLane(s);
         while (!try x.chunk(s, l)) {}
@@ -294,6 +295,7 @@ pub const Inkling = struct {
 
     fn prefillStep(ptr: *anyopaque, s: *Stream, _: u32) anyerror!bool {
         const x = self(ptr);
+        prof.roundEnd();
         const going = if (x.lanes.getPtr(s)) |l| l.fill != null else false;
         const l = if (going) x.lanes.getPtr(s).? else try x.opening(s);
         errdefer x.dropLane(s);
@@ -432,6 +434,7 @@ pub const Inkling = struct {
         prof.at(prof.tag_head);
         try head.logits(x.c, x.s, x.c.flow.r.inp, rows, m.logits.ptr);
         try x.drawRows(m, l, w.positions, o.sampled);
+        prof.window(@intCast(rows), 0);
         prof.end();
         @memcpy(o.drafts, ids[1..rows]);
         l.win_start = l.len;
@@ -450,6 +453,7 @@ pub const Inkling = struct {
             }
             return;
         }
+        prof.roundBegin(x.s.handle);
         if (x.c.rec) |*r| try r.backup.copyFrom(0, x.c.cache.conv.ptr, x.c.cache.conv.len, x.s.handle);
         for (windows, out) |w, o| try x.runWindow(w, o);
     }
@@ -465,6 +469,8 @@ pub const Inkling = struct {
             const n: u32 = @intCast(path.len);
             if (n > l.win_rows) return error.WindowTooWide;
             l.len = l.win_start + n;
+            prof.at(prof.tag_keep);
+            prof.window(0, n);
             if (n < l.win_rows) {
                 const r = x.c.rec.?;
                 const table = r.sites.ptr + @as(u64, l.slot) * r.n_sites * @sizeOf(ops.RewindSite);
@@ -479,6 +485,7 @@ pub const Inkling = struct {
         const x = self(ptr);
         for (requests) |r| if (r.lanes != null or (x.mtp == null and r.depth != 0)) return error.NoDraftHead;
         const m = if (x.mtp) |*m| m else return;
+        prof.at(prof.tag_draft);
         for (requests) |r| {
             const l = x.lanes.getPtr(r.stream) orelse return error.UnknownStream;
             const at = r.position - 1; // the pending token's position: the kept length

@@ -4,6 +4,7 @@ const cuda = @import("cuda");
 const loop_kernels = @import("loop_kernels.zig");
 const ops = @import("ops.zig");
 const plan = @import("plan.zig");
+const prof = @import("prof.zig");
 const weights = @import("weights.zig");
 
 pub const hidden = 2304;
@@ -130,6 +131,7 @@ pub fn forwardPath(env: *const Env, s: cuda.Stream, layer: *const weights.LayerW
 
     try ops.rowdot(env.ops, s, x, layer.mlp.gate.ptr, sc.scores.ptr, rows, experts, hidden, false, true);
     try ops.topk(env.ops, s, sc.scores.ptr, layer.mlp.gate_bias.ptr, sc.pick.ptr, sc.gamma.ptr, rows, experts, top, route_scale);
+    prof.picks(s.handle, sc.pick.ptr, rows);
 
     try actQuant(k, s, prec, x, sc.act.ptr, rows, hidden);
     const w13 = gemm(ex.w13, ex.w13_scale, ex.w13_amax, ex.w13_outer);

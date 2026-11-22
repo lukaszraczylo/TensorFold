@@ -15,12 +15,15 @@ const slots = 1024;
 /// Visit tags 0..47 are schedule visits; these two cover the embedding and the head.
 pub const tag_embed: u8 = 48;
 pub const tag_head: u8 = 49;
-const tags = 50;
+/// The rollback and the draft head's context absorb after a window; the draft head's block.
+pub const tag_keep: u8 = 50;
+pub const tag_draft: u8 = 51;
+const tags = 52;
 const report_every = 32;
 /// The decode token whose launch sequence is printed whole (it is the 6th timed one: caches are warm).
 const seq_token = 6;
 
-const Mode = enum { off, count, time, visit_sync, dup_head };
+const Mode = enum { off, count, time, visit_sync, dup_head, round, experts };
 
 const Name = struct { handle: abi.Function = null, text: []const u8 = "", calls: u64 = 0, busy_us: f64 = 0, gap_us: f64 = 0 };
 
@@ -50,7 +53,18 @@ const Sums = struct {
     dtoh_ns: u64 = 0,
     busy_us: f64 = 0,
     gap_us: f64 = 0,
+    win_rows: u64 = 0,
+    win_kept: u64 = 0,
 };
+
+const max_rows = 8;
+/// Busy and gap by kernel name and phase: 0 verify (visits, embed, head), 1 rollback, 2 draft head.
+var grp_calls: [max_names][3]u64 = @splat(@splat(0));
+var grp_busy: [max_names][3]f64 = @splat(@splat(0));
+var grp_gap: [max_names][3]f64 = @splat(@splat(0));
+var exp_sum: [max_rows + 1]u64 = @splat(0);
+var exp_calls: [max_rows + 1]u64 = @splat(0);
+const round_discard_ns = 300 * std.time.ns_per_ms;
 
 var mode: Mode = .off;
 var active = false;
@@ -92,8 +106,12 @@ fn nameOf(f: abi.Function) u16 {
     return @intCast(n_names - 1);
 }
 
+fn timed_mode() bool {
+    return mode == .time or mode == .round;
+}
+
 fn timed() bool {
-    return active and mode == .time;
+    return active and (mode == .time or mode == .round);
 }
 
 fn record(stream: abi.Stream, idx: usize) void {
@@ -197,7 +215,7 @@ pub fn install(d: *const cuda.Driver) !void {
     drv = d;
     const api: *abi.Api = @constCast(&d.api);
     orig = .{ .launch = api.cuLaunchKernel, .launch_ex = api.cuLaunchKernelEx, .sync = api.cuStreamSynchronize, .htod = api.cuMemcpyHtoD_v2, .htod_async = api.cuMemcpyHtoDAsync_v2, .dtoh = api.cuMemcpyDtoH_v2, .dtoh_async = api.cuMemcpyDtoHAsync_v2 };
-    if (mode == .time) for (&events) |*e| try d.check(d.api.cuEventCreate(e, 0), "cuEventCreate");
+    if (mode == .time or mode == .round) for (&events) |*e| try d.check(d.api.cuEventCreate(e, 0), "cuEventCreate");
     api.cuLaunchKernel = launchThunk;
     api.cuLaunchKernelEx = launchExThunk;
     api.cuStreamSynchronize = syncThunk;
@@ -220,25 +238,74 @@ pub fn at(t: u8) void {
 
 /// The start of a decode token (before its embedding); `stream` takes the timeline's origin event.
 pub fn begin(stream: abi.Stream) void {
-    if (mode == .off) return;
+    if (mode == .off or mode == .round) return;
+    start(stream);
+}
+
+fn start(stream: abi.Stream) void {
     cur = .{};
     n = 0;
     tag = tag_embed;
     stream_h = stream;
     head_dup_done = false;
     active = true;
-    if (mode == .time) record(stream, 0);
+    if (mode == .time or mode == .round) record(stream, 0);
     t_begin = now();
 }
 
 /// The end of a decode token, after the host read its pick (the stream is idle: every event has fired).
 pub fn end() void {
+    if (mode == .round) return;
+    finish();
+}
+
+/// A whole MTP round (verify, draft, rollback) is one timeline in `round` mode, from one verify to the next: the idle time before a
+/// kernel is its gap, and the wall time not covered by kernels or gaps is the host's tail.
+pub fn roundBegin(stream: abi.Stream) void {
+    if (mode != .round) return;
+    roundEnd();
+    start(stream);
+}
+
+/// The end of a decode run (a prompt step follows): the open round is closed.
+pub fn roundEnd() void {
+    if (mode != .round or !active) return;
+    _ = orig.sync(stream_h);
+    finish();
+}
+
+/// A verify window's width and the rows kept of it.
+pub fn window(rows: u32, kept: u32) void {
+    if (!active) return;
+    if (rows != 0) cur.win_rows += rows;
+    cur.win_kept += kept;
+}
+
+/// The experts the router picked for `rows` rows at the current visit, counted after a sync.
+pub fn picks(stream: abi.Stream, pick: u64, rows: usize) void {
+    if (mode != .experts or !active or rows == 0 or rows > max_rows) return;
+    _ = orig.sync(stream);
+    var host: [max_rows * 8]i32 = undefined;
+    _ = orig.dtoh(&host, pick, rows * 8 * @sizeOf(i32));
+    var seen: [128]bool = @splat(false);
+    var distinct: u32 = 0;
+    for (host[0 .. rows * 8]) |e| {
+        if (e < 0 or e >= 128 or seen[@intCast(e)]) continue;
+        seen[@intCast(e)] = true;
+        distinct += 1;
+    }
+    exp_sum[rows] += distinct;
+    exp_calls[rows] += 1;
+}
+
+fn finish() void {
     if (!active) return;
     const wall = now() - t_begin;
     active = false;
     tokens_seen += 1;
     cur.wall_ns = wall;
-    if (mode == .time) resolve();
+    if (mode == .round and wall > round_discard_ns) return;
+    if (timed_mode()) resolve();
     if (mode == .time and tokens_seen == seq_token) dumpSequence();
     add();
     if (sums.tokens >= report_every) report();
@@ -260,6 +327,10 @@ fn resolve() void {
         nm.calls += 1;
         nm.busy_us += busy;
         nm.gap_us += gap;
+        const g: usize = if (launch_tag[i] == tag_keep) 1 else if (launch_tag[i] == tag_draft) 2 else 0;
+        grp_calls[launch_name[i]][g] += 1;
+        grp_busy[launch_name[i]][g] += busy;
+        grp_gap[launch_name[i]][g] += gap;
         vis_busy_us[launch_tag[i]] += busy;
         vis_gap_us[launch_tag[i]] += gap;
         cur.busy_us += busy;
@@ -292,11 +363,26 @@ fn report() void {
         "ink2prof agg mode={s} tokens={d} wall_ms={d:.3} launches={d:.1} launch_call_ms={d:.3} syncs={d:.2} sync_wait_ms={d:.3} htod={d:.2} htod_kb={d:.2} htod_ms={d:.3} dtoh={d:.2} dtoh_ms={d:.3} busy_ms={d:.3} gap_ms={d:.3}\n",
         .{ @tagName(mode), s.tokens, ms(s.wall_ns, tok), @as(f64, @floatFromInt(s.launches)) / tok, ms(s.launch_ns, tok), @as(f64, @floatFromInt(s.syncs)) / tok, ms(s.sync_ns, tok), @as(f64, @floatFromInt(s.htod)) / tok, @as(f64, @floatFromInt(s.htod_bytes)) / 1024 / tok, ms(s.htod_ns, tok), @as(f64, @floatFromInt(s.dtoh)) / tok, ms(s.dtoh_ns, tok), s.busy_us / 1000 / tok, s.gap_us / 1000 / tok },
     );
-    if (mode == .time) {
+    std.debug.print("ink2prof win rows={d:.3} kept={d:.3}\n", .{ @as(f64, @floatFromInt(s.win_rows)) / tok, @as(f64, @floatFromInt(s.win_kept)) / tok });
+    for (1..max_rows + 1) |r| {
+        if (exp_calls[r] != 0) std.debug.print("ink2prof experts rows={d} calls={d} distinct_mean={d:.3}\n", .{ r, exp_calls[r], @as(f64, @floatFromInt(exp_sum[r])) / @as(f64, @floatFromInt(exp_calls[r])) });
+    }
+    exp_sum = @splat(0);
+    exp_calls = @splat(0);
+    if (timed_mode()) {
         for (names[0..n_names]) |nm| {
             if (nm.calls == 0) continue;
             std.debug.print("ink2prof k {s} calls={d:.2} busy_us={d:.2} gap_us={d:.2}\n", .{ nm.text, @as(f64, @floatFromInt(nm.calls)) / tok, nm.busy_us / tok, nm.gap_us / tok });
         }
+        for (names[0..n_names], 0..) |nm, i| {
+            for (0..3) |g| {
+                if (grp_calls[i][g] == 0) continue;
+                std.debug.print("ink2prof kg {s} {d} calls={d:.2} busy_us={d:.2} gap_us={d:.2}\n", .{ nm.text, g, @as(f64, @floatFromInt(grp_calls[i][g])) / tok, grp_busy[i][g] / tok, grp_gap[i][g] / tok });
+            }
+        }
+        grp_calls = @splat(@splat(0));
+        grp_busy = @splat(@splat(0));
+        grp_gap = @splat(@splat(0));
         for (0..tags) |t| {
             if (vis_launches[t] == 0) continue;
             std.debug.print("ink2prof v {d} launches={d:.1} busy_us={d:.2} gap_us={d:.2}\n", .{ t, @as(f64, @floatFromInt(vis_launches[t])) / tok, vis_busy_us[t] / tok, vis_gap_us[t] / tok });
