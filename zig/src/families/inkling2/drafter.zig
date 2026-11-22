@@ -10,12 +10,15 @@ const dk = @import("dspark_ops.zig");
 const engine = @import("engine.zig");
 const head = @import("head.zig");
 const ops = @import("ops.zig");
+const weights = @import("weights.zig");
 
 const platform = @import("sys");
 
 const Checkpoint = core.checkpoint.Checkpoint;
 
 pub const enable_env = "TF_INK2_MTP";
+/// 1 stores the vocabulary fold and the layers' propose weights as int8 with fp16 block scales (drafts only).
+pub const draft8_env = "TF_INK2_DRAFT8";
 
 pub const file_name = "mtp.safetensors";
 const bf16_bytes = 2;
@@ -57,6 +60,7 @@ pub const Drafter = struct {
     k: dk.Kernels,
     m: config.Mtp,
     streams: u32,
+    draft8: bool,
     layers: [max_layers]Layer,
     alpha: cuda.DeviceBuffer, // fp32 [layers + 1, taps]: each layer's tap softmax, then the Markov head's
     norm: cuda.DeviceBuffer,
@@ -65,7 +69,7 @@ pub const Drafter = struct {
     w1: cuda.DeviceBuffer,
     rnn_w: cuda.DeviceBuffer,
     rnn_b: cuda.DeviceBuffer,
-    fold: cuda.DeviceBuffer, // bf16 [vocab, rank]
+    fold: cuda.DeviceBuffer, // bf16 [vocab, rank]; draft8: int8 codes [vocab, rank], then fp16 scales [vocab, rank / 32]
     fbias: cuda.DeviceBuffer, // bf16 [vocab]
     frnn: cuda.DeviceBuffer, // bf16 [streams, hidden]
     // scratch, one call at a time
@@ -132,6 +136,7 @@ pub const Drafter = struct {
         x.c = c;
         x.m = m;
         x.streams = streams;
+        x.draft8 = try platform.environment.read(bool, draft8_env, false);
         x.bytes = 0;
         x.k = try dk.Kernels.load(d);
         errdefer x.k.unload();
@@ -166,9 +171,9 @@ pub const Drafter = struct {
             const wq = try tensor(&ck, try at(&nb, pre, "self_attn.q_proj.weight"), &.{ dm.q, hidden });
             const wk = try tensor(&ck, try at(&nb, pre, "self_attn.k_proj.weight"), &.{ dm.kv, hidden });
             const wv = try tensor(&ck, try at(&nb, pre, "self_attn.v_proj.weight"), &.{ dm.kv, hidden });
-            l.wqkv = try join(d, &x.bytes, &.{ wq, wk, wv });
+            l.wqkv = try joinW(gpa, d, &x.bytes, &.{ wq, wk, wv }, hidden, x.draft8);
             errdefer l.wqkv.free();
-            l.wo = try put(d, &x.bytes, try tensor(&ck, try at(&nb, pre, "self_attn.o_proj.weight"), &.{ hidden, dm.q }));
+            l.wo = try joinW(gpa, d, &x.bytes, &.{try tensor(&ck, try at(&nb, pre, "self_attn.o_proj.weight"), &.{ hidden, dm.q })}, dm.q, x.draft8);
             errdefer l.wo.free();
             const wkc = try tensor(&ck, try at(&nb, pre, "self_attn.k_proj_ctx.weight"), &.{ dm.kv, hidden });
             const wvc = try tensor(&ck, try at(&nb, pre, "self_attn.v_proj_ctx.weight"), &.{ dm.kv, hidden });
@@ -176,9 +181,9 @@ pub const Drafter = struct {
             errdefer l.wkv_ctx.free();
             const wg = try tensor(&ck, try at(&nb, pre, "mlp.gate_proj.weight"), &.{ m.inter, hidden });
             const wu = try tensor(&ck, try at(&nb, pre, "mlp.up_proj.weight"), &.{ m.inter, hidden });
-            l.wgu = try join(d, &x.bytes, &.{ wg, wu });
+            l.wgu = try joinW(gpa, d, &x.bytes, &.{ wg, wu }, hidden, x.draft8);
             errdefer l.wgu.free();
-            l.wd = try put(d, &x.bytes, try tensor(&ck, try at(&nb, pre, "mlp.down_proj.weight"), &.{ hidden, m.inter }));
+            l.wd = try joinW(gpa, d, &x.bytes, &.{try tensor(&ck, try at(&nb, pre, "mlp.down_proj.weight"), &.{ hidden, m.inter })}, m.inter, x.draft8);
             errdefer l.wd.free();
             const cache_bytes = @as(usize, streams) * l.ring * dm.kv * bf16_bytes;
             l.kc = try zeroed(d, &x.bytes, cache_bytes);
@@ -207,7 +212,7 @@ pub const Drafter = struct {
         x.alpha = try put(d, &x.bytes, std.mem.sliceAsBytes(alpha_host[0 .. (n_layers + 1) * taps]));
 
         const vocab: usize = t.unpadded_vocab;
-        x.fold = try zeroed(d, &x.bytes, vocab * rank * bf16_bytes);
+        x.fold = try zeroed(d, &x.bytes, if (x.draft8) weights.q8Bytes(vocab, rank) else vocab * rank * bf16_bytes);
         x.fbias = try zeroed(d, &x.bytes, vocab * bf16_bytes);
         x.frnn = try zeroed(d, &x.bytes, streams * hidden * bf16_bytes);
 
@@ -248,6 +253,26 @@ pub const Drafter = struct {
         }
         total.* += n;
         return b;
+    }
+
+    /// `join` of bf16 weights whose rows are `k` long, stored int8 with fp16 block scales when `q8` (weights.quantQ8's layout).
+    fn joinW(gpa: std.mem.Allocator, d: *const cuda.Driver, total: *u64, parts: []const []const u8, k: usize, q8: bool) !cuda.DeviceBuffer {
+        if (!q8) return join(d, total, parts);
+        var n: usize = 0;
+        for (parts) |p| n += p.len;
+        const host = try gpa.alloc(u8, n);
+        defer gpa.free(host);
+        var at: usize = 0;
+        for (parts) |p| {
+            @memcpy(host[at..][0..p.len], p);
+            at += p.len;
+        }
+        const rows = n / (k * bf16_bytes);
+        if (k % weights.q8_block != 0 or rows * k * bf16_bytes != n) return error.Inkling2DraftShape;
+        const out = try gpa.alloc(u8, weights.q8Bytes(rows, k));
+        defer gpa.free(out);
+        weights.quantQ8(host, rows, k, out);
+        return put(d, total, out);
     }
 
     fn softmaxRows(raw: []const u8, rows: usize, cols: usize, out: []f32) void {
@@ -302,7 +327,9 @@ pub const Drafter = struct {
                 wptr = c.dq.ptr;
             } else wptr = w.ptr + row0 * hidden * bf16_bytes;
             try c.dense.rows(s, rows_dev.ptr, hidden, wptr, out.ptr, tile_max, rank + 1, tile, hidden);
-            try dk.foldTile(&x.k, s, out.ptr, tile, tile_max, row0, rank, x.fold.ptr, x.fbias.ptr);
+            if (x.draft8) {
+                try dk.foldTileQ8(&x.k, s, out.ptr, tile, tile_max, row0, rank, x.fold.ptr, x.fold.ptr + vocab * rank, x.fbias.ptr);
+            } else try dk.foldTile(&x.k, s, out.ptr, tile, tile_max, row0, rank, x.fold.ptr, x.fbias.ptr);
         }
         try s.synchronize();
     }
@@ -332,6 +359,19 @@ pub const Drafter = struct {
     fn gemmBf(x: *const Drafter, s: cuda.Stream, a: u64, w: u64, out: u64, m: usize, n: usize, k: usize) !void {
         try x.gemm(s, a, w, x.tmp.ptr, m, n, k);
         try ops.tobf(&x.c.ops, s, x.tmp.ptr, m, n, n, out, n, 0, n);
+    }
+
+    /// `gemm` / `gemmBf` over a `joinW` weight.
+    fn gemmW(x: *const Drafter, s: cuda.Stream, a: u64, w: u64, out: u64, m: usize, n: usize, k: usize) !void {
+        if (!x.draft8) return x.gemm(s, a, w, out, m, n, k);
+        const seg: ops.DenseSeg = .{ .x = a, .w = w, .out = out, .n = @intCast(n), .block0 = 0 };
+        try ops.dense1Q8Rows(&x.c.ops, s, &.{seg}, k, true, 0, m);
+    }
+
+    fn gemmBfW(x: *const Drafter, s: cuda.Stream, a: u64, w: u64, out: u64, m: usize, n: usize, k: usize) !void {
+        if (!x.draft8) return x.gemmBf(s, a, w, out, m, n, k);
+        const seg: ops.DenseSeg = .{ .x = a, .w = w, .out = out, .n = @intCast(n), .block0 = 0 };
+        try ops.dense1Q8Rows(&x.c.ops, s, &.{seg}, k, false, 0, m);
     }
 
     fn ringBase(x: *const Drafter, l: *const Layer, stream: u32) u64 {
@@ -389,7 +429,7 @@ pub const Drafter = struct {
         try dk.blockInit(k, s, x.anchor_h.ptr, x.mask.ptr, x.resid.ptr, block, hidden);
         try dk.addNorm(k, s, x.resid.ptr, 0, 0, 0, x.layers[0].in_norm.ptr, x.h.ptr, block, hidden, eps);
         for (x.layers[0..x.m.layers], 0..) |*l, i| {
-            try x.gemmBf(s, x.h.ptr, l.wqkv.ptr, x.qkv.ptr, block, dm.q + 2 * dm.kv, hidden);
+            try x.gemmBfW(s, x.h.ptr, l.wqkv.ptr, x.qkv.ptr, block, dm.q + 2 * dm.kv, hidden);
             const base = x.ringBase(l, stream);
             try dk.qk(k, s, .{
                 .x = x.qkv.ptr,
@@ -424,11 +464,11 @@ pub const Drafter = struct {
                 .c0 = 0,
                 .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(x.m.head_dim))),
             }, x.attn.ptr);
-            try x.gemm(s, x.attn.ptr, l.wo.ptr, x.tmp.ptr, block, hidden, dm.q);
+            try x.gemmW(s, x.attn.ptr, l.wo.ptr, x.tmp.ptr, block, hidden, dm.q);
             try dk.addNorm(k, s, x.resid.ptr, x.tmp.ptr, 1, 0, l.post_norm.ptr, x.h.ptr, block, hidden, eps);
-            try x.gemmBf(s, x.h.ptr, l.wgu.ptr, x.qkv.ptr, block, 2 * x.m.inter, hidden);
+            try x.gemmBfW(s, x.h.ptr, l.wgu.ptr, x.qkv.ptr, block, 2 * x.m.inter, hidden);
             try dk.silu(k, s, x.qkv.ptr, x.q.ptr, block, x.m.inter);
-            try x.gemm(s, x.q.ptr, l.wd.ptr, x.tmp.ptr, block, hidden, x.m.inter);
+            try x.gemmW(s, x.q.ptr, l.wd.ptr, x.tmp.ptr, block, hidden, x.m.inter);
             const next = if (i + 1 < x.m.layers) x.layers[i + 1].in_norm.ptr else x.norm.ptr;
             try dk.addNorm(k, s, x.resid.ptr, x.tmp.ptr, 1, 0, next, x.h.ptr, block, hidden, eps);
         }
@@ -445,7 +485,10 @@ pub const Drafter = struct {
         try x.walk.uploadAsync(0, std.mem.sliceAsBytes(&first), s.handle);
         for (0..proposals) |j| {
             try dk.rnn(k, s, x.ctx_rows.ptr + j * 3 * rank * f32_bytes, x.rnn_w.ptr, x.w1.ptr, x.walk.ptr, j, x.state.ptr, x.latent.ptr, rank, hidden);
-            try dk.vocab(k, s, x.base_b.ptr + j * vocab * bf16_bytes, x.latent.ptr, x.fold.ptr, x.fbias.ptr, t.logit_cap, vocab, vocab, x.logits.ptr);
+            const base_row = x.base_b.ptr + j * vocab * bf16_bytes;
+            if (x.draft8) {
+                try dk.vocabQ8(k, s, base_row, x.latent.ptr, x.fold.ptr, x.fold.ptr + vocab * rank, x.fbias.ptr, t.logit_cap, vocab, vocab, x.logits.ptr);
+            } else try dk.vocab(k, s, base_row, x.latent.ptr, x.fold.ptr, x.fbias.ptr, t.logit_cap, vocab, vocab, x.logits.ptr);
             try ops.top1(&c.ops, s, x.logits.ptr, 1, vocab, vocab, 0, x.picks.ptr, x.picks.ptr + 4);
             try dk.pick(k, s, x.picks.ptr, 1, x.walk.ptr, j);
         }

@@ -55,6 +55,8 @@ pub const Kernels = struct {
     pick: cuda.Function,
     block_init: cuda.Function,
     fold: cuda.Function,
+    fold_q8: cuda.Function,
+    vocab_q8: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -74,6 +76,8 @@ pub const Kernels = struct {
             .pick = try mod.function("tf_ink2_dsp_pick"),
             .block_init = try mod.function("tf_ink2_dsp_block_init"),
             .fold = try mod.function("tf_ink2_dsp_fold"),
+            .fold_q8 = try mod.function("tf_ink2_dsp_fold_q8"),
+            .vocab_q8 = try mod.function("tf_ink2_dsp_vocab_q8"),
         };
     }
 
@@ -184,6 +188,17 @@ pub fn vocab(k: *const Kernels, s: cuda.Stream, base: u64, latent: u64, fold: u6
     try go(k.vocab, s, .{ .x = @intCast((nv + 7) / 8) }, 256, &a);
 }
 
+/// `vocab` over the int8 fold: `codes` [nv, 256] int8, then fp16 scales [nv, 8] at `scales`.
+pub fn vocabQ8(k: *const Kernels, s: cuda.Stream, base: u64, latent: u64, codes: u64, scales: u64, fbias: u64, cap: f32, valid: usize, nv: usize, out: u64) !void {
+    var a: cuda.Args = .{};
+    for ([_]u64{ base, latent, codes, scales, fbias }) |v| a.add(v);
+    a.add(cap);
+    a.add(int(valid));
+    a.add(int(nv));
+    a.add(out);
+    try go(k.vocab_q8, s, .{ .x = @intCast((nv + 7) / 8) }, 256, &a);
+}
+
 pub fn pick(k: *const Kernels, s: cuda.Stream, picks: u64, world: usize, walk: u64, j: usize) !void {
     var a: cuda.Args = .{};
     a.add(picks);
@@ -213,6 +228,20 @@ pub fn foldTile(k: *const Kernels, s: cuda.Stream, src: u64, tile: usize, src_st
     a.add(fold);
     a.add(fbias);
     try go(k.fold, s, .{ .x = @intCast((tile + 255) / 256) }, 256, &a);
+}
+
+/// `foldTile` into the int8 fold: `codes` [V, r] and `scales` [V, r / 32].
+pub fn foldTileQ8(k: *const Kernels, s: cuda.Stream, src: u64, tile: usize, src_stride: usize, row0: usize, r: usize, codes: u64, scales: u64, fbias: u64) !void {
+    var a: cuda.Args = .{};
+    a.add(src);
+    a.add(int(tile));
+    a.add(@as(i64, @intCast(src_stride)));
+    a.add(int(row0));
+    a.add(int(r));
+    a.add(codes);
+    a.add(scales);
+    a.add(fbias);
+    try go(k.fold_q8, s, .{ .x = @intCast((tile + 255) / 256) }, 256, &a);
 }
 
 test "dspark ops: argument structs keep dspark.cu's layouts; chunks by absolute position" {

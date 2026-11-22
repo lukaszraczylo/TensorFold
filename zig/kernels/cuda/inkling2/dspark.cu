@@ -1,6 +1,7 @@
 // Inkling 2's DSpark drafter: tap mix, q/k norm + RoPE into the draft caches, block attention, the Markov head.
 #include <cstdint>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 namespace ink2d {
 
@@ -342,4 +343,56 @@ extern "C" __global__ void tf_ink2_dsp_fold(const float* __restrict__ src, int t
     if (v >= tile) return;
     for (int r = 0; r < R; ++r) fold[static_cast<size_t>(row0 + v) * R + r] = tobf(src[static_cast<size_t>(r) * src_stride + v]);
     fbias[row0 + v] = tobf(src[static_cast<size_t>(R) * src_stride + v]);
+}
+
+// tf_ink2_dsp_fold into int8 codes [V][R] and fp16 scales [V][R / 32] (a scale per 32 values, Q8_0 planar), from the bf16-rounded fold values.
+extern "C" __global__ void tf_ink2_dsp_fold_q8(const float* __restrict__ src, int tile, long long src_stride, int row0, int R,
+                                              int8_t* __restrict__ codes, __half* __restrict__ scales, uint16_t* __restrict__ fbias) {
+    using namespace ink2d;
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= tile) return;
+    const size_t row = static_cast<size_t>(row0 + v);
+    for (int b = 0; b < R / 32; ++b) {
+        float e[32];
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            e[i] = bfr(src[static_cast<size_t>(b * 32 + i) * src_stride + v]);
+            amax = fmaxf(amax, fabsf(e[i]));
+        }
+        const __half sc = __float2half_rn(amax / 127.0f);
+        const float s32 = __half2float(sc);
+        for (int i = 0; i < 32; ++i) {
+            const int q = s32 == 0.0f ? 0 : static_cast<int>(fminf(127.0f, fmaxf(-127.0f, roundf(e[i] / s32))));
+            codes[row * R + b * 32 + i] = static_cast<int8_t>(q);
+        }
+        scales[row * (R / 32) + b] = sc;
+    }
+    fbias[row0 + v] = tobf(src[static_cast<size_t>(R) * src_stride + v]);
+}
+
+// tf_ink2_dsp_vocab over the int8 fold (rank 256): a lane reads 8 codes, 4 lanes share a scale.
+extern "C" __global__ void __launch_bounds__(256) tf_ink2_dsp_vocab_q8(const uint16_t* __restrict__ base, const uint16_t* __restrict__ latent,
+                                                                       const int8_t* __restrict__ codes, const __half* __restrict__ scales,
+                                                                       const uint16_t* __restrict__ fbias, float cap, int valid, int nv,
+                                                                       float* __restrict__ out) {
+    using namespace ink2d;
+    const int v = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (v >= nv) return;
+    const int2 raw = *reinterpret_cast<const int2*>(codes + static_cast<size_t>(v) * 256 + lane * 8);
+    const uint4 lat = *reinterpret_cast<const uint4*>(latent + lane * 8);
+    const float sc = __half2float(scales[static_cast<size_t>(v) * 8 + (lane >> 2)]);
+    const uint32_t cw[2] = {static_cast<uint32_t>(raw.x), static_cast<uint32_t>(raw.y)};
+    const uint32_t lw[4] = {lat.x, lat.y, lat.z, lat.w};
+    float s = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t l2 = lw[j >> 1];
+        const float lv = __uint_as_float(((j & 1) ? (l2 & 0xffff0000u) : (l2 << 16)));
+        s += lv * (static_cast<float>(static_cast<int8_t>(cw[j >> 2] >> (8 * (j & 3)))) * sc);
+    }
+    s = warpSum(s);
+    if (lane != 0) return;
+    const float b = bfr(s + bf(fbias[v]));
+    const float x = bfr(bf(base[v]) + b);
+    out[v] = v < valid ? bfr(tanhf(x / cap) * cap) : -INFINITY;
 }
