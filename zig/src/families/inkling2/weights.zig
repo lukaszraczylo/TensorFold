@@ -459,7 +459,11 @@ pub fn loadDiag(gpa: std.mem.Allocator, io: std.Io, up: Uploader, dir: []const u
     const lp = try layer_plan.build(&w.cfg.text, precs);
     const sched = try visits.build(&w.cfg, &lp);
     w.plan = budget.plan(&w.cfg, &sched, precs, o);
-    try budget.check(w.plan, limit);
+    budget.check(w.plan, limit) catch |e| {
+        const mib = 1 << 20;
+        std.log.warn("inkling2 budget over: weights {d} kv {d} conv {d} scratch {d} total {d} limit {d} MiB (chunk_rows {d}, context {d})", .{ w.plan.weights / mib, w.plan.kv / mib, w.plan.conv / mib, w.plan.scratch / mib, w.plan.total / mib, limit / mib, o.chunk_rows, o.context });
+        return e;
+    };
 
     var collect: Collect = .{ .arena = a };
     try names.all(&w.cfg, precs, .model, &collect);

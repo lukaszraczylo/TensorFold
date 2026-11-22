@@ -4,10 +4,19 @@ const std = @import("std");
 const cuda = @import("cuda");
 const decode = @import("decode.zig");
 const engine = @import("engine.zig");
+const platform = @import("sys");
 const head = @import("head.zig");
 
 /// Rows a chunk holds when the caller does not choose.
 pub const default_chunk_rows = 512;
+pub const rows_env_name = "TF_INK2_PF_ROWS";
+
+/// Rows of a prompt chunk: TF_INK2_PF_ROWS, a multiple of the default up to the engine's scratch limit; unset keeps the default.
+pub fn chunkRows() !u32 {
+    const n = try platform.environment.read(u32, rows_env_name, default_chunk_rows);
+    if (n == 0 or n % default_chunk_rows != 0 or n > engine.max_chunk_rows) return error.InvalidEnvironment;
+    return n;
+}
 const bf16_bytes = 2;
 
 /// The chunk sizes a prompt of `len` ids is cut into: `chunk_rows` each, the last one shorter.
@@ -103,4 +112,9 @@ test "run refuses a chunk size the scratch cannot hold before it touches the dev
     const rows: head.RowRange = .{ .first = 0, .count = 1 };
     try ts.expectError(error.RowsExceedScratch, chunkLogprobs(&c, s, 0, &@as([65]u32, @splat(1)), 0, rows, 0, .{}));
     try ts.expectError(error.Inkling2EmptyChunk, chunkLogprobs(&c, s, 0, &.{}, 0, rows, 0, .{}));
+}
+
+test "chunk rows default to the grid when TF_INK2_PF_ROWS is unset" {
+    if (platform.environment.read(u32, rows_env_name, 0) catch 1 != 0) return error.SkipZigTest;
+    try std.testing.expectEqual(@as(u32, default_chunk_rows), try chunkRows());
 }

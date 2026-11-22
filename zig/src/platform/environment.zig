@@ -72,6 +72,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_INK2_PF_FP4", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 runs the Inkling 2 Mini NVFP4 routed experts of prompt chunks on the block-scaled FP4 mma, a numerics change in the prompt path only; default 0)" },
     .{ .name = "TF_INK2_PF_FP8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 runs the Inkling 2 Mini MXFP8 routed experts of prompt chunks on the block-scaled FP8 mma, a summation-order change in the prompt path only; default 0)" },
     .{ .name = "TF_INK2_PF_CTL", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 runs the Inkling 2 Mini controllers of prompt chunks on the bf16 mma, a summation-order change in the prompt path only; default 0)" },
+    .{ .name = "TF_INK2_PF_ROWS", .scope = .cuda, .kind = .u32, .forms = "a multiple of 512 up to 4096 (rows of an Inkling 2 Mini prompt chunk: more rows read each expert once for more tokens, and take more device memory; default 512)" },
     .{ .name = "TF_INK2_PF_BF16", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 runs the Inkling 2 Mini attention projections of prompt chunks on the bf16 mma, a summation-order change in the prompt path only; default 0)" },
     .{ .name = "TF_QMMF_HALF_BELOW", .scope = .cuda, .kind = .size, .forms = "a whole nonnegative native-size block count (0 disables half tiles)" },
     // Qwen 3.5 CUDA and HIP settings, read through this table:

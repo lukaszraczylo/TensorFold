@@ -40,14 +40,15 @@ const Lane = struct {
 /// The draft head and what a window needs around it (TF_INK2_MTP).
 const Mtp = struct {
     head: drafter_mod.Drafter,
-    taps: cuda.DeviceBuffer, // bf16 [slots][prompt_rows][taps][hidden]: the rows the last forward of a slot tapped
+    taps: cuda.DeviceBuffer, // bf16 [slots][rows][taps][hidden]: the rows the last forward of a slot tapped
+    rows: u32, // the engine's chunk rows
     row_bytes: u64,
     logits: cuda.DeviceBuffer, // fp32 [mtp_rows][vocab]: a window's rows
     val: cuda.DeviceBuffer, // fp32 [mtp_rows]
     id: cuda.DeviceBuffer, // i32 [mtp_rows]
 
     fn slotTaps(m: *const Mtp, slot: u32) u64 {
-        return m.taps.ptr + @as(u64, slot) * prompt_rows * m.row_bytes;
+        return m.taps.ptr + @as(u64, slot) * m.rows * m.row_bytes;
     }
 };
 
@@ -150,7 +151,8 @@ pub const Inkling = struct {
         var head_run = try drafter_mod.Drafter.init(gpa, src.io, c, src.dir, streams, context);
         errdefer head_run.deinit();
         const row_bytes = @as(u64, m.taps_n) * c.text.hidden * 2;
-        var taps = try cuda.DeviceBuffer.alloc(d, @as(usize, streams) * prompt_rows * row_bytes);
+        const chunk_rows = c.scratch.geometry.max_rows;
+        var taps = try cuda.DeviceBuffer.alloc(d, @as(usize, streams) * chunk_rows * row_bytes);
         errdefer taps.free();
         const n: usize = c.text.unpadded_vocab;
         var logits = try cuda.DeviceBuffer.alloc(d, mtp_rows * n * 4);
@@ -158,7 +160,7 @@ pub const Inkling = struct {
         var val = try cuda.DeviceBuffer.alloc(d, mtp_rows * 4);
         errdefer val.free();
         const id = try cuda.DeviceBuffer.alloc(d, mtp_rows * 4);
-        return .{ .head = head_run, .taps = taps, .row_bytes = row_bytes, .logits = logits, .val = val, .id = id };
+        return .{ .head = head_run, .taps = taps, .rows = chunk_rows, .row_bytes = row_bytes, .logits = logits, .val = val, .id = id };
     }
 
     pub fn deinit(x: *Inkling) void {
@@ -217,7 +219,12 @@ pub const Inkling = struct {
     fn absorb(x: *Inkling, l: *Lane, row0: usize, rows: usize, pos0: u64) !void {
         const m = if (x.mtp) |*m| m else return;
         const taps = m.slotTaps(l.slot);
-        try m.head.writeContext(x.s, l.slot, taps + row0 * m.row_bytes, rows, pos0);
+        var done: usize = 0;
+        while (done < rows) {
+            const n = @min(drafter_mod.write_rows, rows - done);
+            try m.head.writeContext(x.s, l.slot, taps + (row0 + done) * m.row_bytes, n, pos0 + done);
+            done += n;
+        }
         try m.head.setRnnContext(x.s, l.slot, taps, row0 + rows - 1);
         l.written = pos0 + rows;
     }
@@ -274,7 +281,7 @@ pub const Inkling = struct {
         const p = s.prompt();
         const at = l.fill.?;
         if (s.isCancelled()) return error.Cancelled;
-        const end = @min(p.len, (at / prompt_rows + 1) * prompt_rows);
+        const end = @min(p.len, (at / x.c.scratch.geometry.max_rows + 1) * x.c.scratch.geometry.max_rows);
         const done = end == p.len;
         x.arm(l, false);
         prof.promptBegin(x.s.handle);

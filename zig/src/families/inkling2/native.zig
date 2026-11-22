@@ -12,6 +12,7 @@ const visits = @import("visits.zig");
 const weights = @import("weights.zig");
 const be = @import("backend.zig");
 const drafter = @import("drafter.zig");
+const prefill = @import("prefill.zig");
 
 pub const model_type = "inkling2_loop";
 pub const formats: []const []const u8 = &.{"modelopt-nvfp4"};
@@ -77,6 +78,7 @@ test "a window past the checkpoint's maximum is cut to it, and a zero maximum is
 /// Opens the model with `o.lanes` streams, or (`lanes_fixed` off) the most of them that fit the room; the plan refuses first.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     if (kernels != null) return error.CapturedKernels;
+    const rows = try prefill.chunkRows();
     const embed_host = try platform.environment.read(bool, embed_host_env, false);
     const mtp = try platform.environment.read(bool, drafter.enable_env, false);
     const kv8 = try platform.environment.read(bool, cache.kv8_env, false);
@@ -89,8 +91,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const context = try clampContext(gpa, io, dir, o.context);
     var n: u32 = @max(o.lanes, 1);
     while (true) {
-        const wo: budget.Options = .{ .context = context, .streams = n, .chunk_rows = prompt_rows, .embed_host = embed_host, .kv8 = kv8 };
-        const draft_bytes: u64 = if (mtp) try draftBytes(gpa, io, dir, n) else 0;
+        const wo: budget.Options = .{ .context = context, .streams = n, .chunk_rows = rows, .embed_host = embed_host, .kv8 = kv8 };
+        const draft_bytes: u64 = if (mtp) try draftBytes(gpa, io, dir, n, rows) else 0;
         own.w = weights.load(gpa, io, weights.deviceUploader(ctx.d), dir, wo, room -| draft_bytes) catch |e| {
             if (e != error.OverBudget or o.lanes_fixed or n == 1) return e;
             n -= 1;
@@ -103,7 +105,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const text = &own.w.cfg.text;
     const layers = try plan.build(text, own.w.prec[0..text.layers]);
     own.sched = try visits.build(&own.w.cfg, &layers);
-    const co: cache.Options = .{ .context = context, .streams = n, .chunk_rows = prompt_rows, .kv8 = kv8 };
+    const co: cache.Options = .{ .context = context, .streams = n, .chunk_rows = rows, .kv8 = kv8 };
     own.cache = try cache.Cache.init(ctx.d, &own.sched, text, co);
     errdefer own.cache.deinit();
     own.c.init(gpa, io, ctx.d, &own.w, own.sched, &own.cache, co) catch |e| return if (e == error.FileNotFound) error.AblitFileMissing else e; // the only file `Ctx.init` reads
@@ -114,7 +116,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .backend = own.ib.backend(),
         .facts = own.ib.facts(),
         .rows = if (mtp) be.mtp_rows else window_rows,
-        .stream_bytes = @intCast(cache.bytes(&own.sched, text, .{ .context = context, .streams = 1, .chunk_rows = prompt_rows, .kv8 = kv8 })),
+        .stream_bytes = @intCast(cache.bytes(&own.sched, text, .{ .context = context, .streams = 1, .chunk_rows = rows, .kv8 = kv8 })),
         .free_streams = n,
         .ctx = own,
         .deinit = release,
@@ -124,7 +126,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
 
 /// What the draft head holds beyond the target: the checkpoint's mtp.safetensors, the fold of its Markov bias through the
 /// unembedding, each stream's tapped rows and the head's scratch.
-fn draftBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, streams: u32) !u64 {
+fn draftBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, streams: u32, rows: u32) !u64 {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -133,7 +135,7 @@ fn draftBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, streams: u32)
     const path = try std.fs.path.join(a, &.{ dir, drafter.file_name });
     const file = try std.Io.Dir.cwd().statFile(io, path, .{});
     const fold = @as(u64, cfg.text.unpadded_vocab) * m.rank * 2;
-    const taps = @as(u64, streams) * prompt_rows * m.taps_n * cfg.text.hidden * 2;
+    const taps = @as(u64, streams) * rows * m.taps_n * cfg.text.hidden * 2;
     return file.size + fold + taps + draft_scratch_bytes;
 }
 
