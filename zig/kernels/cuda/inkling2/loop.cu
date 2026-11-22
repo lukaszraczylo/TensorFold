@@ -196,9 +196,9 @@ __device__ __forceinline__ float ue8m0Value(int biased) {
 
 // values (float32 [rows, k]) and exps (uint8 [rows, k/32]) may be null: ref.quant.mxfp8_codes' outputs.
 __device__ void actqMxfp8Row(
-    const __nv_bfloat16* x, float* out, float* values, uint8_t* exps, int row, int k) {
+    const __nv_bfloat16* x, float* out, float* values, uint8_t* exps, uint8_t* pcodes, int row, int k) {
     const __nv_bfloat16* xr = x + (size_t)row * k;
-    float* outr = out + (size_t)row * k;
+    float* outr = out != nullptr ? out + (size_t)row * k : nullptr;
     for (int g = threadIdx.x; g < k / kMxBlock; g += kThreads) {
         float v[kMxBlock];
         float gmax = 0.0f;
@@ -214,19 +214,25 @@ __device__ void actqMxfp8Row(
         for (int i = 0; i < kMxBlock; ++i) {
             const float q = fminf(fmaxf(__fdiv_rn(v[i], scale), -kE4m3Max), kE4m3Max);
             const float qv = e4m3Round(q);
-            outr[g * kMxBlock + i] = __fmul_rn(qv, scale);
+            if (outr != nullptr) outr[g * kMxBlock + i] = __fmul_rn(qv, scale);
+            if (pcodes != nullptr) pcodes[(size_t)row * k + g * kMxBlock + i] = (uint8_t)__nv_cvt_float_to_fp8(qv, __NV_SATFINITE, __NV_E4M3);
             if (values != nullptr) values[(size_t)row * k + g * kMxBlock + i] = qv;
         }
     }
 }
 
 extern "C" __global__ void tf_ink2l_actq_mxfp8(const __nv_bfloat16* x, float* out, int rows, int k) {
-    if (blockIdx.x < rows) actqMxfp8Row(x, out, nullptr, nullptr, blockIdx.x, k);
+    if (blockIdx.x < rows) actqMxfp8Row(x, out, nullptr, nullptr, nullptr, blockIdx.x, k);
+}
+
+// The prompt FP8 mma's input: e4m3 codes at pcodes [rows, k] and the UE8M0 biased exponents at exps [rows, k/32]; out may be null.
+extern "C" __global__ void tf_ink2l_actq_mxfp8_pack(const __nv_bfloat16* x, float* out, uint8_t* pcodes, uint8_t* exps, int rows, int k) {
+    if (blockIdx.x < rows) actqMxfp8Row(x, out, nullptr, exps, pcodes, blockIdx.x, k);
 }
 
 extern "C" __global__ void tf_ink2l_actq_mxfp8_codes(
     const __nv_bfloat16* x, float* out, float* values, uint8_t* exps, int rows, int k) {
-    if (blockIdx.x < rows) actqMxfp8Row(x, out, values, exps, blockIdx.x, k);
+    if (blockIdx.x < rows) actqMxfp8Row(x, out, values, exps, nullptr, blockIdx.x, k);
 }
 
 // ---- Expert decode path: GEMV on the stored weights, softcapped SwiGLU, combine ----

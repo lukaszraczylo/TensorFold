@@ -130,6 +130,128 @@ __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const
     }
 }
 
+
+// MXFP8: e4m3 codes with a UE8M0 scale a 32 on both sides, on the block-scaled e4m3 mma (m16n8k32): no outer scale.
+__device__ __forceinline__ void mmaMx8(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, uint32_t sa, uint32_t sb) {
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
+    const uint16_t z = 0;
+    asm volatile(
+        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, %10, {%11, %12}, %13, {%14, %15};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sa), "h"(z), "h"(z), "r"(sb), "h"(z), "h"(z));
+#else
+    __trap();
+#endif
+}
+
+struct Step8 {
+    uint32_t a[kMt][4], sa[kMt];
+    uint2 b[kTj];
+    uint32_t sb[kTj];
+};
+
+// As `grouped` on MXFP8: act codes [rows, K] bytes, exps [rows, K/32], weights [E, N, K] bytes, ws [E, N, K/32].
+template <bool DOWN>
+__device__ __forceinline__ void groupedMx(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ xs, int act_div,
+                                          const int* __restrict__ offsets, const int* __restrict__ items,
+                                          const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws,
+                                          void* __restrict__ out, int N, int K) {
+    const int e = blockIdx.y;
+    const int begin = offsets[e];
+    const int first = blockIdx.z * kPairs;
+    const int cnt = min(offsets[e + 1] - begin - first, kPairs);
+    if (cnt <= 0) return;
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int n0 = blockIdx.x * kBlockCols + (threadIdx.x >> 5) * kTj * 8;
+    const int KG = K / 32;
+
+    const uint8_t* c0[kMt];
+    const uint8_t* c1[kMt];
+    const uint8_t* sr[kMt];
+    bool v0[kMt], v1[kMt];
+    int p0[kMt], p1[kMt];
+    const bool hi = t & 1;
+#pragma unroll
+    for (int m = 0; m < kMt; ++m) {
+        const int r0 = m * 16 + g, r1 = r0 + 8;
+        v0[m] = r0 < cnt;
+        v1[m] = r1 < cnt;
+        p0[m] = v0[m] ? __ldg(items + begin + first + r0) : 0;
+        p1[m] = v1[m] ? __ldg(items + begin + first + r1) : 0;
+        const int x0 = p0[m] / act_div, x1 = p1[m] / act_div;
+        c0[m] = codes + (size_t)x0 * K;
+        c1[m] = codes + (size_t)x1 * K;
+        sr[m] = xs + (size_t)(hi ? x1 : x0) * (K / 32);
+    }
+    const uint8_t* wr[kTj];
+    const uint8_t* sw[kTj];
+#pragma unroll
+    for (int j = 0; j < kTj; ++j) {
+        const size_t row = (size_t)e * N + n0 + j * 8 + g;
+        wr[j] = w + row * K;
+        sw[j] = ws + row * (K / 32);
+    }
+
+    auto fetch = [&](int kg, Step8& f) {
+#pragma unroll
+        for (int m = 0; m < kMt; ++m) {
+            f.a[m][0] = v0[m] ? __ldg(reinterpret_cast<const uint32_t*>(c0[m] + kg * 32 + 4 * t)) : 0u;
+            f.a[m][1] = v1[m] ? __ldg(reinterpret_cast<const uint32_t*>(c1[m] + kg * 32 + 4 * t)) : 0u;
+            f.a[m][2] = v0[m] ? __ldg(reinterpret_cast<const uint32_t*>(c0[m] + kg * 32 + 16 + 4 * t)) : 0u;
+            f.a[m][3] = v1[m] ? __ldg(reinterpret_cast<const uint32_t*>(c1[m] + kg * 32 + 16 + 4 * t)) : 0u;
+            f.sa[m] = (hi ? v1[m] : v0[m]) ? (uint32_t)__ldg(sr[m] + kg) : 0u;
+        }
+#pragma unroll
+        for (int j = 0; j < kTj; ++j) {
+            f.b[j] = make_uint2(__ldg(reinterpret_cast<const uint32_t*>(wr[j] + kg * 32 + 4 * t)),
+                                __ldg(reinterpret_cast<const uint32_t*>(wr[j] + kg * 32 + 16 + 4 * t)));
+            f.sb[j] = (uint32_t)__ldg(sw[j] + kg);
+        }
+    };
+
+    float acc[kMt][kTj][4];
+#pragma unroll
+    for (int m = 0; m < kMt; ++m)
+#pragma unroll
+        for (int j = 0; j < kTj; ++j) acc[m][j][0] = acc[m][j][1] = acc[m][j][2] = acc[m][j][3] = 0.0f;
+
+    Step8 st[2];
+    fetch(0, st[0]);
+    for (int kg = 0; kg < KG; kg += 2) {
+        if (kg + 1 < KG) fetch(kg + 1, st[1]);
+#pragma unroll
+        for (int m = 0; m < kMt; ++m)
+#pragma unroll
+            for (int j = 0; j < kTj; ++j) mmaMx8(acc[m][j], st[0].a[m], st[0].b[j].x, st[0].b[j].y, st[0].sa[m], st[0].sb[j]);
+        if (kg + 1 >= KG) break;
+        if (kg + 2 < KG) fetch(kg + 2, st[0]);
+#pragma unroll
+        for (int m = 0; m < kMt; ++m)
+#pragma unroll
+            for (int j = 0; j < kTj; ++j) mmaMx8(acc[m][j], st[1].a[m], st[1].b[j].x, st[1].b[j].y, st[1].sa[m], st[1].sb[j]);
+    }
+
+#pragma unroll
+    for (int m = 0; m < kMt; ++m) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            if (!(h ? v1[m] : v0[m])) continue;
+            const int p = h ? p1[m] : p0[m];
+#pragma unroll
+            for (int j = 0; j < kTj; ++j) {
+                const int col = n0 + j * 8 + 2 * t;
+                const float s0 = acc[m][j][2 * h], s1 = acc[m][j][2 * h + 1];
+                if constexpr (DOWN) {
+                    *reinterpret_cast<float2*>(static_cast<float*>(out) + (size_t)p * N + col) = make_float2(bf16Round(s0), bf16Round(s1));
+                } else {
+                    *reinterpret_cast<__nv_bfloat162*>(static_cast<__nv_bfloat16*>(out) + (size_t)p * N + col) = __floats2bfloat162_rn(s0, s1);
+                }
+            }
+        }
+    }
+}
+
 }  // namespace ink2p
 
 extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)
@@ -239,4 +361,16 @@ extern "C" __global__ void __launch_bounds__(ink2p::kDenseWarps * 32)
                 if (col < n) *reinterpret_cast<float2*>(out + (size_t)r * out_stride + col) = make_float2(acc[mt][j][2 * h], acc[mt][j][2 * h + 1]);
             }
         }
+}
+
+extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)
+    tf_ink2p_gu_mxfp8(const uint8_t* codes, const uint8_t* xs, int act_div, const int* offsets, const int* items,
+                      const uint8_t* w, const uint8_t* ws, __nv_bfloat16* out, int N, int K) {
+    ink2p::groupedMx<false>(codes, xs, act_div, offsets, items, w, ws, out, N, K);
+}
+
+extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)
+    tf_ink2p_down_mxfp8(const uint8_t* codes, const uint8_t* xs, int act_div, const int* offsets, const int* items,
+                        const uint8_t* w, const uint8_t* ws, float* out, int N, int K) {
+    ink2p::groupedMx<true>(codes, xs, act_div, offsets, items, w, ws, out, N, K);
 }

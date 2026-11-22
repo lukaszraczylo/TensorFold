@@ -136,21 +136,21 @@ pub fn forwardPath(env: *const Env, s: cuda.Stream, layer: *const weights.LayerW
     try ops.topk(env.ops, s, sc.scores.ptr, layer.mlp.gate_bias.ptr, sc.pick.ptr, sc.gamma.ptr, rows, experts, top, route_scale);
     prof.picks(s.handle, sc.pick.ptr, rows);
 
-    const fp4 = if (env.pf4) |st| (if (st.experts and path == .grouped and prec == .nvfp4) st else null) else null;
-    if (fp4) |st| try prefill4.pack(&st.k, s, x, 0, st.bufs.actX(), rows, hidden) else try actQuant(k, s, prec, x, sc.act.ptr, rows, hidden);
+    const fp4 = if (env.pf4) |st| (if (path == .grouped and st.takes(prec)) st else null) else null;
+    if (fp4) |st| try prefill4.pack(&st.k, prec, s, x, 0, st.bufs.actX(), rows, hidden) else try actQuant(k, s, prec, x, sc.act.ptr, rows, hidden);
     const w13 = gemm(ex.w13, ex.w13_scale, ex.w13_amax, ex.w13_outer);
     const w2 = gemm(ex.w2, ex.w2_scale, ex.w2_amax, ex.w2_outer);
     if (path == .grouped) try loop_kernels.expertGroup(k, s, sc.pick.ptr, rows, experts, sc.offsets.ptr, sc.items.ptr, sc.counts.ptr);
     if (fp4) |st| {
-        try prefill4.gateUp(&st.k, s, st.bufs.actX(), sc.offsets.ptr, sc.items.ptr, w13, sc.gu.ptr, rows, experts, 2 * inter, hidden);
+        try prefill4.gateUp(&st.k, prec, s, st.bufs.actX(), sc.offsets.ptr, sc.items.ptr, w13, sc.gu.ptr, rows, experts, 2 * inter, hidden);
     } else switch (path) {
         .naive => try loop_kernels.expertGateUp(k, s, prec, sc.act.ptr, sc.pick.ptr, w13, sc.gu.ptr, rows, 2 * inter, hidden),
         .grouped => try loop_kernels.expertGateUpGrouped(k, s, prec, sc.act.ptr, sc.offsets.ptr, sc.items.ptr, w13, sc.gu.ptr, rows, experts, 2 * inter, hidden),
     }
     try loop_kernels.situ(k, s, sc.gu.ptr, sc.gamma.ptr, sc.y.ptr, rows, inter, gate_cap, up_cap);
-    if (fp4) |st| try prefill4.pack(&st.k, s, sc.y.ptr, 0, st.bufs.actY(), pairs, inter) else try actQuant(k, s, prec, sc.y.ptr, sc.yq.ptr, pairs, inter);
+    if (fp4) |st| try prefill4.pack(&st.k, prec, s, sc.y.ptr, 0, st.bufs.actY(), pairs, inter) else try actQuant(k, s, prec, sc.y.ptr, sc.yq.ptr, pairs, inter);
     if (fp4) |st| {
-        try prefill4.down(&st.k, s, st.bufs.actY(), sc.offsets.ptr, sc.items.ptr, w2, sc.dn.ptr, rows, experts, hidden, inter);
+        try prefill4.down(&st.k, prec, s, st.bufs.actY(), sc.offsets.ptr, sc.items.ptr, w2, sc.dn.ptr, rows, experts, hidden, inter);
     } else switch (path) {
         .naive => try loop_kernels.expertDown(k, s, prec, sc.yq.ptr, sc.pick.ptr, w2, sc.dn.ptr, rows, hidden, inter),
         .grouped => try loop_kernels.expertDownGrouped(k, s, prec, sc.yq.ptr, sc.offsets.ptr, sc.items.ptr, w2, sc.dn.ptr, rows, experts, hidden, inter),
