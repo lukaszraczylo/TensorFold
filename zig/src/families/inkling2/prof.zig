@@ -19,11 +19,13 @@ pub const tag_head: u8 = 49;
 pub const tag_keep: u8 = 50;
 pub const tag_draft: u8 = 51;
 const tags = 52;
-const report_every = 32;
+const report_every: u64 = 32;
+/// `prompt` mode times one prompt chunk as a token and reports every this many chunks.
+const prompt_report_every: u64 = 8;
 /// The decode token whose launch sequence is printed whole (it is the 6th timed one: caches are warm).
 const seq_token = 6;
 
-const Mode = enum { off, count, time, visit_sync, dup_head, round, experts };
+const Mode = enum { off, count, time, visit_sync, dup_head, round, experts, prompt };
 
 const Name = struct { handle: abi.Function = null, text: []const u8 = "", calls: u64 = 0, busy_us: f64 = 0, gap_us: f64 = 0 };
 
@@ -107,11 +109,11 @@ fn nameOf(f: abi.Function) u16 {
 }
 
 fn timed_mode() bool {
-    return mode == .time or mode == .round;
+    return mode == .time or mode == .round or mode == .prompt;
 }
 
 fn timed() bool {
-    return active and (mode == .time or mode == .round);
+    return active and timed_mode();
 }
 
 fn record(stream: abi.Stream, idx: usize) void {
@@ -215,7 +217,7 @@ pub fn install(d: *const cuda.Driver) !void {
     drv = d;
     const api: *abi.Api = @constCast(&d.api);
     orig = .{ .launch = api.cuLaunchKernel, .launch_ex = api.cuLaunchKernelEx, .sync = api.cuStreamSynchronize, .htod = api.cuMemcpyHtoD_v2, .htod_async = api.cuMemcpyHtoDAsync_v2, .dtoh = api.cuMemcpyDtoH_v2, .dtoh_async = api.cuMemcpyDtoHAsync_v2 };
-    if (mode == .time or mode == .round) for (&events) |*e| try d.check(d.api.cuEventCreate(e, 0), "cuEventCreate");
+    if (timed_mode()) for (&events) |*e| try d.check(d.api.cuEventCreate(e, 0), "cuEventCreate");
     api.cuLaunchKernel = launchThunk;
     api.cuLaunchKernelEx = launchExThunk;
     api.cuStreamSynchronize = syncThunk;
@@ -238,8 +240,21 @@ pub fn at(t: u8) void {
 
 /// The start of a decode token (before its embedding); `stream` takes the timeline's origin event.
 pub fn begin(stream: abi.Stream) void {
-    if (mode == .off or mode == .round) return;
+    if (mode == .off or mode == .round or mode == .prompt) return;
     start(stream);
+}
+
+/// The start of a prompt chunk (`prompt` mode only).
+pub fn promptBegin(stream: abi.Stream) void {
+    if (mode != .prompt) return;
+    start(stream);
+}
+
+/// The end of a prompt chunk: the stream is drained so every event has fired.
+pub fn promptEnd() void {
+    if (mode != .prompt or !active) return;
+    _ = orig.sync(stream_h);
+    finish();
 }
 
 fn start(stream: abi.Stream) void {
@@ -249,7 +264,7 @@ fn start(stream: abi.Stream) void {
     stream_h = stream;
     head_dup_done = false;
     active = true;
-    if (mode == .time or mode == .round) record(stream, 0);
+    if (timed_mode()) record(stream, 0);
     t_begin = now();
 }
 
@@ -308,7 +323,7 @@ fn finish() void {
     if (timed_mode()) resolve();
     if (mode == .time and tokens_seen == seq_token) dumpSequence();
     add();
-    if (sums.tokens >= report_every) report();
+    if (sums.tokens >= (if (mode == .prompt) prompt_report_every else report_every)) report();
 }
 
 fn elapsedUs(a: usize, b: usize) f64 {
@@ -405,6 +420,10 @@ test "with TF_INK2_PROF unset every hook is inert" {
     try std.testing.expect(!active);
     end();
     try std.testing.expectEqual(@as(u64, 0), tokens_seen);
+}
+
+test "prompt mode is a documented word and is timed" {
+    try std.testing.expectEqual(Mode.prompt, std.meta.stringToEnum(Mode, "prompt").?);
 }
 
 test "profile modes are the documented words" {

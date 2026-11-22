@@ -277,8 +277,10 @@ pub const Inkling = struct {
         const end = @min(p.len, (at / prompt_rows + 1) * prompt_rows);
         const done = end == p.len;
         x.arm(l, false);
+        prof.promptBegin(x.s.handle);
         try pre.chunk(x.c, x.s, l.slot, p[at..end], at, if (done) x.heads[l.slot].r.logits else null, .{});
         try x.absorb(l, 0, end - at, at);
+        prof.promptEnd();
         s.fill_at.store(@intCast(end), .monotonic);
         l.fill = if (done) null else end;
         if (done) l.len = p.len;
