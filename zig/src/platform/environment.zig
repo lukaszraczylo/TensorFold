@@ -69,6 +69,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_INK2_MTP", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 loads the Inkling 2 Mini draft head from mtp.safetensors and verifies windows of up to 8 rows; default 0)" },
     .{ .name = "TF_INK2_DRAFT8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 stores the Inkling 2 Mini draft head's vocabulary fold and layer weights as int8 with fp16 block scales; only the proposals change; default 0)" },
     .{ .name = "TF_INK2_KV8", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 stores the Inkling 2 global layers' attention K and V caches as int8 with an fp32 scale a token and head, a numerics change; default 0)" },
+    .{ .name = "TF_INK2_PF_FP4", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 runs the Inkling 2 Mini NVFP4 routed experts of prompt chunks on the block-scaled FP4 mma, a numerics change in the prompt path only; default 0)" },
     .{ .name = "TF_QMMF_HALF_BELOW", .scope = .cuda, .kind = .size, .forms = "a whole nonnegative native-size block count (0 disables half tiles)" },
     // Qwen 3.5 CUDA and HIP settings, read through this table:
     .{ .name = "TENSORFOLD_MEMORY_RESERVE_GIB", .scope = .cuda, .kind = .real, .forms = "a finite GiB amount (the HIP admission's floor and the memory's size still bound it)" },

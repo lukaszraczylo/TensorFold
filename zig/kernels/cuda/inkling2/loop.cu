@@ -48,6 +48,13 @@ __device__ __forceinline__ float e2m1RneSat(float x) {
     return copysignf(grid[code], x);
 }
 
+// The e2m1 nibble of a grid value: the index into {0, .5, 1, 1.5, 2, 3, 4, 6}, the sign in bit 3.
+__device__ __forceinline__ uint32_t e2m1Nibble(float v) {
+    const float a = fabsf(v);
+    const uint32_t idx = (a >= 0.5f) + (a >= 1.0f) + (a >= 1.5f) + (a >= 2.0f) + (a >= 3.0f) + (a >= 4.0f) + (a >= 6.0f);
+    return idx | (signbit(v) ? 8u : 0u);
+}
+
 // ref.quant._pairwise_sum over 16 values: adjacent pairs, level by level.
 __device__ __forceinline__ float pairwise16(float* e) {
     #pragma unroll
@@ -95,10 +102,11 @@ __device__ float blockMax(float v, float* red) {
 // amax_out (each may be null) are what ref.quant.nvfp4_codes returns: e2m1 values [rows, k], e4m3 block
 // scales [rows, k/16] and the row amax [rows], all float32.
 __device__ void actqNvfp4Row(
-    const __nv_bfloat16* x, float* out, float* values, float* scales, float* amax_out, int row, int k) {
+    const __nv_bfloat16* x, float* out, float* values, float* scales, float* amax_out, uint8_t* pcodes, uint8_t* pscales,
+    int row, int k) {
     __shared__ float red[kWarps];
     const __nv_bfloat16* xr = x + (size_t)row * k;
-    float* outr = out + (size_t)row * k;
+    float* outr = out != nullptr ? out + (size_t)row * k : nullptr;
     if (amax_out == nullptr) values = scales = nullptr;
 
     float m = 0.0f;
@@ -125,8 +133,20 @@ __device__ void actqNvfp4Row(
         nvfp4Candidate(blocks, block_max, encoder, decoder, err_outer, factor6, c6);
         nvfp4Candidate(blocks, block_max, encoder, decoder, err_outer, factor4, c4);
         const Candidate& w = (c4.err < c6.err) ? c4 : c6;
-        #pragma unroll
-        for (int i = 0; i < kNvBlock; ++i) outr[b * kNvBlock + i] = __fmul_rn(__fmul_rn(w.values[i], w.scale), outer);
+        if (outr != nullptr) {
+            #pragma unroll
+            for (int i = 0; i < kNvBlock; ++i) outr[b * kNvBlock + i] = __fmul_rn(__fmul_rn(w.values[i], w.scale), outer);
+        }
+        if (pcodes != nullptr) {
+            uint32_t lo = 0, hi = 0;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                lo |= e2m1Nibble(w.values[i]) << (4 * i);
+                hi |= e2m1Nibble(w.values[8 + i]) << (4 * i);
+            }
+            *reinterpret_cast<uint2*>(pcodes + (size_t)row * (k / 2) + b * 8) = make_uint2(lo, hi);
+            pscales[(size_t)row * (k / kNvBlock) + b] = (uint8_t)__nv_cvt_float_to_fp8(w.scale, __NV_SATFINITE, __NV_E4M3);
+        }
         if (values != nullptr) {
             scales[(size_t)row * (k / kNvBlock) + b] = w.scale;
             #pragma unroll
@@ -136,12 +156,19 @@ __device__ void actqNvfp4Row(
 }
 
 extern "C" __global__ void tf_ink2l_actq_nvfp4(const __nv_bfloat16* x, float* out, int rows, int k) {
-    if (blockIdx.x < rows) actqNvfp4Row(x, out, nullptr, nullptr, nullptr, blockIdx.x, k);
+    if (blockIdx.x < rows) actqNvfp4Row(x, out, nullptr, nullptr, nullptr, nullptr, nullptr, blockIdx.x, k);
+}
+
+// The prompt FP4 mma's input: the row's e2m1 codes packed two a byte (low nibble first) at pcodes [rows, k/2], the e4m3 block
+// scales at pscales [rows, k/16] and the row amax [rows]; the same quantisation as tf_ink2l_actq_nvfp4. out may be null.
+extern "C" __global__ void tf_ink2l_actq_nvfp4_pack(const __nv_bfloat16* x, float* out, float* amax, uint8_t* pcodes,
+                                                    uint8_t* pscales, int rows, int k) {
+    if (blockIdx.x < rows) actqNvfp4Row(x, out, nullptr, nullptr, amax, pcodes, pscales, blockIdx.x, k);
 }
 
 extern "C" __global__ void tf_ink2l_actq_nvfp4_codes(
     const __nv_bfloat16* x, float* out, float* values, float* scales, float* amax, int rows, int k) {
-    if (blockIdx.x < rows) actqNvfp4Row(x, out, values, scales, amax, blockIdx.x, k);
+    if (blockIdx.x < rows) actqNvfp4Row(x, out, values, scales, amax, nullptr, nullptr, blockIdx.x, k);
 }
 
 // The biased UE8M0 exponent of one 32-group: the power of two at or above raw, as ref.quant.mxfp8_codes builds it.

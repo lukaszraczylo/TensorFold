@@ -165,6 +165,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "inkling2_experts", .src = "inkling2/experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // ours: Inkling 2's grouped experts
     .{ .name = "inkling2_dspark", .src = "inkling2/dspark", .flags = glue }, // ours: Inkling 2's DSpark drafter glue
     .{ .name = "inkling2_loop", .src = "inkling2/loop", .flags = &.{ "-O3", "--fmad=false" } }, // ours: Inkling 2 Mini's looped-engine kernels
+    .{ .name = "inkling2_pf4", .src = "inkling2/prefill4", .flags = &.{"-O3"}, .arch_specific = true }, // ours: Inkling 2 Mini's NVFP4 prompt experts on the FP4 mma (sm_121a)
     .{ .name = "inkling2_vision", .src = "inkling2/vision", .flags = glue }, // ours: Inkling 2's vision tower glue and attention
     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5

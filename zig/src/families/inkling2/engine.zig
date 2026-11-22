@@ -9,6 +9,8 @@ const kernels = @import("kernels.zig");
 const loop_kernels = @import("loop_kernels.zig");
 const moe = @import("moe.zig");
 const ops = @import("ops.zig");
+const platform = @import("sys");
+const prefill4 = @import("prefill4.zig");
 const visits = @import("visits.zig");
 const weights = @import("weights.zig");
 
@@ -290,6 +292,7 @@ pub const Ctx = struct {
     scratch: Scratch,
     flow: Flow,
     moe_sc: moe.Scratch,
+    pf4: ?prefill4.State, // TF_INK2_PF_FP4: the prompt experts on the FP4 mma
     gpa: std.mem.Allocator,
     dq: cuda.DeviceBuffer, // bf16 expansion of an 8-bit weight a prompt GEMM reads; empty unless TF_INK2_DENSE8 or TF_INK2_HEAD8
     ablit: ?ablit.State, // TF_INK2_ABLIT: null leaves every visit unedited
@@ -330,7 +333,17 @@ pub const Ctx = struct {
         errdefer c.flow.deinit();
         c.moe_sc = try moe.Scratch.init(d, g.max_rows);
         errdefer c.moe_sc.deinit();
-        c.env = .{ .driver = d, .loop = &c.loop, .ops = &c.ops };
+        c.pf4 = null;
+        if (try platform.environment.read(bool, prefill4.env_name, false)) {
+            var k = try prefill4.Kernels.load(d, &c.loop);
+            errdefer k.unload();
+            c.pf4 = .{ .k = k, .bufs = try prefill4.Bufs.init(d, g.max_rows) };
+        }
+        errdefer if (c.pf4) |*st| {
+            st.bufs.deinit();
+            st.k.unload();
+        };
+        c.env = .{ .driver = d, .loop = &c.loop, .ops = &c.ops, .pf4 = if (c.pf4) |*st| st else null };
         c.gpa = gpa;
         c.ablit_hook = applyAblit;
         c.window = false;
@@ -343,6 +356,10 @@ pub const Ctx = struct {
     pub fn deinit(c: *Ctx) void {
         if (c.rec) |*r| r.deinit();
         if (c.ablit) |*st| ablit.close(st, c.gpa);
+        if (c.pf4) |*st| {
+            st.bufs.deinit();
+            st.k.unload();
+        }
         c.moe_sc.deinit();
         c.flow.deinit();
         c.scratch.deinit();
