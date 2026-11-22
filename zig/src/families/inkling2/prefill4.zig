@@ -6,6 +6,9 @@ const cuda = @import("cuda");
 const loop_kernels = @import("loop_kernels.zig");
 
 pub const env_name = "TF_INK2_PF_FP4";
+pub const dense_env_name = "TF_INK2_PF_BF16";
+/// Calls of at least this many rows run the prompt kernels (the decode kernels keep the smaller ones).
+pub const prompt_from = 17;
 const hidden = 2304;
 const inter = 1152;
 const warps = 4;
@@ -19,6 +22,7 @@ pub const Kernels = struct {
     pack: cuda.Function,
     gu: cuda.Function,
     down: cuda.Function,
+    dense: cuda.Function,
 
     /// `loop` holds the activation packer; the image holds the two grouped GEMMs.
     pub fn load(d: *const cuda.Driver, loop: *const loop_kernels.Kernels) !Kernels {
@@ -30,6 +34,7 @@ pub const Kernels = struct {
             .pack = try loop.mod.function("tf_ink2l_actq_nvfp4_pack"),
             .gu = try mod.function("tf_ink2p_gu_nvfp4"),
             .down = try mod.function("tf_ink2p_down_nvfp4"),
+            .dense = try mod.function("tf_ink2p_dense_rows"),
         };
     }
 
@@ -84,8 +89,26 @@ pub const Bufs = struct {
     }
 };
 
-/// The state a Ctx holds when the flag is on.
-pub const State = struct { k: Kernels, bufs: Bufs };
+/// The state a Ctx holds when either flag is on: `experts` is TF_INK2_PF_FP4, `dense` TF_INK2_PF_BF16.
+pub const State = struct { k: Kernels, bufs: Bufs, experts: bool, dense: bool };
+
+const dense_tile_rows = 64;
+const dense_tile_cols = 128;
+
+/// out float32 [m, n] = x bf16 [m, k] (row stride x_stride elements) times w bf16 [n, k] transposed, on the bf16 mma.
+pub fn denseRows(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, m: usize, n: usize, kdim: usize) !void {
+    if (kdim % 16 != 0 or n % 8 != 0 or x % 4 != 0 or w % 4 != 0 or x_stride % 2 != 0) return error.Misaligned;
+    if (m == 0 or n == 0) return;
+    var args: cuda.Args = .{};
+    args.add(x);
+    args.add(@as(i64, @intCast(x_stride)));
+    args.add(w);
+    args.add(out);
+    args.add(@as(i64, @intCast(out_stride)));
+    for ([_]usize{ m, n, kdim }) |v| args.add(@as(i32, @intCast(v)));
+    const grid: cuda.Dim3 = .{ .x = @intCast((n + dense_tile_cols - 1) / dense_tile_cols), .y = @intCast((m + dense_tile_rows - 1) / dense_tile_rows) };
+    try cuda.launch.launch(k.dense, .{ .grid = grid, .block = .{ .x = warps * 32 } }, s, &args);
+}
 
 /// Quantises bf16 `x` [rows, kdim] as tf_ink2l_actq_nvfp4 does, into `a`; `out` (float32 [rows, kdim], or 0) takes the dequantised values too.
 pub fn pack(k: *const Kernels, s: cuda.Stream, x: u64, out: u64, a: Act, rows: usize, kdim: usize) !void {
@@ -136,5 +159,15 @@ test "a width the tiles do not cover is refused before any launch" {
     const g: loop_kernels.ExpertGemm = .{ .w = 0, .scale = 0 };
     try std.testing.expectError(error.BadWidth, grouped(f, s, a, 8, 0, 0, g, 0, 512, 128, 100, 2304));
     try std.testing.expectError(error.BadWidth, grouped(f, s, a, 8, 0, 0, g, 0, 512, 128, 2304, 100));
-    try std.testing.expectError(error.BadWidth, pack(&.{ .mod = undefined, .pack = f, .gu = f, .down = f }, s, 0, 0, a, 4, 100));
+    try std.testing.expectError(error.BadWidth, pack(&.{ .mod = undefined, .pack = f, .gu = f, .down = f, .dense = f }, s, 0, 0, a, 4, 100));
+}
+
+test "dense rows refuses a width or address the fragments cannot load" {
+    var d: cuda.Driver = undefined;
+    const f: cuda.Function = .{ .d = &d, .handle = null };
+    const s: cuda.Stream = .{ .d = &d, .handle = null };
+    const k: Kernels = .{ .mod = undefined, .pack = f, .gu = f, .down = f, .dense = f };
+    try std.testing.expectError(error.Misaligned, denseRows(&k, s, 0, 2304, 0, 0, 3072, 512, 3072, 100));
+    try std.testing.expectError(error.Misaligned, denseRows(&k, s, 0, 2304, 0, 0, 20, 512, 20, 2304));
+    try denseRows(&k, s, 0, 2304, 0, 0, 3072, 0, 3072, 2304);
 }

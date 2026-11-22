@@ -136,7 +136,7 @@ pub fn forwardPath(env: *const Env, s: cuda.Stream, layer: *const weights.LayerW
     try ops.topk(env.ops, s, sc.scores.ptr, layer.mlp.gate_bias.ptr, sc.pick.ptr, sc.gamma.ptr, rows, experts, top, route_scale);
     prof.picks(s.handle, sc.pick.ptr, rows);
 
-    const fp4 = if (env.pf4) |st| (if (path == .grouped and prec == .nvfp4) st else null) else null;
+    const fp4 = if (env.pf4) |st| (if (st.experts and path == .grouped and prec == .nvfp4) st else null) else null;
     if (fp4) |st| try prefill4.pack(&st.k, s, x, 0, st.bufs.actX(), rows, hidden) else try actQuant(k, s, prec, x, sc.act.ptr, rows, hidden);
     const w13 = gemm(ex.w13, ex.w13_scale, ex.w13_amax, ex.w13_outer);
     const w2 = gemm(ex.w2, ex.w2_scale, ex.w2_amax, ex.w2_outer);

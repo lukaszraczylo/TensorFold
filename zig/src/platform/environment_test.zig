@@ -107,6 +107,7 @@ const valid = [_]Case{
     .{ .name = "TF_INK2_DRAFT8", .raw = "1", .n = 1 },
     .{ .name = "TF_INK2_KV8", .raw = "1", .n = 1 },
     .{ .name = "TF_INK2_PF_FP4", .raw = "1", .n = 1 },
+    .{ .name = "TF_INK2_PF_BF16", .raw = "1", .n = 1 },
     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .raw = "0", .n = 0 },
     .{ .name = "TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS", .raw = "1", .n = 1 },
     .{ .name = "TF_PROMPT_INTERMEDIATE", .raw = "0", .n = 0 },

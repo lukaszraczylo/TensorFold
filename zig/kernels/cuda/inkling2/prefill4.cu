@@ -145,3 +145,98 @@ extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)
                         const float* denominator, float* out, int N, int K) {
     ink2p::grouped<true>(codes, xs, amax_a, act_div, offsets, items, w, ws, amax_w, denominator, out, N, K);
 }
+
+// ---- bf16 rows times bf16 weight rows on the bf16 mma: out[r, n] = x[r] . w[n], float32 ----
+// The sum of a column runs on the tensor cores in k16 steps, so it differs from tf_dense_rows in order only.
+namespace ink2p {
+
+constexpr int kDenseWarps = 4;
+constexpr int kDenseMt = 4;   // m16 tiles a warp computes
+constexpr int kDenseNt = 4;   // n8 tiles a warp computes
+constexpr int kDenseRows = 16 * kDenseMt;
+constexpr int kDenseCols = kDenseWarps * kDenseNt * 8;
+
+__device__ __forceinline__ void mmaBf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+struct DenseStep {
+    uint32_t a[kDenseMt][4];
+    uint32_t b[kDenseNt][2];
+};
+
+}  // namespace ink2p
+
+// Grid: x = tiles of kDenseCols columns, y = tiles of kDenseRows rows. x [m, k] bf16 with row stride x_stride (elements),
+// w [n, k] bf16, out [m, n] float32 with row stride out_stride. k % 16 == 0 and n % 8 == 0.
+extern "C" __global__ void __launch_bounds__(ink2p::kDenseWarps * 32)
+    tf_ink2p_dense_rows(const __nv_bfloat16* __restrict__ x, long long x_stride, const __nv_bfloat16* __restrict__ w,
+                        float* __restrict__ out, long long out_stride, int m, int n, int k) {
+    using namespace ink2p;
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int col0 = blockIdx.x * kDenseCols + (threadIdx.x >> 5) * kDenseNt * 8;
+    const int row0 = blockIdx.y * kDenseRows;
+    if (col0 >= n) return;
+    const uint32_t* xr[kDenseMt][2];
+    const uint32_t* wr[kDenseNt];
+#pragma unroll
+    for (int mt = 0; mt < kDenseMt; ++mt)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int r = min(row0 + mt * 16 + g + 8 * h, m - 1);
+            xr[mt][h] = reinterpret_cast<const uint32_t*>(x + (size_t)r * x_stride) + t;
+        }
+#pragma unroll
+    for (int j = 0; j < kDenseNt; ++j) wr[j] = reinterpret_cast<const uint32_t*>(w + (size_t)min(col0 + j * 8 + g, n - 1) * k) + t;
+
+    auto fetch = [&](int kk, DenseStep& f) {  // k16 step kk: words kk * 8 + t and kk * 8 + 4 + t of each row
+#pragma unroll
+        for (int mt = 0; mt < kDenseMt; ++mt) {
+            f.a[mt][0] = __ldg(xr[mt][0] + kk * 8);
+            f.a[mt][1] = __ldg(xr[mt][1] + kk * 8);
+            f.a[mt][2] = __ldg(xr[mt][0] + kk * 8 + 4);
+            f.a[mt][3] = __ldg(xr[mt][1] + kk * 8 + 4);
+        }
+#pragma unroll
+        for (int j = 0; j < kDenseNt; ++j) {
+            f.b[j][0] = __ldg(wr[j] + kk * 8);
+            f.b[j][1] = __ldg(wr[j] + kk * 8 + 4);
+        }
+    };
+    float acc[kDenseMt][kDenseNt][4];
+#pragma unroll
+    for (int mt = 0; mt < kDenseMt; ++mt)
+#pragma unroll
+        for (int j = 0; j < kDenseNt; ++j) acc[mt][j][0] = acc[mt][j][1] = acc[mt][j][2] = acc[mt][j][3] = 0.0f;
+
+    const int steps = k / 16;
+    DenseStep st[2];
+    fetch(0, st[0]);
+    for (int kk = 0; kk < steps; kk += 2) {
+        if (kk + 1 < steps) fetch(kk + 1, st[1]);
+#pragma unroll
+        for (int mt = 0; mt < kDenseMt; ++mt)
+#pragma unroll
+            for (int j = 0; j < kDenseNt; ++j) mmaBf16(acc[mt][j], st[0].a[mt], st[0].b[j][0], st[0].b[j][1]);
+        if (kk + 1 >= steps) break;
+        if (kk + 2 < steps) fetch(kk + 2, st[0]);
+#pragma unroll
+        for (int mt = 0; mt < kDenseMt; ++mt)
+#pragma unroll
+            for (int j = 0; j < kDenseNt; ++j) mmaBf16(acc[mt][j], st[1].a[mt], st[1].b[j][0], st[1].b[j][1]);
+    }
+#pragma unroll
+    for (int mt = 0; mt < kDenseMt; ++mt)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int r = row0 + mt * 16 + g + 8 * h;
+            if (r >= m) continue;
+#pragma unroll
+            for (int j = 0; j < kDenseNt; ++j) {
+                const int col = col0 + j * 8 + 2 * t;
+                if (col < n) *reinterpret_cast<float2*>(out + (size_t)r * out_stride + col) = make_float2(acc[mt][j][2 * h], acc[mt][j][2 * h + 1]);
+            }
+        }
+}

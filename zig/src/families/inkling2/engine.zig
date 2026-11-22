@@ -334,10 +334,12 @@ pub const Ctx = struct {
         c.moe_sc = try moe.Scratch.init(d, g.max_rows);
         errdefer c.moe_sc.deinit();
         c.pf4 = null;
-        if (try platform.environment.read(bool, prefill4.env_name, false)) {
+        const pf_experts = try platform.environment.read(bool, prefill4.env_name, false);
+        const pf_dense = try platform.environment.read(bool, prefill4.dense_env_name, false);
+        if (pf_experts or pf_dense) {
             var k = try prefill4.Kernels.load(d, &c.loop);
             errdefer k.unload();
-            c.pf4 = .{ .k = k, .bufs = try prefill4.Bufs.init(d, g.max_rows) };
+            c.pf4 = .{ .k = k, .bufs = try prefill4.Bufs.init(d, g.max_rows), .experts = pf_experts, .dense = pf_dense };
         }
         errdefer if (c.pf4) |*st| {
             st.bufs.deinit();

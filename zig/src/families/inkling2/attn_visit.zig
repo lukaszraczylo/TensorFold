@@ -11,6 +11,7 @@ const kernels = @import("kernels.zig");
 const loop_kernels = @import("loop_kernels.zig");
 const ops = @import("ops.zig");
 const plan = @import("plan.zig");
+const prefill4 = @import("prefill4.zig");
 const visits = @import("visits.zig");
 const weights = @import("weights.zig");
 
@@ -55,14 +56,20 @@ fn upload(c: *const engine.Ctx, s: cuda.Stream, addr: u64, items: anytype) !void
     try view.uploadAsync(0, bytes, s.handle);
 }
 
+/// `c.dense.rows`, or the bf16 mma for a prompt-sized call when TF_INK2_PF_BF16 is on.
+fn denseRows(c: *const engine.Ctx, s: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, rows: usize, n: usize, k: usize) !void {
+    if (c.pf4) |*st| if (st.dense and rows >= prefill4.prompt_from) return prefill4.denseRows(&st.k, s, x, x_stride, w, out, out_stride, rows, n, k);
+    return c.dense.rows(s, x, x_stride, w, out, out_stride, rows, n, k);
+}
+
 /// fp32 [rows, n] = x [rows, k] times w [n, k] transposed, rounded once to bf16 into `out`, as ops.linear.
 fn linear(c: *const engine.Ctx, s: cuda.Stream, x: u64, w: Dev, rows: usize, n: usize, k: usize, out: u64) !void {
     try shaped(w, "linear", &.{ n, k });
     const tmp = c.scratch.r.tmp;
     if (w.q8) {
         try ops.q8ToBf16(&c.ops, s, w.ptr, n, k, 0, n, c.dq.ptr);
-        try c.dense.rows(s, x, k, c.dq.ptr, tmp, n, rows, n, k);
-    } else try c.dense.rows(s, x, k, w.ptr, tmp, n, rows, n, k);
+        try denseRows(c, s, x, k, c.dq.ptr, tmp, n, rows, n, k);
+    } else try denseRows(c, s, x, k, w.ptr, tmp, n, rows, n, k);
     try ops.tobf(&c.ops, s, tmp, rows, n, n, out, n, 0, n);
 }
 
@@ -120,7 +127,7 @@ fn shortConv(c: *const engine.Ctx, s: cuda.Stream, v: visits.Visit, which: cache
         const p = proj.?;
         try shaped(p, "weight_proj", &.{ taps, g.hidden });
         const dyn = c.scratch.r.dyn;
-        try c.dense.rows(s, x_in, g.hidden, p.ptr, dyn, taps, rows, taps, g.hidden);
+        try denseRows(c, s, x_in, g.hidden, p.ptr, dyn, taps, rows, taps, g.hidden);
         try loop_kernels.roundBf16(&c.loop, s, dyn, rows * taps);
         a.dyn = dyn;
         a.heads = @intCast(g.kv_heads);
