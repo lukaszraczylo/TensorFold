@@ -741,6 +741,33 @@ extern "C" __global__ void tf_ink2l_ctl_blend_apply(const float* z, const __nv_b
     if (n < c) out[(size_t)row * c + n] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(zr[n], inv), __bfloat162float(norm_w[n])));
 }
 
+// Prompt controllers on the bf16 mma: the pair rows of ctl_down, bf16 [rows, 2c] = bf16([dest * inv_d, msg * inv_m]), one block a row.
+extern "C" __global__ void tf_ink2l_ctl_pair(const float* dest, const float* msg, __nv_bfloat16* pair, int rows, int c) {
+    __shared__ float inv[2];
+    const int row = blockIdx.x;
+    if (row >= rows || c > kLoopMaxC) return;
+    const float* d = dest + (size_t)row * c;
+    const float* g = msg + (size_t)row * c;
+    const int warp = threadIdx.x >> 5;
+    if (warp < 2) {
+        const float* x = warp == 0 ? d : g;
+        const float s = warpSumSq([&](int k) { return x[k]; }, c);
+        if ((threadIdx.x & 31) == 0) inv[warp] = invRms(s, c);
+    }
+    __syncthreads();
+    __nv_bfloat16* out = pair + (size_t)row * 2 * c;
+    for (int k = threadIdx.x; k < 2 * c; k += blockDim.x) {
+        out[k] = __float2bfloat16_rn(k < c ? __fmul_rn(d[k], inv[0]) : __fmul_rn(g[k - c], inv[1]));
+    }
+}
+
+// z = (1 - tanh(forget)) * dest + tanh(gain) * msg elementwise; z holds the gain on entry. n = rows * c.
+extern "C" __global__ void tf_ink2l_ctl_z(const float* dest, const float* msg, const float* forget, float* z, long long n) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    z[i] = __fadd_rn(__fmul_rn(__fsub_rn(1.0f, tanhf(forget[i])), dest[i]), __fmul_rn(tanhf(z[i]), msg[i]));
+}
+
 // ---- Abliteration (ref.ablit.Ablit.apply): y -= (table[layer]) * Q (Q^T y) on one row a block, rank <= kAblitMaxRank ----
 // Warp j computes c_j = sum_i q[i, j] * y[i] (lane-strided fmaf chain, xor-shuffle tree); the update sums j in increasing order.
 constexpr int kAblitMaxRank = 8;

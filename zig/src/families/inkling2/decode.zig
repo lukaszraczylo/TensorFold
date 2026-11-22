@@ -10,6 +10,7 @@ const engine = @import("engine.zig");
 const loop_kernels = @import("loop_kernels.zig");
 const moe = @import("moe.zig");
 const ops = @import("ops.zig");
+const prefill4 = @import("prefill4.zig");
 const prof = @import("prof.zig");
 const visits = @import("visits.zig");
 const weights = @import("weights.zig");
@@ -176,7 +177,7 @@ fn controllers(lw: *const weights.LayerW) !*const [loop_kernels.n_streams]weight
 /// Stream `stream` of a pass > 0 visit: blends the float32 `dest` rows with that stream's messages into the normed bf16 `out`.
 fn control(c: *engine.Ctx, s: cuda.Stream, w: weights.Controller, dest: u64, stream: u32, norm: u64, out: u64, n: usize) !void {
     const f = c.flow.r;
-    try loop_kernels.controller(&c.loop, s, .{
+    const args: loop_kernels.ControllerArgs = .{
         .dest = dest,
         .msg = f.msg + @as(u64, stream) * f32Bytes(n),
         .down = try present(w.down),
@@ -187,7 +188,9 @@ fn control(c: *engine.Ctx, s: cuda.Stream, w: weights.Controller, dest: u64, str
         .z = f.gate_z,
         .out = out,
         .rows = n,
-    });
+    };
+    if (c.pf4) |*st| if (st.ctl and n >= prefill4.prompt_from) return prefill4.controller(st, &c.loop, s, args);
+    try loop_kernels.controller(&c.loop, s, args);
 }
 
 /// The restart's bank: the previous pass's two blocks, copied before this pass overwrites their slots (SPEC 9.1).

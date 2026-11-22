@@ -292,10 +292,10 @@ struct DenseStep {
 }  // namespace ink2p
 
 // Grid: x = tiles of kDenseCols columns, y = tiles of kDenseRows rows. x [m, k] bf16 with row stride x_stride (elements),
-// w [n, k] bf16, out [m, n] float32 with row stride out_stride. k % 16 == 0 and n % 8 == 0.
-extern "C" __global__ void __launch_bounds__(ink2p::kDenseWarps * 32)
-    tf_ink2p_dense_rows(const __nv_bfloat16* __restrict__ x, long long x_stride, const __nv_bfloat16* __restrict__ w,
-                        float* __restrict__ out, long long out_stride, int m, int n, int k) {
+// w [n, k] bf16, out [m, n] with row stride out_stride: float32, or bf16 rounded once (BF16OUT). k % 16 == 0 and n % 8 == 0.
+template <bool BF16OUT>
+__device__ __forceinline__ void denseRows(const __nv_bfloat16* __restrict__ x, long long x_stride, const __nv_bfloat16* __restrict__ w,
+                                          void* __restrict__ out_v, long long out_stride, int m, int n, int k) {
     using namespace ink2p;
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int col0 = blockIdx.x * kDenseCols + (threadIdx.x >> 5) * kDenseNt * 8;
@@ -358,9 +358,27 @@ extern "C" __global__ void __launch_bounds__(ink2p::kDenseWarps * 32)
 #pragma unroll
             for (int j = 0; j < kDenseNt; ++j) {
                 const int col = col0 + j * 8 + 2 * t;
-                if (col < n) *reinterpret_cast<float2*>(out + (size_t)r * out_stride + col) = make_float2(acc[mt][j][2 * h], acc[mt][j][2 * h + 1]);
+                if (col >= n) continue;
+                if constexpr (BF16OUT) {
+                    *reinterpret_cast<__nv_bfloat162*>(static_cast<__nv_bfloat16*>(out_v) + (size_t)r * out_stride + col) =
+                        __floats2bfloat162_rn(acc[mt][j][2 * h], acc[mt][j][2 * h + 1]);
+                } else {
+                    *reinterpret_cast<float2*>(static_cast<float*>(out_v) + (size_t)r * out_stride + col) = make_float2(acc[mt][j][2 * h], acc[mt][j][2 * h + 1]);
+                }
             }
         }
+}
+
+extern "C" __global__ void __launch_bounds__(ink2p::kDenseWarps * 32)
+    tf_ink2p_dense_rows(const __nv_bfloat16* __restrict__ x, long long x_stride, const __nv_bfloat16* __restrict__ w,
+                        float* __restrict__ out, long long out_stride, int m, int n, int k) {
+    denseRows<false>(x, x_stride, w, out, out_stride, m, n, k);
+}
+
+extern "C" __global__ void __launch_bounds__(ink2p::kDenseWarps * 32)
+    tf_ink2p_dense_rows_bf16(const __nv_bfloat16* __restrict__ x, long long x_stride, const __nv_bfloat16* __restrict__ w,
+                             __nv_bfloat16* __restrict__ out, long long out_stride, int m, int n, int k) {
+    denseRows<true>(x, x_stride, w, out, out_stride, m, n, k);
 }
 
 extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)

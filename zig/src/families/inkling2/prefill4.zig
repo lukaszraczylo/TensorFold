@@ -7,6 +7,7 @@ const loop_kernels = @import("loop_kernels.zig");
 const plan = @import("plan.zig");
 
 pub const env_name = "TF_INK2_PF_FP4";
+pub const ctl_env_name = "TF_INK2_PF_CTL";
 pub const dense_env_name = "TF_INK2_PF_BF16";
 pub const mx_env_name = "TF_INK2_PF_FP8";
 /// Calls of at least this many rows run the prompt kernels (the decode kernels keep the smaller ones).
@@ -28,6 +29,9 @@ pub const Kernels = struct {
     down: cuda.Function,
     down8: cuda.Function,
     dense: cuda.Function,
+    dense_bf16: cuda.Function,
+    ctl_pair: cuda.Function,
+    ctl_z: cuda.Function,
 
     /// `loop` holds the activation packer; the image holds the two grouped GEMMs.
     pub fn load(d: *const cuda.Driver, loop: *const loop_kernels.Kernels) !Kernels {
@@ -43,6 +47,9 @@ pub const Kernels = struct {
             .down = try mod.function("tf_ink2p_down_nvfp4"),
             .down8 = try mod.function("tf_ink2p_down_mxfp8"),
             .dense = try mod.function("tf_ink2p_dense_rows"),
+            .dense_bf16 = try mod.function("tf_ink2p_dense_rows_bf16"),
+            .ctl_pair = try loop.mod.function("tf_ink2l_ctl_pair"),
+            .ctl_z = try loop.mod.function("tf_ink2l_ctl_z"),
         };
     }
 
@@ -67,6 +74,8 @@ pub fn actBytes(max_rows: usize) struct { x: [3]usize, y: [3]usize } {
 pub const Bufs = struct {
     x: [3]cuda.DeviceBuffer,
     y: [3]cuda.DeviceBuffer,
+    pair: cuda.DeviceBuffer, // bf16 [max_rows, 2 * hidden]: a controller's normed (dest, msg) rows
+    forget: cuda.DeviceBuffer, // fp32 [max_rows, hidden]: a controller's forget pre-activation
 
     pub fn init(d: *const cuda.Driver, max_rows: usize) !Bufs {
         const n = actBytes(max_rows);
@@ -81,12 +90,17 @@ pub const Bufs = struct {
             slot.* = try cuda.DeviceBuffer.alloc(d, len);
             made += 1;
         }
+        b.pair = try cuda.DeviceBuffer.alloc(d, max_rows * 2 * hidden * 2);
+        errdefer b.pair.free();
+        b.forget = try cuda.DeviceBuffer.alloc(d, max_rows * hidden * 4);
         return b;
     }
 
     pub fn deinit(b: *Bufs) void {
         for (&b.x) |*v| v.free();
         for (&b.y) |*v| v.free();
+        b.pair.free();
+        b.forget.free();
     }
 
     pub fn actX(b: *const Bufs) Act {
@@ -98,13 +112,14 @@ pub const Bufs = struct {
     }
 };
 
-/// The state a Ctx holds when a flag is on: `experts` is TF_INK2_PF_FP4, `experts8` TF_INK2_PF_FP8, `dense` TF_INK2_PF_BF16.
+/// The state a Ctx holds when a flag is on: `experts` is TF_INK2_PF_FP4, `experts8` TF_INK2_PF_FP8, `dense` TF_INK2_PF_BF16, `ctl` TF_INK2_PF_CTL.
 pub const State = struct {
     k: Kernels,
     bufs: Bufs,
     experts: bool,
     experts8: bool,
     dense: bool,
+    ctl: bool,
 
     /// Whether a layer of precision `prec` takes the mma expert path.
     pub fn takes(st: *const State, prec: plan.Precision) bool {
@@ -116,7 +131,7 @@ const dense_tile_rows = 64;
 const dense_tile_cols = 128;
 
 /// out float32 [m, n] = x bf16 [m, k] (row stride x_stride elements) times w bf16 [n, k] transposed, on the bf16 mma.
-pub fn denseRows(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, m: usize, n: usize, kdim: usize) !void {
+fn denseWith(f: cuda.Function, k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, m: usize, n: usize, kdim: usize) !void {
     if (kdim % 16 != 0 or n % 8 != 0 or x % 4 != 0 or w % 4 != 0 or x_stride % 2 != 0) return error.Misaligned;
     if (m == 0 or n == 0) return;
     var args: cuda.Args = .{};
@@ -127,7 +142,37 @@ pub fn denseRows(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, w: 
     args.add(@as(i64, @intCast(out_stride)));
     for ([_]usize{ m, n, kdim }) |v| args.add(@as(i32, @intCast(v)));
     const grid: cuda.Dim3 = .{ .x = @intCast((n + dense_tile_cols - 1) / dense_tile_cols), .y = @intCast((m + dense_tile_rows - 1) / dense_tile_rows) };
-    try cuda.launch.launch(k.dense, .{ .grid = grid, .block = .{ .x = warps * 32 } }, s, &args);
+    _ = k;
+    try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = warps * 32 } }, s, &args);
+}
+
+pub fn denseRows(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, m: usize, n: usize, kdim: usize) !void {
+    return denseWith(k.dense, k, s, x, x_stride, w, out, out_stride, m, n, kdim);
+}
+
+/// As denseRows with `out` bf16, rounded once.
+pub fn denseRowsBf16(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, m: usize, n: usize, kdim: usize) !void {
+    return denseWith(k.dense_bf16, k, s, x, x_stride, w, out, out_stride, m, n, kdim);
+}
+
+/// One stream of a controller on the bf16 mma, as loop_kernels.controller: `h` bf16 [rows, gate_rank] and `z` float32 [rows, hidden] are scratch.
+pub fn controller(st: *const State, lk: *const loop_kernels.Kernels, s: cuda.Stream, a: loop_kernels.ControllerArgs) !void {
+    if (a.rows == 0) return;
+    const rank = loop_kernels.gate_rank;
+    var pa: cuda.Args = .{};
+    for ([_]u64{ a.dest, a.msg, st.bufs.pair.ptr }) |v| pa.add(v);
+    for ([_]usize{ a.rows, hidden }) |v| pa.add(@as(i32, @intCast(v)));
+    try cuda.launch.launch(st.k.ctl_pair, .{ .grid = .{ .x = @intCast(a.rows) }, .block = .{ .x = loop_kernels.actq_threads } }, s, &pa);
+    try denseRowsBf16(&st.k, s, st.bufs.pair.ptr, 2 * hidden, a.down, a.h, rank, a.rows, rank, 2 * hidden);
+    try denseRows(&st.k, s, a.h, rank, a.gain, a.z, hidden, a.rows, hidden, rank);
+    try denseRows(&st.k, s, a.h, rank, a.forget, st.bufs.forget.ptr, hidden, a.rows, hidden, rank);
+    const n = a.rows * hidden;
+    var za: cuda.Args = .{};
+    for ([_]u64{ a.dest, a.msg, st.bufs.forget.ptr, a.z }) |v| za.add(v);
+    za.add(@as(i64, @intCast(n)));
+    const z_threads = 256;
+    try cuda.launch.launch(st.k.ctl_z, .{ .grid = .{ .x = @intCast((n + z_threads - 1) / z_threads) }, .block = .{ .x = z_threads } }, s, &za);
+    try loop_kernels.blendApply(lk, s, a.z, a.norm, a.out, a.rows);
 }
 
 /// Quantises bf16 `x` [rows, kdim] as the layer's precision does (tf_ink2l_actq_*), into `a`; `out` (float32 [rows, kdim], or 0) takes the dequantised values too.
@@ -192,14 +237,14 @@ test "a width the tiles do not cover is refused before any launch" {
     const g: loop_kernels.ExpertGemm = .{ .w = 0, .scale = 0 };
     try std.testing.expectError(error.BadWidth, grouped(f, .nvfp4, s, a, 8, 0, 0, g, 0, 512, 128, 100, 2304));
     try std.testing.expectError(error.BadWidth, grouped(f, .mxfp8, s, a, 8, 0, 0, g, 0, 512, 128, 2304, 100));
-    try std.testing.expectError(error.BadWidth, pack(&.{ .mod = undefined, .pack = f, .pack8 = f, .gu = f, .gu8 = f, .down = f, .down8 = f, .dense = f }, .nvfp4, s, 0, 0, a, 4, 100));
+    try std.testing.expectError(error.BadWidth, pack(&.{ .mod = undefined, .pack = f, .pack8 = f, .gu = f, .gu8 = f, .down = f, .down8 = f, .dense = f, .dense_bf16 = f, .ctl_pair = f, .ctl_z = f }, .nvfp4, s, 0, 0, a, 4, 100));
 }
 
 test "dense rows refuses a width or address the fragments cannot load" {
     var d: cuda.Driver = undefined;
     const f: cuda.Function = .{ .d = &d, .handle = null };
     const s: cuda.Stream = .{ .d = &d, .handle = null };
-    const k: Kernels = .{ .mod = undefined, .pack = f, .pack8 = f, .gu = f, .gu8 = f, .down = f, .down8 = f, .dense = f };
+    const k: Kernels = .{ .mod = undefined, .pack = f, .pack8 = f, .gu = f, .gu8 = f, .down = f, .down8 = f, .dense = f, .dense_bf16 = f, .ctl_pair = f, .ctl_z = f };
     try std.testing.expectError(error.Misaligned, denseRows(&k, s, 0, 2304, 0, 0, 3072, 512, 3072, 100));
     try std.testing.expectError(error.Misaligned, denseRows(&k, s, 0, 2304, 0, 0, 20, 512, 20, 2304));
     try denseRows(&k, s, 0, 2304, 0, 0, 3072, 0, 3072, 2304);

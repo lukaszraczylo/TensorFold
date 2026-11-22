@@ -277,10 +277,15 @@ pub fn controller(k: *const Kernels, s: cuda.Stream, a: ControllerArgs) !void {
     for ([_]u64{ a.dest, a.msg, a.h, a.gain, a.forget, a.z }) |p| blend.add(p);
     for ([_]usize{ a.rows, loop_hidden, gate_rank }) |v| blend.add(@as(i32, @intCast(v)));
     try cuda.launch.launch(k.ctl_blend, blend_cfg, s, &blend);
-    const apply_cfg: cuda.launch.Config = .{ .grid = .{ .x = @intCast(a.rows * (loop_hidden / apply_threads)) }, .block = .{ .x = apply_threads } };
+    try blendApply(k, s, a.z, a.norm, a.out, a.rows);
+}
+
+/// Blend stage 2 alone: out bf16 [rows, 2304] = norm_w * rms-normalised float32 z.
+pub fn blendApply(k: *const Kernels, s: cuda.Stream, z: u64, norm: u64, out: u64, rows: usize) !void {
+    const apply_cfg: cuda.launch.Config = .{ .grid = .{ .x = @intCast(rows * (loop_hidden / apply_threads)) }, .block = .{ .x = apply_threads } };
     var apply: cuda.Args = .{};
-    for ([_]u64{ a.z, a.norm, a.out }) |p| apply.add(p);
-    apply.add(@as(i32, @intCast(a.rows)));
+    for ([_]u64{ z, norm, out }) |p| apply.add(p);
+    apply.add(@as(i32, @intCast(rows)));
     apply.add(@as(i32, loop_hidden));
     try cuda.launch.launch(k.ctl_apply, apply_cfg, s, &apply);
 }

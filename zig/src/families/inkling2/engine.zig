@@ -337,10 +337,11 @@ pub const Ctx = struct {
         const pf_experts = try platform.environment.read(bool, prefill4.env_name, false);
         const pf_experts8 = try platform.environment.read(bool, prefill4.mx_env_name, false);
         const pf_dense = try platform.environment.read(bool, prefill4.dense_env_name, false);
-        if (pf_experts or pf_experts8 or pf_dense) {
+        const pf_ctl = try platform.environment.read(bool, prefill4.ctl_env_name, false);
+        if (pf_experts or pf_experts8 or pf_dense or pf_ctl) {
             var k = try prefill4.Kernels.load(d, &c.loop);
             errdefer k.unload();
-            c.pf4 = .{ .k = k, .bufs = try prefill4.Bufs.init(d, g.max_rows), .experts = pf_experts, .experts8 = pf_experts8, .dense = pf_dense };
+            c.pf4 = .{ .k = k, .bufs = try prefill4.Bufs.init(d, g.max_rows), .experts = pf_experts, .experts8 = pf_experts8, .dense = pf_dense, .ctl = pf_ctl };
         }
         errdefer if (c.pf4) |*st| {
             st.bufs.deinit();
