@@ -61,6 +61,26 @@ pub fn each(c: *const cache.Cache, sched: *const visits.Schedule, slot: u32, at:
     try f(ctx, c.conv.ptr + @as(u64, slot) * c.layout.conv_stream, off, c.layout.conv_stream);
 }
 
+/// The image's parts as `each` lays it out, for the disk store: a global plane keeps its row size (a longer state's
+/// plane begins with a shorter one's), the rest is the state's own. `draft` bytes, when the head keeps context, close it.
+pub fn parts(c: *const cache.Cache, sched: *const visits.Schedule, at: u32, draft: u64, out: anytype, a: Allocator) !void {
+    for ([_]bool{ true, false }) |global| for (sched.visits[0..sched.n], 0..) |v, i| {
+        if (v.global != global) continue;
+        const layer = c.layerAt(@intCast(i));
+        if (global and at > layer.ring) return error.PastContext;
+        for (0..2) |_| for (0..c.layout.slots[i].kv_heads) |_| {
+            if (!global) {
+                try out.append(a, .{ .bytes = @as(u64, tail(layer.window, at)) * head_dim * bf16_bytes });
+            } else if (layer.q8) {
+                try out.append(a, .{ .bytes = @as(u64, at) * head_dim, .row = head_dim });
+                try out.append(a, .{ .bytes = @as(u64, at) * kernels.kv8_scale_bytes, .row = kernels.kv8_scale_bytes });
+            } else try out.append(a, .{ .bytes = @as(u64, at) * head_dim * bf16_bytes, .row = head_dim * bf16_bytes });
+        };
+    };
+    try out.append(a, .{ .bytes = c.layout.conv_stream });
+    if (draft > 0) try out.append(a, .{ .bytes = draft });
+}
+
 const Count = struct {
     n: *u64,
     fn add(c: Count, _: u64, _: u64, len: u64) anyerror!void {
@@ -209,4 +229,45 @@ test "a state past a global ring is refused" {
     const m = try cache.Mini.init(arena.allocator());
     const c = cache.fake(&m, .{ .context = 2048, .streams = 1, .chunk_rows = 512 });
     try ts.expectError(error.PastContext, bytes(&c, &m.sched, 2049));
+}
+
+const Part = struct { bytes: u64, row: u32 = 0 };
+
+test "the disk parts tile the image: each part ends where a run does, and global planes keep their row size" {
+    var arena = std.heap.ArenaAllocator.init(ts.allocator);
+    defer arena.deinit();
+    const m = try cache.Mini.init(arena.allocator());
+    for ([_]bool{ false, true }) |kv8| {
+        const c = cache.fake(&m, .{ .context = 4096, .streams = 1, .chunk_rows = 512, .kv8 = kv8 });
+        for ([_]u32{ 1, 700, 1023, 1024, 3000 }) |at| {
+            var list: std.ArrayList(Part) = .empty;
+            defer list.deinit(ts.allocator);
+            try parts(&c, &m.sched, at, 0, &list, ts.allocator);
+            var runs: std.ArrayList([3]u64) = .empty;
+            defer runs.deinit(ts.allocator);
+            try each(&c, &m.sched, 0, at, Runs{ .list = &runs }, Runs.add);
+            var ends: std.ArrayList(u64) = .empty;
+            defer ends.deinit(ts.allocator);
+            for (runs.items) |r| try ends.append(ts.allocator, r[1] + r[2]);
+            var off: u64 = 0;
+            for (list.items) |p| {
+                off += p.bytes;
+                try ts.expect(std.mem.indexOfScalar(u64, ends.items, off) != null);
+                if (p.row > 0) try ts.expectEqual(@as(u64, at) * p.row, p.bytes);
+            }
+            try ts.expectEqual(try bytes(&c, &m.sched, at), off);
+        }
+    }
+}
+
+test "a draft part closes the image" {
+    var arena = std.heap.ArenaAllocator.init(ts.allocator);
+    defer arena.deinit();
+    const m = try cache.Mini.init(arena.allocator());
+    const c = cache.fake(&m, .{ .context = 4096, .streams = 1, .chunk_rows = 512 });
+    var list: std.ArrayList(Part) = .empty;
+    defer list.deinit(ts.allocator);
+    try parts(&c, &m.sched, 100, 77, &list, ts.allocator);
+    try ts.expectEqual(@as(u64, 77), list.items[list.items.len - 1].bytes);
+    try ts.expectEqual(c.layout.conv_stream, list.items[list.items.len - 2].bytes);
 }

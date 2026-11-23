@@ -27,6 +27,8 @@ pub const snap_grid: u32 = prompt_rows;
 pub const snap_lookahead: u32 = 0;
 /// The cache is opt-in: no --prompt-cache-gib, no store and no memory set aside.
 pub const prompt_cache_gib: f64 = 0;
+/// --learn-conversations and --spill-gib: the disk store's image (native/cuda_kept.zig).
+pub const kept_view = @import("kept.zig");
 
 const embed_host_env = "TF_INK2_EMBED_HOST";
 const ablit_env = "TF_INK2_ABLIT";

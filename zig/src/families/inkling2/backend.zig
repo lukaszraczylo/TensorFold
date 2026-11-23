@@ -295,6 +295,16 @@ pub const Inkling = struct {
         return snap.save(x.gpa, x.c.d, x.s, x.c.cache, &x.c.sched, x.draftHead(), l.slot, at);
     }
 
+    /// A state of `at` positions in buffers of its own, for the disk store to fill.
+    pub fn blankState(x: *Inkling, at: u32) !*snap.Saved {
+        const k = try x.gpa.create(snap.Saved);
+        errdefer x.gpa.destroy(k);
+        k.* = .{ .at = at, .buf = try cuda.DeviceBuffer.alloc(x.c.d, try snap.bytes(x.c.cache, &x.c.sched, at)) };
+        errdefer k.buf.free();
+        if (x.draftHead()) |h| k.draft = try cuda.DeviceBuffer.alloc(x.c.d, h.snapBytes(at));
+        return k;
+    }
+
     pub fn dropState(x: *Inkling, k: *snap.Saved) void {
         snap.drop(x.gpa, x.s, k);
     }
