@@ -1,4 +1,4 @@
-//! Inkling 2 Mini (looped, ModelOpt NVFP4 and MXFP8) behind the native CUDA registry: plain decoding, no prompt cache.
+//! Inkling 2 Mini (looped, ModelOpt NVFP4 and MXFP8) behind the native CUDA registry: plain decoding, a prompt cache only under --prompt-cache-gib.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -22,8 +22,11 @@ pub const prompt_rows: u32 = be.prompt_rows;
 /// A request's last verify window: one row.
 pub const window_rows: u32 = be.window_rows;
 pub const explains_open = true;
-/// No snap_* hooks: the host plans no prompt cache and refuses --prompt-cache-gib by name.
-pub const keeps_no_prompts = true;
+/// Kept states land on the engine's chunk grid, which a fresh pass cuts at too, so a resumed pass is the fresh one's rows.
+pub const snap_grid: u32 = prompt_rows;
+pub const snap_lookahead: u32 = 0;
+/// The cache is opt-in: no --prompt-cache-gib, no store and no memory set aside.
+pub const prompt_cache_gib: f64 = 0;
 
 const embed_host_env = "TF_INK2_EMBED_HOST";
 const ablit_env = "TF_INK2_ABLIT";
@@ -153,6 +156,28 @@ pub fn tensorWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, vi
 pub fn fits(p: *anyopaque, prompt: u32, max_tokens: u32) bool {
     const own: *const Owned = @ptrCast(@alignCast(p));
     return own.ib.admits(prompt, max_tokens);
+}
+
+fn inkling(ptr: *anyopaque) *be.Inkling {
+    return @ptrCast(@alignCast(ptr));
+}
+
+/// Bytes a state at `at` prompt tokens takes.
+pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
+    return inkling(ptr).snapBytes(at);
+}
+
+/// The prompt pass stands at `at` (a chunk start): copy the stream's state there.
+pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+    return @ptrCast(try inkling(ptr).saveState(owner, at));
+}
+
+pub fn snap_restore(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
+    return error.BackendRestores; // the prompt pass restores, before its first chunk
+}
+
+pub fn snap_drop(ptr: *anyopaque, saved: *anyopaque) void {
+    inkling(ptr).dropState(@ptrCast(@alignCast(saved)));
 }
 
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {

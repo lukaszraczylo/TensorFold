@@ -27,6 +27,7 @@ pub const prof = @import("prof.zig");
 pub const prefill = @import("prefill.zig");
 pub const prefill4 = @import("prefill4.zig");
 pub const drafter = @import("drafter.zig");
+pub const snap = @import("snap.zig");
 pub const backend = @import("backend.zig");
 pub const native = @import("native.zig");
 
@@ -58,6 +59,7 @@ test {
     _ = head;
     _ = prefill;
     _ = drafter;
+    _ = snap;
     _ = backend;
     _ = native;
 }

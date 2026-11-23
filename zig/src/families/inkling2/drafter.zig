@@ -376,6 +376,35 @@ pub const Drafter = struct {
         try ops.dense1Q8Rows(&x.c.ops, s, &.{seg}, k, false, 0, m);
     }
 
+    /// A stream's context at `at` positions, in image order: each layer's last `min(at, ring)` K rows, then its V rows
+    /// (position p at slot p % ring), then the Markov head's recurrent input. `f` gets each run's device address, its offset
+    /// in the image and its length.
+    pub fn each(x: *const Drafter, stream: u32, at: u32, ctx: anytype, comptime f: fn (@TypeOf(ctx), dev: u64, off: u64, len: u64) anyerror!void) !void {
+        const row = @as(u64, x.m.kv_heads) * x.m.head_dim * bf16_bytes;
+        var off: u64 = 0;
+        for (x.layers[0..x.m.layers]) |*l| for ([_]u64{ l.kc.ptr, l.vc.ptr }) |base| {
+            const keep = @min(at, l.ring);
+            var p: u64 = at - keep;
+            while (p < at) {
+                const slot = p % l.ring;
+                const run = @min(at - p, l.ring - slot);
+                try f(ctx, base + x.ringBase(l, stream) + slot * row, off, run * row);
+                off += run * row;
+                p += run;
+            }
+        };
+        const rnn = @as(u64, x.c.text.hidden) * bf16_bytes;
+        try f(ctx, x.frnn.ptr + @as(u64, stream) * rnn, off, rnn);
+    }
+
+    /// The bytes `each` copies for `at` positions.
+    pub fn snapBytes(x: *const Drafter, at: u32) u64 {
+        const row = @as(u64, x.m.kv_heads) * x.m.head_dim * bf16_bytes;
+        var n: u64 = @as(u64, x.c.text.hidden) * bf16_bytes;
+        for (x.layers[0..x.m.layers]) |*l| n += 2 * @min(at, l.ring) * row;
+        return n;
+    }
+
     fn ringBase(x: *const Drafter, l: *const Layer, stream: u32) u64 {
         const row = @as(u64, x.m.kv_heads) * x.m.head_dim * bf16_bytes;
         return @as(u64, stream) * l.ring * row;

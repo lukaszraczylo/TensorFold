@@ -9,6 +9,7 @@ const prof = @import("prof.zig");
 const ops = @import("ops.zig");
 const pre = @import("prefill.zig");
 const drafter_mod = @import("drafter.zig");
+const snap = @import("snap.zig");
 const platform = @import("sys");
 
 const be = lanes.backend;
@@ -271,9 +272,48 @@ pub const Inkling = struct {
         l.n_drafts = 0;
         s.cached = 0;
         try x.c.cache.clear(x.s, l.slot);
-        l.fill = 0;
-        s.fill_at.store(0, .monotonic);
+        l.fill = x.resumeAt(s, l, p.len);
+        s.fill_at.store(@intCast(l.fill.?), .monotonic);
         return l;
+    }
+
+    pub fn draftHead(x: *const Inkling) ?*const drafter_mod.Drafter {
+        return if (x.mtp) |*m| &m.head else null;
+    }
+
+    /// Bytes a kept state at `at` takes (the store's charge).
+    pub fn snapBytes(x: *const Inkling, at: u32) u64 {
+        const target = snap.bytes(x.c.cache, &x.c.sched, at) catch return std.math.maxInt(u32);
+        return target + if (x.draftHead()) |h| h.snapBytes(at) else 0;
+    }
+
+    /// The stream's state at `at`, copied behind the chunk that ends there.
+    pub fn saveState(x: *Inkling, owner: ?*anyopaque, at: u32) !*snap.Saved {
+        const s: *const Stream = @ptrCast(@alignCast(owner orelse return error.NoOwner));
+        const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
+        if ((l.fill orelse l.len) != at or (x.mtp != null and l.written != at)) return error.NotAtMark; // a state is copied only where the pass stands
+        return snap.save(x.gpa, x.c.d, x.s, x.c.cache, &x.c.sched, x.draftHead(), l.slot, at);
+    }
+
+    pub fn dropState(x: *Inkling, k: *snap.Saved) void {
+        snap.drop(x.gpa, x.s, k);
+    }
+
+    /// The kept state's position, restored into the slot (0: none, or not this prompt's); any grid row resumes exactly.
+    fn resumeAt(x: *Inkling, s: *Stream, l: *Lane, len: usize) usize {
+        const saved = s.reuse.saved orelse return 0;
+        const k: *const snap.Saved = @ptrCast(@alignCast(saved));
+        if (k.at != s.reuse.at or k.at == 0 or k.at >= len or (x.mtp != null and k.draft == null)) {
+            s.reuse_failed = true;
+            return 0;
+        }
+        snap.restore(x.c.d, x.s, x.c.cache, &x.c.sched, x.draftHead(), l.slot, k) catch {
+            s.reuse_failed = true;
+            return 0;
+        };
+        l.written = k.at;
+        s.cached = k.at;
+        return k.at;
     }
 
     /// One chunk from `l.fill` to the next grid line or the prompt's end; true once the last row's logits are written.
@@ -281,7 +321,10 @@ pub const Inkling = struct {
         const p = s.prompt();
         const at = l.fill.?;
         if (s.isCancelled()) return error.Cancelled;
-        const end = @min(p.len, (at / x.c.scratch.geometry.max_rows + 1) * x.c.scratch.geometry.max_rows);
+        var end = @min(p.len, (at / x.c.scratch.geometry.max_rows + 1) * x.c.scratch.geometry.max_rows);
+        for (s.reuse.marks) |mk| if (mk > at and mk < end) {
+            end = mk;
+        };
         const done = end == p.len;
         x.arm(l, false);
         prof.promptBegin(x.s.handle);
@@ -291,6 +334,7 @@ pub const Inkling = struct {
         s.fill_at.store(@intCast(end), .monotonic);
         l.fill = if (done) null else end;
         if (done) l.len = p.len;
+        if (s.reuse.hook) |hk| if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(end)) != null) hk.at(hk.ptr, s, @intCast(end));
         return done;
     }
 

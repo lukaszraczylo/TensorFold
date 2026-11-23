@@ -160,12 +160,12 @@ const names_test = @import("names_test.zig");
 
 const fake_base: u64 = 1 << 32;
 
-const Mini = struct {
+pub const Mini = struct {
     cfg: config.Config,
     sched: visits.Schedule,
     prec: [config.max_layers]plan.Precision,
 
-    fn init(a: std.mem.Allocator) !Mini {
+    pub fn init(a: std.mem.Allocator) !Mini {
         var why: config.Why = .{};
         var m: Mini = undefined;
         m.cfg = try config.parse(a, config_test.mini, &why);
@@ -178,7 +178,7 @@ const Mini = struct {
 };
 
 /// A cache over fake device addresses: the accessors never touch the driver.
-fn fake(m: *const Mini, o: Options) Cache {
+pub fn fake(m: *const Mini, o: Options) Cache {
     const layout = Layout.build(&m.sched, &m.cfg.text, o);
     return .{
         .d = undefined,
