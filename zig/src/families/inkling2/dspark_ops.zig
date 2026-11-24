@@ -57,6 +57,9 @@ pub const Kernels = struct {
     fold: cuda.Function,
     fold_q8: cuda.Function,
     vocab_q8: cuda.Function,
+    conf: cuda.Function,
+    gather: cuda.Function,
+    pick_map: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -78,6 +81,9 @@ pub const Kernels = struct {
             .fold = try mod.function("tf_ink2_dsp_fold"),
             .fold_q8 = try mod.function("tf_ink2_dsp_fold_q8"),
             .vocab_q8 = try mod.function("tf_ink2_dsp_vocab_q8"),
+            .conf = try mod.function("tf_ink2_dsp_conf"),
+            .gather = try mod.function("tf_ink2_dsp_gather"),
+            .pick_map = try mod.function("tf_ink2_dsp_pick_map"),
         };
     }
 
@@ -197,6 +203,38 @@ pub fn vocabQ8(k: *const Kernels, s: cuda.Stream, base: u64, latent: u64, codes:
     a.add(int(nv));
     a.add(out);
     try go(k.vocab_q8, s, .{ .x = @intCast((nv + 7) / 8) }, 256, &a);
+}
+
+/// conf[j] = the softmax probability of the step's pick: `logits` fp32 [n], `picks` its (value, id).
+pub fn conf(k: *const Kernels, s: cuda.Stream, logits: u64, picks: u64, n: usize, out: u64, j: usize) !void {
+    var a: cuda.Args = .{};
+    a.add(logits);
+    a.add(picks);
+    a.add(int(n));
+    a.add(out);
+    a.add(int(j));
+    try go(k.conf, s, .{ .x = 1 }, 1024, &a);
+}
+
+/// dst row i = src row ids[i] (int32 [n]), rows of `words` 16-bit words, source rows `stride` words apart.
+pub fn gather(k: *const Kernels, s: cuda.Stream, src: u64, dst: u64, ids: u64, n: usize, words: usize, stride: usize) !void {
+    var a: cuda.Args = .{};
+    a.add(src);
+    a.add(dst);
+    a.add(ids);
+    a.add(int(words));
+    a.add(@as(i64, @intCast(stride)));
+    try go(k.gather, s, .{ .x = @intCast(n) }, 256, &a);
+}
+
+/// `pick` through `map`: walk[j + 1] = map[the pick's index].
+pub fn pickMap(k: *const Kernels, s: cuda.Stream, picks: u64, map: u64, walk: u64, j: usize) !void {
+    var a: cuda.Args = .{};
+    a.add(picks);
+    a.add(map);
+    a.add(walk);
+    a.add(int(j));
+    try go(k.pick_map, s, .{ .x = 1 }, 1, &a);
 }
 
 pub fn pick(k: *const Kernels, s: cuda.Stream, picks: u64, world: usize, walk: u64, j: usize) !void {

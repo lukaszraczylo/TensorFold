@@ -396,3 +396,32 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2_dsp_vocab_q8(const uin
     const float x = bfr(bf(base[v]) + b);
     out[v] = v < valid ? bfr(tanhf(x / cap) * cap) : -INFINITY;
 }
+
+// The softmax probability of step j's pick: 1 / sum(exp(x - max)), one block over the n valid logits; picks[0] is the max.
+extern "C" __global__ void __launch_bounds__(1024) tf_ink2_dsp_conf(const float* __restrict__ x, const float* __restrict__ picks, int n,
+                                                                    float* __restrict__ conf, int j) {
+    __shared__ float part[32];
+    const float m = picks[0];
+    float s = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) s += expf(x[i] - m);
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = s;
+    __syncthreads();
+    if (threadIdx.x >> 5) return;
+    s = (threadIdx.x < (blockDim.x >> 5)) ? part[threadIdx.x] : 0.0f;
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+    if (threadIdx.x == 0) conf[j] = 1.0f / s;
+}
+
+// dst row i = src row ids[i]: rows of `words` 16-bit words, the source rows `stride` words apart.
+extern "C" __global__ void __launch_bounds__(256) tf_ink2_dsp_gather(const uint16_t* __restrict__ src, uint16_t* __restrict__ dst,
+                                                                     const int* __restrict__ ids, int words, long long stride) {
+    const uint16_t* s = src + static_cast<long long>(ids[blockIdx.x]) * stride;
+    uint16_t* d = dst + static_cast<long long>(blockIdx.x) * words;
+    for (int w = threadIdx.x; w < words; w += blockDim.x) d[w] = s[w];
+}
+
+// tf_ink2_dsp_pick over one rank, the pick an index into `map` (the draft vocabulary's token ids): walk[j + 1] = map[pick].
+extern "C" __global__ void tf_ink2_dsp_pick_map(const float* __restrict__ picks, const int* __restrict__ map, int* __restrict__ walk, int j) {
+    walk[j + 1] = map[reinterpret_cast<const int*>(picks)[1]];
+}

@@ -36,6 +36,7 @@ const Lane = struct {
     written: u64 = 0, // positions [0, written) are in the draft head's context
     drafts: [most_drafts]u32 = undefined, // the head's held drafts
     n_drafts: u32 = 0,
+    chain: [most_drafts]f32 = undefined, // the head's probability for each held draft (TF_INK2_VCAP)
 };
 
 /// The draft head and what a window needs around it (TF_INK2_MTP).
@@ -187,7 +188,7 @@ pub const Inkling = struct {
         return .{ .ptr = x, .vtable = &vtable };
     }
 
-    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true };
+    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .probabilities = probabilities, .release = release, .reports_fill = true };
 
     /// The round loop's facts: one-token windows and no draft head, or (TF_INK2_MTP) windows of up to `mtp_rows` rows with the
     /// head's block of drafts; a stream a slot.
@@ -202,6 +203,8 @@ pub const Inkling = struct {
             .copy_drafts = false,
             .fixed_draft_block = true,
             .drafts = most_drafts,
+            .draft_probabilities = x.mtp.?.head.vcap and x.mtp.?.head.vcap_floor == null,
+            .draft_confidence = x.mtp.?.head.vcap_floor,
             .window_costs = &window_costs,
             .mtp_step_ms = draft_ms,
             .max_streams = @intCast(x.free.len),
@@ -560,10 +563,25 @@ pub const Inkling = struct {
             if (r.depth == 0) continue;
             const pending = if (r.first) |feed| try x.value(feed) else r.follow[r.follow.len - 1];
             var block: [most_drafts]u32 = undefined;
-            try m.head.propose(x.s, l.slot, pending, at, &block);
+            try m.head.propose(x.s, l.slot, pending, at, &block, &l.chain);
             l.n_drafts = @min(r.depth, most_drafts);
             @memcpy(l.drafts[0..l.n_drafts], block[0..l.n_drafts]);
         }
+    }
+
+    /// Each held draft's chance of landing: the product of the head's probabilities along the chain.
+    fn probabilities(ptr: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
+        const x = self(ptr);
+        const m = if (x.mtp) |*m| m else return false;
+        if (!m.head.vcap) return false;
+        const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
+        if (out.len > l.n_drafts) return false;
+        var chance: f64 = 1;
+        for (out, l.chain[0..out.len]) |*o, p| {
+            chance *= p;
+            o.* = chance;
+        }
+        return true;
     }
 
     fn dropLane(x: *Inkling, s: *const Stream) void {

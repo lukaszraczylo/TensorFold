@@ -1221,7 +1221,8 @@ fn draftAcc(init: std.process.Init, a: Args) !void {
             try drafter.setRnnContext(s, 0, taps.ptr, pos - 1);
             var out: [ink2.drafter.proposals]u32 = undefined;
             try t_start.record(s);
-            try drafter.propose(s, 0, toks[k], pos, &out);
+            var chain: [ink2.drafter.proposals]f32 = undefined;
+            try drafter.propose(s, 0, toks[k], pos, &out, &chain);
             try t_end.record(s);
             try s.synchronize();
             total_ms += try cuda.Event.elapsedMs(t_start, t_end);

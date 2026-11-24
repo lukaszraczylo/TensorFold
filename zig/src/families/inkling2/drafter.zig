@@ -20,6 +20,22 @@ const Checkpoint = core.checkpoint.Checkpoint;
 pub const enable_env = "TF_INK2_MTP";
 /// 1 stores the vocabulary fold and the layers' propose weights as int8 with fp16 block scales (drafts only).
 pub const draft8_env = "TF_INK2_DRAFT8";
+/// Nonzero: `propose` also reports each draft's softmax probability (the verify-width cap); the drafts do not change.
+pub const vcap_env = "TF_INK2_VCAP";
+/// A file of ascending uint32 token ids: the draft head proposes only these (the target verifies the whole vocabulary).
+pub const vocab_env = "TF_INK2_DRAFT_VOCAB";
+
+/// The draft vocabulary on the device: its ids, the target head's rows for them (int8 codes, then fp16 scales) and the fold's.
+const Hot = struct {
+    n: usize,
+    ids: cuda.DeviceBuffer, // int32 [n]
+    head: cuda.DeviceBuffer, // weights.q8Bytes(n, hidden)
+
+    fn free(h: *Hot) void {
+        h.ids.free();
+        h.head.free();
+    }
+};
 
 pub const file_name = "mtp.safetensors";
 const bf16_bytes = 2;
@@ -62,6 +78,9 @@ pub const Drafter = struct {
     m: config.Mtp,
     streams: u32,
     draft8: bool,
+    hot: ?Hot,
+    vcap: bool,
+    vcap_floor: ?f64, // TF_INK2_VCAP 2..99: the chain chance a verified draft needs; null: trim by chance and price
     layers: [max_layers]Layer,
     alpha: cuda.DeviceBuffer, // fp32 [layers + 1, taps]: each layer's tap softmax, then the Markov head's
     norm: cuda.DeviceBuffer,
@@ -92,6 +111,7 @@ pub const Drafter = struct {
     walk: cuda.DeviceBuffer,
     picks: cuda.DeviceBuffer,
     logits: cuda.DeviceBuffer,
+    conf: cuda.DeviceBuffer, // fp32 [proposals]: the softmax probability of each step's pick (vcap)
     bytes: u64 = 0,
 
     fn dims(m: config.Mtp) struct { q: usize, kv: usize } {
@@ -138,6 +158,10 @@ pub const Drafter = struct {
         x.m = m;
         x.streams = streams;
         x.draft8 = try platform.environment.read(bool, draft8_env, false);
+        const vcap = try platform.environment.read(u32, vcap_env, 0);
+        x.vcap = vcap != 0;
+        x.vcap_floor = if (vcap >= 2) @as(f64, @floatFromInt(@min(vcap, 99))) / 100.0 else null;
+        x.hot = null;
         x.bytes = 0;
         x.k = try dk.Kernels.load(d);
         errdefer x.k.unload();
@@ -238,7 +262,9 @@ pub const Drafter = struct {
         x.walk = try zeroed(d, &x.bytes, block * 4);
         x.picks = try zeroed(d, &x.bytes, 16);
         x.logits = try zeroed(d, &x.bytes, vocab * f32_bytes);
+        x.conf = try zeroed(d, &x.bytes, proposals * f32_bytes);
         try x.foldHead(gpa, hout_w, hout_b);
+        if (try platform.environment.path(vocab_env, platform.environment.Process.get(.{}, vocab_env))) |path| try x.loadVocab(gpa, io, path);
         return x;
     }
 
@@ -335,6 +361,51 @@ pub const Drafter = struct {
         try s.synchronize();
     }
 
+    /// Restricts the proposals to the ids in `path`: gathers their rows of the target's int8 head and of the fold into compact tables.
+    fn loadVocab(x: *Drafter, gpa: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+        const c = x.c;
+        const d = c.d;
+        const vocab: usize = c.text.unpadded_vocab;
+        const hidden: usize = c.text.hidden;
+        const rank: usize = x.m.rank;
+        const w = c.w.unembed;
+        if (!x.draft8 or !w.q8) return error.Inkling2DraftVocabNeedsInt8;
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(vocab * 4 + 1));
+        defer gpa.free(bytes);
+        if (bytes.len == 0 or bytes.len % 4 != 0) return error.Inkling2DraftVocabFile;
+        const ids = std.mem.bytesAsSlice(i32, bytes);
+        for (ids, 0..) |id, i| {
+            if (id < 0 or id >= vocab or (i > 0 and id <= ids[i - 1])) return error.Inkling2DraftVocabFile;
+        }
+        const n = ids.len;
+        var hot: Hot = undefined;
+        hot.n = n;
+        hot.ids = try put(d, &x.bytes, bytes);
+        errdefer hot.ids.free();
+        hot.head = try zeroed(d, &x.bytes, weights.q8Bytes(n, hidden));
+        errdefer hot.head.free();
+        var fold = try zeroed(d, &x.bytes, weights.q8Bytes(n, rank));
+        errdefer fold.free();
+        var fbias = try zeroed(d, &x.bytes, n * bf16_bytes);
+        errdefer fbias.free();
+        var s = try cuda.Stream.init(d, true);
+        defer s.deinit();
+        const stored: usize = w.shape[0];
+        const k = &x.k;
+        const q8_block = ops.q8_block;
+        try dk.gather(k, s, w.ptr, hot.head.ptr, hot.ids.ptr, n, hidden / 2, hidden / 2);
+        try dk.gather(k, s, w.ptr + stored * hidden, hot.head.ptr + n * hidden, hot.ids.ptr, n, hidden / q8_block, hidden / q8_block);
+        try dk.gather(k, s, x.fold.ptr, fold.ptr, hot.ids.ptr, n, rank / 2, rank / 2);
+        try dk.gather(k, s, x.fold.ptr + vocab * rank, fold.ptr + n * rank, hot.ids.ptr, n, rank / q8_block, rank / q8_block);
+        try dk.gather(k, s, x.fbias.ptr, fbias.ptr, hot.ids.ptr, n, 1, 1);
+        try s.synchronize();
+        x.fold.free();
+        x.fbias.free();
+        x.fold = fold;
+        x.fbias = fbias;
+        x.hot = hot;
+    }
+
     fn freeLayer(l: *Layer) void {
         inline for (.{ "in_norm", "post_norm", "dflare", "q_norm", "k_norm", "k_norm_ctx", "wqkv", "wo", "wkv_ctx", "wgu", "wd", "kc", "vc" }) |f| @field(l, f).free();
     }
@@ -345,8 +416,9 @@ pub const Drafter = struct {
     }
 
     pub fn deinit(x: *Drafter) void {
-        inline for (.{ "alpha", "norm", "mask", "mk_dflare", "w1", "rnn_w", "rnn_b", "fold", "fbias", "frnn", "resid", "h", "anchor_h", "tmp", "qkv", "q", "attn", "mix", "po", "pml", "base_f", "base_b", "ctx_rows", "state", "latent", "walk", "picks", "logits" }) |f| @field(x, f).free();
+        inline for (.{ "alpha", "norm", "mask", "mk_dflare", "w1", "rnn_w", "rnn_b", "fold", "fbias", "frnn", "resid", "h", "anchor_h", "tmp", "qkv", "q", "attn", "mix", "po", "pml", "base_f", "base_b", "ctx_rows", "state", "latent", "walk", "picks", "logits", "conf" }) |f| @field(x, f).free();
         for (x.layers[0..x.m.layers]) |*l| freeLayer(l);
+        if (x.hot) |*h| h.free();
         x.k.unload();
         x.* = undefined;
     }
@@ -448,12 +520,12 @@ pub const Drafter = struct {
     }
 
     /// The `proposals` tokens after `anchor` (position `pos`, its embedding drawn by the target) into `out`.
-    pub fn propose(x: *Drafter, s: cuda.Stream, stream: u32, anchor: u32, pos: u64, out: *[proposals]u32) !void {
+    pub fn propose(x: *Drafter, s: cuda.Stream, stream: u32, anchor: u32, pos: u64, out: *[proposals]u32, chain: *[proposals]f32) !void {
         const c = x.c;
         const t = &c.text;
         const hidden: usize = t.hidden;
         const dm = dims(x.m);
-        const vocab: usize = t.unpadded_vocab;
+        const vocab: usize = if (x.hot) |h| h.n else t.unpadded_vocab;
         const rank: usize = x.m.rank;
         const k = &x.k;
         try decode.embedTokens(c, s, &.{anchor}, x.anchor_h.ptr);
@@ -508,7 +580,10 @@ pub const Drafter = struct {
         const was = c.window;
         c.window = true;
         defer c.window = was;
-        try head.logitsRaw(c, s, hrows, proposals, x.base_f.ptr);
+        if (x.hot) |h| {
+            const seg: ops.DenseSeg = .{ .x = hrows, .w = h.head.ptr, .out = x.base_f.ptr, .n = @intCast(h.n), .block0 = 0 };
+            try ops.dense1Q8Rows(&c.ops, s, &.{seg}, hidden, true, h.n, proposals);
+        } else try head.logitsRaw(c, s, hrows, proposals, x.base_f.ptr);
         try ops.tobf(&c.ops, s, x.base_f.ptr, proposals, vocab, vocab, x.base_b.ptr, vocab, 0, vocab);
         try dk.ctx(k, s, hrows, x.frnn.ptr + @as(u64, stream) * hidden * bf16_bytes, x.rnn_w.ptr, x.rnn_b.ptr, x.ctx_rows.ptr, proposals, hidden, rank);
         try x.state.fill8(0, s.handle);
@@ -521,10 +596,12 @@ pub const Drafter = struct {
                 try dk.vocabQ8(k, s, base_row, x.latent.ptr, x.fold.ptr, x.fold.ptr + vocab * rank, x.fbias.ptr, t.logit_cap, vocab, vocab, x.logits.ptr);
             } else try dk.vocab(k, s, base_row, x.latent.ptr, x.fold.ptr, x.fbias.ptr, t.logit_cap, vocab, vocab, x.logits.ptr);
             try ops.top1(&c.ops, s, x.logits.ptr, 1, vocab, vocab, 0, x.picks.ptr, x.picks.ptr + 4);
-            try dk.pick(k, s, x.picks.ptr, 1, x.walk.ptr, j);
+            if (x.vcap) try dk.conf(k, s, x.logits.ptr, x.picks.ptr, vocab, x.conf.ptr, j);
+            if (x.hot) |h| try dk.pickMap(k, s, x.picks.ptr, h.ids.ptr, x.walk.ptr, j) else try dk.pick(k, s, x.picks.ptr, 1, x.walk.ptr, j);
         }
         var got: [block]i32 = undefined;
         try x.walk.downloadAsync(0, std.mem.sliceAsBytes(&got), s.handle);
+        if (x.vcap) try x.conf.downloadAsync(0, std.mem.sliceAsBytes(chain), s.handle);
         try s.synchronize();
         for (out, got[1..]) |*o, g| o.* = std.math.cast(u32, g) orelse return error.Inkling2DraftToken;
     }
