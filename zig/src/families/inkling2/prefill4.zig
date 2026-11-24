@@ -19,6 +19,26 @@ const warps = 4;
 const tile_cols = warps * 4 * 8;
 const tile_pairs = 64;
 pub const tile_env_name = "TF_INK2_PF_TILE";
+/// 1 to 4: the NVFP4 prompt experts stage their tiles through a cp.async ring in shared memory (see `staged_tiles`); tiles 0 and 1 only.
+pub const smem_env_name = "TF_INK2_PF_SMEM";
+/// A staged kernel: its entry points and warps (the block holds `warps * tj * 8` columns).
+const Staged = struct { gu: [:0]const u8, down: [:0]const u8, warps: usize };
+const staged_tiles = [2][4]Staged{
+    .{
+        .{ .gu = "tf_ink2p_gu_nvfp4_s6", .down = "tf_ink2p_down_nvfp4_s6", .warps = 4 },
+        .{ .gu = "tf_ink2p_gu_nvfp4_s4", .down = "tf_ink2p_down_nvfp4_s4", .warps = 4 },
+        .{ .gu = "tf_ink2p_gu_nvfp4_s3", .down = "tf_ink2p_down_nvfp4_s3", .warps = 4 },
+        .{ .gu = "tf_ink2p_gu_nvfp4_s6", .down = "tf_ink2p_down_nvfp4_s6", .warps = 4 },
+    },
+    .{
+        .{ .gu = "tf_ink2p_gu_nvfp4_m8t2_s6", .down = "tf_ink2p_down_nvfp4_m8t2_s6", .warps = 4 },
+        .{ .gu = "tf_ink2p_gu_nvfp4_m8t2_s4", .down = "tf_ink2p_down_nvfp4_m8t2_s4", .warps = 4 },
+        .{ .gu = "tf_ink2p_gu_nvfp4_m8t2_w8s4", .down = "tf_ink2p_down_nvfp4_m8t2_w8s4", .warps = 8 },
+        .{ .gu = "tf_ink2p_gu_nvfp4_m8t2_w8s5", .down = "tf_ink2p_down_nvfp4_m8t2_w8s5", .warps = 8 },
+    },
+};
+/// Bit 0: the NVFP4 kernels, bit 1: the MXFP8 kernels pull each block's weight rows into L2 as whole rows before the loop.
+pub const prefetch_env_name = "TF_INK2_PF_PREFETCH";
 
 /// The NVFP4 expert kernel's per-warp tile: `mt` m16 tiles by `tj` n8 tiles, and its entry points in prefill4.cu.
 const Tile = struct { mt: usize, tj: usize, gu: [:0]const u8, down: [:0]const u8 };
@@ -47,6 +67,11 @@ pub const Kernels = struct {
     gu8: cuda.Function,
     down: cuda.Function,
     down8: cuda.Function,
+    gu_s: ?cuda.Function = null,
+    down_s: ?cuda.Function = null,
+    cols_s: usize = tile_cols,
+    block_s: usize = warps * 32,
+    prefetch: u32 = 0,
     dense: cuda.Function,
     dense_bf16: cuda.Function,
     ctl_pair: cuda.Function,
@@ -67,7 +92,27 @@ pub const Kernels = struct {
         const want8 = try platform.environment.read(u32, tile8_env_name, 0);
         if (want8 >= tiles8.len) return error.InvalidEnvironment;
         const t8 = tiles8[want8];
+        const smem = try platform.environment.read(u32, smem_env_name, 0);
+        if (smem > staged_tiles[0].len or (smem != 0 and want > 1)) return error.InvalidEnvironment;
+        const prefetch = try platform.environment.read(u32, prefetch_env_name, 0);
+        if (prefetch > 3) return error.InvalidEnvironment;
+        var gu_s: ?cuda.Function = null;
+        var down_s: ?cuda.Function = null;
+        var cols_s: usize = warps * t.tj * 8;
+        var block_s: usize = warps * 32;
+        if (smem != 0) {
+            const st = staged_tiles[want][smem - 1];
+            gu_s = try mod.function(st.gu);
+            down_s = try mod.function(st.down);
+            cols_s = st.warps * t.tj * 8;
+            block_s = st.warps * 32;
+        }
         return .{
+            .gu_s = gu_s,
+            .down_s = down_s,
+            .cols_s = cols_s,
+            .block_s = block_s,
+            .prefetch = prefetch,
             .cols = warps * t.tj * 8,
             .pairs = 16 * t.mt,
             .cols8 = warps * t8.tj * 8,
@@ -225,7 +270,7 @@ pub fn pack(k: *const Kernels, prec: plan.Precision, s: cuda.Stream, x: u64, out
     try cuda.launch.launch(if (prec == .nvfp4) k.pack else k.pack8, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = loop_kernels.actq_threads } }, s, &args);
 }
 
-fn grouped(f: cuda.Function, tile: [2]usize, prec: plan.Precision, s: cuda.Stream, a: Act, act_div: usize, offsets: u64, items: u64, g: loop_kernels.ExpertGemm, out: u64, rows: usize, experts: usize, n: usize, kdim: usize) !void {
+fn grouped(f: cuda.Function, tile: [2]usize, block: usize, pf: bool, prec: plan.Precision, s: cuda.Stream, a: Act, act_div: usize, offsets: u64, items: u64, g: loop_kernels.ExpertGemm, out: u64, rows: usize, experts: usize, n: usize, kdim: usize) !void {
     if (n == 0 or n % tile[0] != 0 or kdim == 0 or kdim % 128 != 0) return error.BadWidth;
     if (rows == 0) return;
     var args: cuda.Args = .{};
@@ -239,18 +284,35 @@ fn grouped(f: cuda.Function, tile: [2]usize, prec: plan.Precision, s: cuda.Strea
     if (prec == .nvfp4) for ([_]u64{ g.amax, g.outer }) |v| args.add(v);
     args.add(out);
     for ([_]usize{ n, kdim }) |v| args.add(@as(i32, @intCast(v)));
+    args.add(@as(i32, @intFromBool(pf)));
     const pair_tiles = (rows + tile[1] - 1) / tile[1];
-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(n / tile[0]), .y = @intCast(experts), .z = @intCast(pair_tiles) }, .block = .{ .x = warps * 32 } }, s, &args);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(n / tile[0]), .y = @intCast(experts), .z = @intCast(pair_tiles) }, .block = .{ .x = @intCast(block) } }, s, &args);
+}
+
+/// What a layer's grouped GEMM launches: the kernel, its tile (columns, pairs), its block size and whether it prefetches the weights.
+const Choice = struct { f: cuda.Function, tile: [2]usize, block: usize, pf: bool };
+
+/// The staged NVFP4 kernel when it is built and the 16-byte copies are aligned, else the register-fed kernel; the prefetch needs
+/// 16-byte aligned weight and scale rows.
+fn pick(k: *const Kernels, is_gu: bool, prec: plan.Precision, a: Act, g: loop_kernels.ExpertGemm) Choice {
+    const aligned = g.w % 16 == 0 and g.scale % 16 == 0;
+    if (prec != .nvfp4) return .{ .f = if (is_gu) k.gu8 else k.down8, .tile = .{ k.cols8, k.pairs8 }, .block = warps * 32, .pf = k.prefetch & 2 != 0 and aligned };
+    const pf = k.prefetch & 1 != 0 and aligned;
+    const staged = if (is_gu) k.gu_s else k.down_s;
+    if (staged) |f| if (aligned and a.codes % 16 == 0 and a.scales % 4 == 0) return .{ .f = f, .tile = .{ k.cols_s, k.pairs }, .block = k.block_s, .pf = pf };
+    return .{ .f = if (is_gu) k.gu else k.down, .tile = .{ k.cols, k.pairs }, .block = warps * 32, .pf = pf };
 }
 
 /// As loop_kernels.expertGateUpGrouped: `a` holds the rows' activations; pair p lands at gu row p.
 pub fn gateUp(k: *const Kernels, prec: plan.Precision, s: cuda.Stream, a: Act, offsets: u64, items: u64, g: loop_kernels.ExpertGemm, gu: u64, rows: usize, experts: usize, n: usize, kdim: usize) !void {
-    return grouped(if (prec == .nvfp4) k.gu else k.gu8, if (prec == .nvfp4) .{ k.cols, k.pairs } else .{ k.cols8, k.pairs8 }, prec, s, a, slots, offsets, items, g, gu, rows, experts, n, kdim);
+    const c = pick(k, true, prec, a, g);
+    return grouped(c.f, c.tile, c.block, c.pf, prec, s, a, slots, offsets, items, g, gu, rows, experts, n, kdim);
 }
 
 /// As loop_kernels.expertDownGrouped: `a` holds one row a pair.
 pub fn down(k: *const Kernels, prec: plan.Precision, s: cuda.Stream, a: Act, offsets: u64, items: u64, g: loop_kernels.ExpertGemm, dn: u64, rows: usize, experts: usize, n: usize, kdim: usize) !void {
-    return grouped(if (prec == .nvfp4) k.down else k.down8, if (prec == .nvfp4) .{ k.cols, k.pairs } else .{ k.cols8, k.pairs8 }, prec, s, a, 1, offsets, items, g, dn, rows, experts, n, kdim);
+    const c = pick(k, false, prec, a, g);
+    return grouped(c.f, c.tile, c.block, c.pf, prec, s, a, 1, offsets, items, g, dn, rows, experts, n, kdim);
 }
 
 test "packed activation sizes" {
@@ -268,8 +330,8 @@ test "a width the tiles do not cover is refused before any launch" {
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     const a: Act = .{ .codes = 0, .scales = 0, .amax = 0 };
     const g: loop_kernels.ExpertGemm = .{ .w = 0, .scale = 0 };
-    try std.testing.expectError(error.BadWidth, grouped(f, .{ tile_cols, tile_pairs }, .nvfp4, s, a, 8, 0, 0, g, 0, 512, 128, 100, 2304));
-    try std.testing.expectError(error.BadWidth, grouped(f, .{ tile_cols, tile_pairs }, .mxfp8, s, a, 8, 0, 0, g, 0, 512, 128, 2304, 100));
+    try std.testing.expectError(error.BadWidth, grouped(f, .{ tile_cols, tile_pairs }, warps * 32, false, .nvfp4, s, a, 8, 0, 0, g, 0, 512, 128, 100, 2304));
+    try std.testing.expectError(error.BadWidth, grouped(f, .{ tile_cols, tile_pairs }, warps * 32, false, .mxfp8, s, a, 8, 0, 0, g, 0, 512, 128, 2304, 100));
     try std.testing.expectError(error.BadWidth, pack(&.{ .mod = undefined, .pack = f, .pack8 = f, .gu = f, .gu8 = f, .down = f, .down8 = f, .dense = f, .dense_bf16 = f, .ctl_pair = f, .ctl_z = f }, .nvfp4, s, 0, 0, a, 4, 100));
 }
 

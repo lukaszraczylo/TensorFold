@@ -467,6 +467,15 @@ recipe commit e1f564eb915bb5272474b6c1c527aec3b9ed3de6. It credits TensorFold Co
 arithmetic and staging design. Copyright (c) 2026 MiaAI-Lab and Copyright (c) 2026 TensorFold contributors.
 The complete original MIT notices and permission text are retained in [Mia-FlashNext-MIT.txt](LICENSES/Mia-FlashNext-MIT.txt).
 
+## MiaAI-Lab Inkling 2 Mini prompt expert staging
+
+`zig/kernels/cuda/inkling2/prefill4.cu` (`groupedS`, the staged NVFP4 prompt experts) adapts the staged activation and
+weight tiles of patch 0015 (`0015-mini-prefill-tc.patch`) of
+[MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold](https://github.com/MiaAI-Lab/Inkling-2-Mini-DGX-Spark-TensorFold),
+Apache-2.0, Copyright (c) 2026 MiaAI-Lab. The cp.async ring, the swizzled shared tile and the ldmatrix fragment loads follow
+that patch; the weight-row L2 prefetch and the 8-warp tile are our own. The Apache-2.0 text is in
+[Apache-2.0.txt](LICENSES/Apache-2.0.txt).
+
 ## Ling-3.0-tiny and Ling-3.1-flash
 
 Ling-3.0-tiny and Ling-3.1-flash are MIT licensed by inclusionAI. The host family package

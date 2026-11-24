@@ -110,6 +110,8 @@ const valid = [_]Case{
     .{ .name = "TF_INK2_PF_ROWS", .raw = "1024", .n = 1024 },
     .{ .name = "TF_INK2_PF_TILE", .raw = "1", .n = 1 },
     .{ .name = "TF_INK2_PF_TILE8", .raw = "2", .n = 2 },
+    .{ .name = "TF_INK2_PF_SMEM", .raw = "4", .n = 4 },
+    .{ .name = "TF_INK2_PF_PREFETCH", .raw = "3", .n = 3 },
     .{ .name = "TF_INK2_VCAP", .raw = "30", .n = 30 },
     .{ .name = "TF_INK2_DRAFT_VOCAB", .raw = "/hot/draft-vocab.bin", .n = 0 },
     .{ .name = "TF_INK2_PF_CTL", .raw = "1", .n = 1 },
