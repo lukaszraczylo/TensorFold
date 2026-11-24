@@ -18,6 +18,7 @@ constexpr float kNvOuter = 1536.0f;
 
 __device__ __forceinline__ float bf16Round(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 
+template <int kMt, int kTj>
 struct Step {
     uint32_t a[kMt][4], sa[kMt];
     uint2 b[kTj];
@@ -26,7 +27,7 @@ struct Step {
 
 // Grid: x = column blocks, y = experts, z = tiles of kPairs of an expert's pairs (it gets at most `rows` pairs).
 // Pair p reads activation row p / act_div. DOWN: fp32 out [pairs, n] holds bf16-rounded sums; else bf16 out.
-template <bool DOWN>
+template <int kMt, int kTj, bool DOWN>
 __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ xs,
                                         const float* __restrict__ amax_a, int act_div, const int* __restrict__ offsets,
                                         const int* __restrict__ items, const uint8_t* __restrict__ w,
@@ -34,6 +35,7 @@ __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const
                                         const float* __restrict__ denominator, void* __restrict__ out, int N, int K) {
     const int e = blockIdx.y;
     const int begin = offsets[e];
+    constexpr int kPairs = 16 * kMt, kBlockCols = kWarps * kTj * 8;
     const int first = blockIdx.z * kPairs;
     const int cnt = min(offsets[e + 1] - begin - first, kPairs);
     if (cnt <= 0) return;
@@ -68,7 +70,7 @@ __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const
         sw[j] = ws + row * (K / 16);
     }
 
-    auto fetch = [&](int kg, Step& f) {
+    auto fetch = [&](int kg, Step<kMt, kTj>& f) {
 #pragma unroll
         for (int m = 0; m < kMt; ++m) {
             f.a[m][0] = v0[m] ? __ldg(reinterpret_cast<const uint32_t*>(c0[m] + kg * 32 + 4 * t)) : 0u;
@@ -91,7 +93,7 @@ __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const
 #pragma unroll
         for (int j = 0; j < kTj; ++j) acc[m][j][0] = acc[m][j][1] = acc[m][j][2] = acc[m][j][3] = 0.0f;
 
-    Step st[2];
+    Step<kMt, kTj> st[2];
     fetch(0, st[0]);
     for (int kg = 0; kg < KG; kg += 2) {
         if (kg + 1 < KG) fetch(kg + 1, st[1]);
@@ -145,6 +147,7 @@ __device__ __forceinline__ void mmaMx8(float (&d)[4], const uint32_t (&a)[4], ui
 #endif
 }
 
+template <int kMt, int kTj>
 struct Step8 {
     uint32_t a[kMt][4], sa[kMt];
     uint2 b[kTj];
@@ -152,13 +155,14 @@ struct Step8 {
 };
 
 // As `grouped` on MXFP8: act codes [rows, K] bytes, exps [rows, K/32], weights [E, N, K] bytes, ws [E, N, K/32].
-template <bool DOWN>
+template <int kMt, int kTj, bool DOWN>
 __device__ __forceinline__ void groupedMx(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ xs, int act_div,
                                           const int* __restrict__ offsets, const int* __restrict__ items,
                                           const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws,
                                           void* __restrict__ out, int N, int K) {
     const int e = blockIdx.y;
     const int begin = offsets[e];
+    constexpr int kPairs = 16 * kMt, kBlockCols = kWarps * kTj * 8;
     const int first = blockIdx.z * kPairs;
     const int cnt = min(offsets[e + 1] - begin - first, kPairs);
     if (cnt <= 0) return;
@@ -193,7 +197,7 @@ __device__ __forceinline__ void groupedMx(const uint8_t* __restrict__ codes, con
         sw[j] = ws + row * (K / 32);
     }
 
-    auto fetch = [&](int kg, Step8& f) {
+    auto fetch = [&](int kg, Step8<kMt, kTj>& f) {
 #pragma unroll
         for (int m = 0; m < kMt; ++m) {
             f.a[m][0] = v0[m] ? __ldg(reinterpret_cast<const uint32_t*>(c0[m] + kg * 32 + 4 * t)) : 0u;
@@ -216,7 +220,7 @@ __device__ __forceinline__ void groupedMx(const uint8_t* __restrict__ codes, con
 #pragma unroll
         for (int j = 0; j < kTj; ++j) acc[m][j][0] = acc[m][j][1] = acc[m][j][2] = acc[m][j][3] = 0.0f;
 
-    Step8 st[2];
+    Step8<kMt, kTj> st[2];
     fetch(0, st[0]);
     for (int kg = 0; kg < KG; kg += 2) {
         if (kg + 1 < KG) fetch(kg + 1, st[1]);
@@ -254,19 +258,26 @@ __device__ __forceinline__ void groupedMx(const uint8_t* __restrict__ codes, con
 
 }  // namespace ink2p
 
-extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)
-    tf_ink2p_gu_nvfp4(const uint8_t* codes, const uint8_t* xs, const float* amax_a, int act_div, const int* offsets,
-                      const int* items, const uint8_t* w, const uint8_t* ws, const float* amax_w, const float* denominator,
-                      __nv_bfloat16* out, int N, int K) {
-    ink2p::grouped<false>(codes, xs, amax_a, act_div, offsets, items, w, ws, amax_w, denominator, out, N, K);
-}
+#define INK2P_NVFP4_ENTRY(MT, TJ, SUF)                                                                                    \
+    extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)                                                     \
+        tf_ink2p_gu_nvfp4##SUF(const uint8_t* codes, const uint8_t* xs, const float* amax_a, int act_div,                 \
+                               const int* offsets, const int* items, const uint8_t* w, const uint8_t* ws,                 \
+                               const float* amax_w, const float* denominator, __nv_bfloat16* out, int N, int K) {         \
+        ink2p::grouped<MT, TJ, false>(codes, xs, amax_a, act_div, offsets, items, w, ws, amax_w, denominator, out, N, K); \
+    }                                                                                                                      \
+    extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)                                                     \
+        tf_ink2p_down_nvfp4##SUF(const uint8_t* codes, const uint8_t* xs, const float* amax_a, int act_div,               \
+                                 const int* offsets, const int* items, const uint8_t* w, const uint8_t* ws,               \
+                                 const float* amax_w, const float* denominator, float* out, int N, int K) {               \
+        ink2p::grouped<MT, TJ, true>(codes, xs, amax_a, act_div, offsets, items, w, ws, amax_w, denominator, out, N, K);  \
+    }
 
-extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)
-    tf_ink2p_down_nvfp4(const uint8_t* codes, const uint8_t* xs, const float* amax_a, int act_div, const int* offsets,
-                        const int* items, const uint8_t* w, const uint8_t* ws, const float* amax_w,
-                        const float* denominator, float* out, int N, int K) {
-    ink2p::grouped<true>(codes, xs, amax_a, act_div, offsets, items, w, ws, amax_w, denominator, out, N, K);
-}
+INK2P_NVFP4_ENTRY(4, 4, )
+INK2P_NVFP4_ENTRY(8, 2, _m8t2)
+INK2P_NVFP4_ENTRY(8, 4, _m8t4)
+INK2P_NVFP4_ENTRY(2, 4, _m2t4)
+INK2P_NVFP4_ENTRY(16, 1, _m16t1)
+INK2P_NVFP4_ENTRY(12, 2, _m12t2)
 
 // ---- bf16 rows times bf16 weight rows on the bf16 mma: out[r, n] = x[r] . w[n], float32 ----
 // The sum of a column runs on the tensor cores in k16 steps, so it differs from tf_dense_rows in order only.
@@ -381,14 +392,18 @@ extern "C" __global__ void __launch_bounds__(ink2p::kDenseWarps * 32)
     denseRows<true>(x, x_stride, w, out, out_stride, m, n, k);
 }
 
-extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)
-    tf_ink2p_gu_mxfp8(const uint8_t* codes, const uint8_t* xs, int act_div, const int* offsets, const int* items,
-                      const uint8_t* w, const uint8_t* ws, __nv_bfloat16* out, int N, int K) {
-    ink2p::groupedMx<false>(codes, xs, act_div, offsets, items, w, ws, out, N, K);
-}
+#define INK2P_MX8_ENTRY(MT, TJ, SUF)                                                                                  \
+    extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)                                                 \
+        tf_ink2p_gu_mxfp8##SUF(const uint8_t* codes, const uint8_t* xs, int act_div, const int* offsets,              \
+                               const int* items, const uint8_t* w, const uint8_t* ws, __nv_bfloat16* out, int N, int K) { \
+        ink2p::groupedMx<MT, TJ, false>(codes, xs, act_div, offsets, items, w, ws, out, N, K);                        \
+    }                                                                                                                  \
+    extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)                                                 \
+        tf_ink2p_down_mxfp8##SUF(const uint8_t* codes, const uint8_t* xs, int act_div, const int* offsets,            \
+                                 const int* items, const uint8_t* w, const uint8_t* ws, float* out, int N, int K) {   \
+        ink2p::groupedMx<MT, TJ, true>(codes, xs, act_div, offsets, items, w, ws, out, N, K);                         \
+    }
 
-extern "C" __global__ void __launch_bounds__(ink2p::kWarps * 32)
-    tf_ink2p_down_mxfp8(const uint8_t* codes, const uint8_t* xs, int act_div, const int* offsets, const int* items,
-                        const uint8_t* w, const uint8_t* ws, float* out, int N, int K) {
-    ink2p::groupedMx<true>(codes, xs, act_div, offsets, items, w, ws, out, N, K);
-}
+INK2P_MX8_ENTRY(4, 4, )
+INK2P_MX8_ENTRY(8, 2, _m8t2)
+INK2P_MX8_ENTRY(8, 4, _m8t4)

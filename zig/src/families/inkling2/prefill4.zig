@@ -5,6 +5,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const loop_kernels = @import("loop_kernels.zig");
 const plan = @import("plan.zig");
+const platform = @import("sys");
 
 pub const env_name = "TF_INK2_PF_FP4";
 pub const ctl_env_name = "TF_INK2_PF_CTL";
@@ -17,6 +18,24 @@ const inter = 1152;
 const warps = 4;
 const tile_cols = warps * 4 * 8;
 const tile_pairs = 64;
+pub const tile_env_name = "TF_INK2_PF_TILE";
+
+/// The NVFP4 expert kernel's per-warp tile: `mt` m16 tiles by `tj` n8 tiles, and its entry points in prefill4.cu.
+const Tile = struct { mt: usize, tj: usize, gu: [:0]const u8, down: [:0]const u8 };
+const tiles = [_]Tile{
+    .{ .mt = 4, .tj = 4, .gu = "tf_ink2p_gu_nvfp4", .down = "tf_ink2p_down_nvfp4" },
+    .{ .mt = 8, .tj = 2, .gu = "tf_ink2p_gu_nvfp4_m8t2", .down = "tf_ink2p_down_nvfp4_m8t2" },
+    .{ .mt = 8, .tj = 4, .gu = "tf_ink2p_gu_nvfp4_m8t4", .down = "tf_ink2p_down_nvfp4_m8t4" },
+    .{ .mt = 2, .tj = 4, .gu = "tf_ink2p_gu_nvfp4_m2t4", .down = "tf_ink2p_down_nvfp4_m2t4" },
+    .{ .mt = 16, .tj = 1, .gu = "tf_ink2p_gu_nvfp4_m16t1", .down = "tf_ink2p_down_nvfp4_m16t1" },
+    .{ .mt = 12, .tj = 2, .gu = "tf_ink2p_gu_nvfp4_m12t2", .down = "tf_ink2p_down_nvfp4_m12t2" },
+};
+pub const tile8_env_name = "TF_INK2_PF_TILE8";
+const tiles8 = [_]Tile{
+    .{ .mt = 4, .tj = 4, .gu = "tf_ink2p_gu_mxfp8", .down = "tf_ink2p_down_mxfp8" },
+    .{ .mt = 8, .tj = 2, .gu = "tf_ink2p_gu_mxfp8_m8t2", .down = "tf_ink2p_down_mxfp8_m8t2" },
+    .{ .mt = 8, .tj = 4, .gu = "tf_ink2p_gu_mxfp8_m8t4", .down = "tf_ink2p_down_mxfp8_m8t4" },
+};
 const nvfp4_block = 16;
 const slots = loop_kernels.expert_slots;
 
@@ -32,20 +51,34 @@ pub const Kernels = struct {
     dense_bf16: cuda.Function,
     ctl_pair: cuda.Function,
     ctl_z: cuda.Function,
+    cols: usize = tile_cols,
+    pairs: usize = tile_pairs,
+    cols8: usize = tile_cols,
+    pairs8: usize = tile_pairs,
 
     /// `loop` holds the activation packer; the image holds the two grouped GEMMs.
     pub fn load(d: *const cuda.Driver, loop: *const loop_kernels.Kernels) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var mod = try cuda.Module.load(d, cuda.kernels.inkling2_pf4);
         errdefer mod.unload();
+        const want = try platform.environment.read(u32, tile_env_name, 0);
+        if (want >= tiles.len) return error.InvalidEnvironment;
+        const t = tiles[want];
+        const want8 = try platform.environment.read(u32, tile8_env_name, 0);
+        if (want8 >= tiles8.len) return error.InvalidEnvironment;
+        const t8 = tiles8[want8];
         return .{
+            .cols = warps * t.tj * 8,
+            .pairs = 16 * t.mt,
+            .cols8 = warps * t8.tj * 8,
+            .pairs8 = 16 * t8.mt,
             .mod = mod,
             .pack = try loop.mod.function("tf_ink2l_actq_nvfp4_pack"),
             .pack8 = try loop.mod.function("tf_ink2l_actq_mxfp8_pack"),
-            .gu = try mod.function("tf_ink2p_gu_nvfp4"),
-            .gu8 = try mod.function("tf_ink2p_gu_mxfp8"),
-            .down = try mod.function("tf_ink2p_down_nvfp4"),
-            .down8 = try mod.function("tf_ink2p_down_mxfp8"),
+            .gu = try mod.function(t.gu),
+            .gu8 = try mod.function(t8.gu),
+            .down = try mod.function(t.down),
+            .down8 = try mod.function(t8.down),
             .dense = try mod.function("tf_ink2p_dense_rows"),
             .dense_bf16 = try mod.function("tf_ink2p_dense_rows_bf16"),
             .ctl_pair = try loop.mod.function("tf_ink2l_ctl_pair"),
@@ -192,8 +225,8 @@ pub fn pack(k: *const Kernels, prec: plan.Precision, s: cuda.Stream, x: u64, out
     try cuda.launch.launch(if (prec == .nvfp4) k.pack else k.pack8, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = loop_kernels.actq_threads } }, s, &args);
 }
 
-fn grouped(f: cuda.Function, prec: plan.Precision, s: cuda.Stream, a: Act, act_div: usize, offsets: u64, items: u64, g: loop_kernels.ExpertGemm, out: u64, rows: usize, experts: usize, n: usize, kdim: usize) !void {
-    if (n == 0 or n % tile_cols != 0 or kdim == 0 or kdim % 128 != 0) return error.BadWidth;
+fn grouped(f: cuda.Function, tile: [2]usize, prec: plan.Precision, s: cuda.Stream, a: Act, act_div: usize, offsets: u64, items: u64, g: loop_kernels.ExpertGemm, out: u64, rows: usize, experts: usize, n: usize, kdim: usize) !void {
+    if (n == 0 or n % tile[0] != 0 or kdim == 0 or kdim % 128 != 0) return error.BadWidth;
     if (rows == 0) return;
     var args: cuda.Args = .{};
     if (prec == .nvfp4) {
@@ -206,18 +239,18 @@ fn grouped(f: cuda.Function, prec: plan.Precision, s: cuda.Stream, a: Act, act_d
     if (prec == .nvfp4) for ([_]u64{ g.amax, g.outer }) |v| args.add(v);
     args.add(out);
     for ([_]usize{ n, kdim }) |v| args.add(@as(i32, @intCast(v)));
-    const pair_tiles = (rows + tile_pairs - 1) / tile_pairs;
-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(n / tile_cols), .y = @intCast(experts), .z = @intCast(pair_tiles) }, .block = .{ .x = warps * 32 } }, s, &args);
+    const pair_tiles = (rows + tile[1] - 1) / tile[1];
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(n / tile[0]), .y = @intCast(experts), .z = @intCast(pair_tiles) }, .block = .{ .x = warps * 32 } }, s, &args);
 }
 
 /// As loop_kernels.expertGateUpGrouped: `a` holds the rows' activations; pair p lands at gu row p.
 pub fn gateUp(k: *const Kernels, prec: plan.Precision, s: cuda.Stream, a: Act, offsets: u64, items: u64, g: loop_kernels.ExpertGemm, gu: u64, rows: usize, experts: usize, n: usize, kdim: usize) !void {
-    return grouped(if (prec == .nvfp4) k.gu else k.gu8, prec, s, a, slots, offsets, items, g, gu, rows, experts, n, kdim);
+    return grouped(if (prec == .nvfp4) k.gu else k.gu8, if (prec == .nvfp4) .{ k.cols, k.pairs } else .{ k.cols8, k.pairs8 }, prec, s, a, slots, offsets, items, g, gu, rows, experts, n, kdim);
 }
 
 /// As loop_kernels.expertDownGrouped: `a` holds one row a pair.
 pub fn down(k: *const Kernels, prec: plan.Precision, s: cuda.Stream, a: Act, offsets: u64, items: u64, g: loop_kernels.ExpertGemm, dn: u64, rows: usize, experts: usize, n: usize, kdim: usize) !void {
-    return grouped(if (prec == .nvfp4) k.down else k.down8, prec, s, a, 1, offsets, items, g, dn, rows, experts, n, kdim);
+    return grouped(if (prec == .nvfp4) k.down else k.down8, if (prec == .nvfp4) .{ k.cols, k.pairs } else .{ k.cols8, k.pairs8 }, prec, s, a, 1, offsets, items, g, dn, rows, experts, n, kdim);
 }
 
 test "packed activation sizes" {
@@ -235,8 +268,8 @@ test "a width the tiles do not cover is refused before any launch" {
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     const a: Act = .{ .codes = 0, .scales = 0, .amax = 0 };
     const g: loop_kernels.ExpertGemm = .{ .w = 0, .scale = 0 };
-    try std.testing.expectError(error.BadWidth, grouped(f, .nvfp4, s, a, 8, 0, 0, g, 0, 512, 128, 100, 2304));
-    try std.testing.expectError(error.BadWidth, grouped(f, .mxfp8, s, a, 8, 0, 0, g, 0, 512, 128, 2304, 100));
+    try std.testing.expectError(error.BadWidth, grouped(f, .{ tile_cols, tile_pairs }, .nvfp4, s, a, 8, 0, 0, g, 0, 512, 128, 100, 2304));
+    try std.testing.expectError(error.BadWidth, grouped(f, .{ tile_cols, tile_pairs }, .mxfp8, s, a, 8, 0, 0, g, 0, 512, 128, 2304, 100));
     try std.testing.expectError(error.BadWidth, pack(&.{ .mod = undefined, .pack = f, .pack8 = f, .gu = f, .gu8 = f, .down = f, .down8 = f, .dense = f, .dense_bf16 = f, .ctl_pair = f, .ctl_z = f }, .nvfp4, s, 0, 0, a, 4, 100));
 }
 
