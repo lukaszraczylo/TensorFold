@@ -373,3 +373,59 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2d_head4(const __nv_bflo
         if (lane == 0 && r < rows) out[(long long)r * N + n] = v;
     }
 }
+
+// Quantising the target head to the NVFP4 layout tf_ink2d_head4 reads, on the device (ModelOpt's recipe: global scale
+// amax / (6 * 448), an e4m3 scale a 16 inputs at the block's amax / 6, e2m1 codes to the nearest value).
+__device__ __forceinline__ float e4m3Value(int c) {
+    const int ex = c >> 3, mant = c & 7;
+    return ex == 0 ? mant * (1.f / 8.f) * (1.f / 64.f) : (1.f + mant * (1.f / 8.f)) * exp2f((float)(ex - 7));
+}
+
+// amax[0] = max(amax[0], |w|) over `count` bf16 values (non-negative floats order as their bits).
+extern "C" __global__ void __launch_bounds__(256) tf_ink2d_h4_amax(const uint16_t* __restrict__ w, long long count, unsigned* __restrict__ amax) {
+    float m = 0.f;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (long long)gridDim.x * blockDim.x)
+        m = fmaxf(m, fabsf(__uint_as_float(((unsigned)w[i]) << 16)));
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    __shared__ float red[8];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float r = 0.f;
+        for (int i = 0; i < 8; ++i) r = fmaxf(r, red[i]);
+        atomicMax(amax, __float_as_uint(r));
+    }
+}
+
+// One thread a 16-input block of `rows` rows of D bf16: codes [rows][D/2] and e4m3 scales [rows][D/16].
+extern "C" __global__ void __launch_bounds__(256) tf_ink2d_h4_quant(const uint16_t* __restrict__ w, int rows, float gs, uint8_t* __restrict__ codes,
+                                                                    uint8_t* __restrict__ scales) {
+    const long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (long long)rows * GROUPS) return;
+    const uint16_t* src = w + t * GROUP;
+    float v[GROUP];
+    float bmax = 0.f;
+#pragma unroll
+    for (int j = 0; j < GROUP; ++j) {
+        v[j] = __uint_as_float(((unsigned)src[j]) << 16);
+        bmax = fmaxf(bmax, fabsf(v[j]));
+    }
+    const float want = bmax / 6.f / gs;
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (e4m3Value(mid) < want) lo = mid + 1; else hi = mid;
+    }
+    const int sc = (lo > 0 && want - e4m3Value(lo - 1) <= e4m3Value(lo) - want) ? lo - 1 : lo;
+    scales[t] = (uint8_t)sc;
+    const float step = e4m3Value(sc) * gs;
+    uint32_t words[2] = {0u, 0u};
+#pragma unroll
+    for (int j = 0; j < GROUP; ++j) {
+        const float mag = step > 0.f ? fabsf(v[j]) / step : 0.f;
+        uint32_t idx = (mag >= 0.25f) + (mag >= 0.75f) + (mag >= 1.25f) + (mag >= 1.75f) + (mag >= 2.5f) + (mag >= 3.5f) + (mag >= 5.0f);
+        const uint32_t nib = idx | ((v[j] < 0.f && idx != 0) ? 8u : 0u);
+        words[j >> 3] |= nib << (4 * (j & 7));
+    }
+    *reinterpret_cast<uint2*>(codes + t * (GROUP / 2)) = make_uint2(words[0], words[1]);
+}

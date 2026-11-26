@@ -84,6 +84,8 @@ const Kernels = struct {
     top16_merge: cuda.Function,
     select: cuda.Function,
     head4: cuda.Function,
+    h4_amax: cuda.Function,
+    h4_quant: cuda.Function,
 
     fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -91,88 +93,14 @@ const Kernels = struct {
         errdefer mod.unload();
         var k: Kernels = undefined;
         k.mod = mod;
-        inline for (.{ "norm", "conv", "swiglu", "block_qkv", "ctx_kv", "attn_part", "attn_merge", "top16_part", "top16_merge", "select", "head4" }) |name| {
+        inline for (.{ "norm", "conv", "swiglu", "block_qkv", "ctx_kv", "attn_part", "attn_merge", "top16_part", "top16_merge", "select", "head4", "h4_amax", "h4_quant" }) |name| {
             @field(k, name) = try mod.function("tf_ink2d_" ++ name);
         }
         return k;
     }
 };
 
-fn bf32(h: u16) f32 {
-    return @bitCast(@as(u32, h) << 16);
-}
-
-const e2m1_bounds = [_]f32{ 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0 };
-
-/// e4m3's non-negative values by code (0..126).
-fn e4m3Values() [127]f32 {
-    var v: [127]f32 = undefined;
-    for (&v, 0..) |*o, c| {
-        const ex: i32 = @intCast(c >> 3);
-        const mant: f32 = @floatFromInt(c & 7);
-        o.* = if (ex == 0) mant / 8.0 * std.math.pow(f32, 2, -6) else (1.0 + mant / 8.0) * std.math.pow(f32, 2, @floatFromInt(ex - 7));
-    }
-    return v;
-}
-
-/// The global scale of `rows`: amax / (6 * 448).
-fn head4Scale(rows: []const u16) !f32 {
-    var m: f32 = 0;
-    for (rows) |h| m = @max(m, @abs(bf32(h)));
-    if (!(m > 0) or !std.math.isFinite(m)) return error.DFlash2WeightRange;
-    return m / (6.0 * 448.0);
-}
-
-const pack_threads = 8;
 const head4_tolerance = 0.25;
-
-fn head4Rows(rows: []const u16, r0: usize, r1: usize, gs: f32, codes: []u8, scales: []u8) void {
-    const e4 = e4m3Values();
-    for (r0..r1) |r| {
-        const src = rows[r * hidden ..][0..hidden];
-        for (0..hidden / group) |b| {
-            var bmax: f32 = 0;
-            for (src[b * group ..][0..group]) |h| bmax = @max(bmax, @abs(bf32(h)));
-            const want = bmax / 6.0 / gs;
-            var lo: usize = 0;
-            var hi: usize = e4.len - 1;
-            while (lo < hi) {
-                const mid = (lo + hi) / 2;
-                if (e4[mid] < want) lo = mid + 1 else hi = mid;
-            }
-            const sc: usize = if (lo > 0 and want - e4[lo - 1] <= e4[lo] - want) lo - 1 else lo;
-            scales[r * (hidden / group) + b] = @intCast(sc);
-            const step = e4[sc] * gs;
-            for (0..group / 2) |q| {
-                var byte: u8 = 0;
-                for (0..2) |h| {
-                    const val = bf32(src[b * group + 2 * q + h]);
-                    const mag = if (step > 0) @abs(val) / step else 0;
-                    var idx: u8 = 0;
-                    for (e2m1_bounds) |bound| idx += @intFromBool(mag >= bound);
-                    const nib: u8 = idx | (if (val < 0 and idx != 0) @as(u8, 8) else 0);
-                    byte |= nib << @intCast(4 * h);
-                }
-                codes[(r * hidden + b * group) / 2 + q] = byte;
-            }
-        }
-    }
-}
-
-/// `rows` [n][hidden] bf16 as NVFP4 codes and e4m3 scales (the row-major layout tf_ink2d_head4 reads).
-fn head4Pack(rows: []const u16, n: usize, gs: f32, codes: []u8, scales: []u8) !void {
-    var threads: [pack_threads]std.Thread = undefined;
-    const per = (n + pack_threads - 1) / pack_threads;
-    var spawned: usize = 0;
-    errdefer for (threads[0..spawned]) |t| t.join();
-    for (0..pack_threads) |i| {
-        const r0 = @min(n, i * per);
-        const r1 = @min(n, r0 + per);
-        threads[i] = try std.Thread.spawn(.{}, head4Rows, .{ rows, r0, r1, gs, codes, scales });
-        spawned += 1;
-    }
-    for (threads[0..spawned]) |t| t.join();
-}
 
 /// A stream's ring state on the host: the first position the ring holds for this sequence and the end of what it absorbed.
 const Lane = struct { from: u64 = 0, end: u64 = 0 };
@@ -353,9 +281,8 @@ pub const Dflash2 = struct {
         x.succ = try x.put(&.{succ[0 .. x.vocab * rank * bf16_bytes]});
     }
 
-    /// The target's unembedding as `Head4`: read back as bf16 (expanded from the 8-bit copy when the target holds that), then
-    /// quantised on the host as ModelOpt does: global scale amax / (6 * 448), an e4m3 scale a 16 inputs at the block's
-    /// amax / 6, e2m1 codes to the nearest value. After tonyd2wild's patch 0018 (Apache-2.0).
+    /// The target's unembedding as `Head4`, quantised on the device as ModelOpt does (tf_ink2d_h4_quant). The target holds it
+    /// bf16 or 8-bit; either is read as bf16 a tile of rows at a time. After tonyd2wild's patch 0018 (Apache-2.0).
     fn quantHead(x: *Dflash2) !Head4 {
         const c = x.c;
         const n = x.vocab;
@@ -363,33 +290,50 @@ pub const Dflash2 = struct {
         if (w.dtype != .bf16 or w.rank != 2 or w.shape[1] != hidden or w.shape[0] < n) return error.Inkling2HeadShape;
         var s = try cuda.Stream.init(c.d, true);
         defer s.deinit();
-        const rows = try x.gpa.alloc(u16, n * hidden);
-        defer x.gpa.free(rows);
-        var row0: usize = 0;
-        while (row0 < n) : (row0 += engine.dq_tile_rows) {
-            const tile = @min(engine.dq_tile_rows, n - row0);
-            const dst = std.mem.sliceAsBytes(rows[row0 * hidden ..][0 .. tile * hidden]);
-            if (w.q8) {
-                try ops.q8ToBf16(&c.ops, s, w.ptr, w.shape[0], hidden, row0, tile, c.dq.ptr);
+        var amax = try cuda.DeviceBuffer.alloc(c.d, 256);
+        defer amax.free();
+        try amax.fill8(0, s.handle);
+        var codes = try cuda.DeviceBuffer.alloc(c.d, n * hidden / 2);
+        errdefer codes.free();
+        var scales = try cuda.DeviceBuffer.alloc(c.d, n * hidden / group);
+        errdefer scales.free();
+        var gs: f32 = 0;
+        for ([_]bool{ false, true }) |quant| {
+            var row0: usize = 0;
+            while (row0 < n) : (row0 += engine.dq_tile_rows) {
+                const tile = @min(engine.dq_tile_rows, n - row0);
+                var src: u64 = w.ptr + row0 * hidden * bf16_bytes;
+                if (w.q8) {
+                    try ops.q8ToBf16(&c.ops, s, w.ptr, w.shape[0], hidden, row0, tile, c.dq.ptr);
+                    src = c.dq.ptr;
+                }
+                var a: cuda.Args = .{};
+                if (!quant) {
+                    a.add(src);
+                    a.add(@as(i64, @intCast(tile * hidden)));
+                    a.add(amax.ptr);
+                    try go(x.k.h4_amax, s, .{ .x = 1024 }, 256, &a);
+                } else {
+                    a.add(src);
+                    a.add(@as(i32, @intCast(tile)));
+                    a.add(gs);
+                    a.add(codes.ptr + row0 * hidden / 2);
+                    a.add(scales.ptr + row0 * hidden / group);
+                    try go(x.k.h4_quant, s, .{ .x = @intCast((tile * (hidden / group) + 255) / 256) }, 256, &a);
+                }
                 try s.synchronize();
-                try cuda.memory.download(c.d, c.dq.ptr, dst);
-            } else try cuda.memory.download(c.d, w.ptr + row0 * hidden * bf16_bytes, dst);
+            }
+            if (!quant) {
+                var bits: u32 = 0;
+                try cuda.memory.download(c.d, amax.ptr, std.mem.asBytes(&bits));
+                const m: f32 = @bitCast(bits);
+                if (!(m > 0) or !std.math.isFinite(m)) return error.DFlash2WeightRange;
+                gs = m / (6.0 * 448.0);
+                std.log.info("Inkling 2 Mini DFlash2 NVFP4 head: amax {d:.4}, global scale {e}", .{ m, gs });
+            }
         }
-        const gs = try head4Scale(rows);
-        const codes = try x.gpa.alloc(u8, n * hidden / 2);
-        defer x.gpa.free(codes);
-        const scales = try x.gpa.alloc(u8, n * hidden / group);
-        defer x.gpa.free(scales);
-        try head4Pack(rows, n, gs, codes, scales);
-        var nz_scales: usize = 0;
-        for (scales) |b| nz_scales += @intFromBool(b != 0);
-        var nz_codes: usize = 0;
-        for (codes) |b| nz_codes += @intFromBool(b != 0);
-        std.log.info("Inkling 2 Mini DFlash2 NVFP4 head: global scale {e}, {d} of {d} block scales and {d} of {d} code bytes nonzero, row 0 starts {d:.4} {d:.4} {d:.4}", .{ gs, nz_scales, scales.len, nz_codes, codes.len, bf32(rows[0]), bf32(rows[1]), bf32(rows[2]) });
-        var out: Head4 = .{ .codes = try x.put(&.{codes}), .scales = undefined, .gs = gs };
-        errdefer out.codes.free();
-        out.scales = try x.put(&.{scales});
-        return out;
+        x.bytes += codes.len + scales.len;
+        return .{ .codes = codes, .scales = scales, .gs = gs };
     }
 
     fn head4Logits(x: *Dflash2, s: cuda.Stream, h: Head4, rows_ptr: u64, out: u64) !void {
