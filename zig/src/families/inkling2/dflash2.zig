@@ -10,6 +10,7 @@ const decode = @import("decode.zig");
 const engine = @import("engine.zig");
 const head = @import("head.zig");
 const platform = @import("sys");
+const prefill4 = @import("prefill4.zig");
 const ops = @import("ops.zig");
 const weights = @import("weights.zig");
 
@@ -446,6 +447,10 @@ pub const Dflash2 = struct {
 
     /// out bf16 [m, n] = round(a bf16 [m, k] . w bf16 [n, k]^T).
     fn gemm(x: *Dflash2, s: cuda.Stream, a: u64, lda: usize, w: u64, out: u64, m: usize, n: usize, k: usize) !void {
+        if (x.c.pf4) |*st| if (st.dense and m >= prefill4.prompt_from and k % 16 == 0 and n % 8 == 0 and a % 4 == 0 and w % 4 == 0 and lda % 2 == 0) {
+            try prefill4.denseRows(&st.k, s, a, lda, w, x.tmp.ptr, n, m, n, k);
+            return ops.tobf(&x.c.ops, s, x.tmp.ptr, m, n, n, out, n, 0, n);
+        };
         try x.c.dense.rows(s, a, lda, w, x.tmp.ptr, n, m, n, k);
         try ops.tobf(&x.c.ops, s, x.tmp.ptr, m, n, n, out, n, 0, n);
     }
