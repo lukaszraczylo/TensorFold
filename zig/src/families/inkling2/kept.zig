@@ -56,7 +56,7 @@ pub fn drop(t: *Target, st: *State) void {
 /// What the image's bytes depend on past the probe's hash: the cache form, the chunk grid, the head and its rings.
 pub fn facts(t: *const Target) [4]u64 {
     var h = std.hash.Wyhash.init(0x6932);
-    if (t.draftHead()) |d| for (d.layers[0..d.m.layers]) |l| h.update(std.mem.asBytes(&@as(u64, l.ring)));
+    if (t.draftHead()) |d| d.identity(&h);
     const q8 = for (0..t.c.sched.n) |i| {
         if (t.c.sched.visits[i].global) break t.c.cache.layerAt(@intCast(i)).q8;
     } else false;

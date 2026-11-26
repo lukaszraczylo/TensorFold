@@ -57,6 +57,14 @@ pub const Head = union(enum) {
         };
     }
 
+    /// What a kept state's draft image depends on: the head kind and the rings' shape.
+    pub fn identity(h: *const Head, hasher: *std.hash.Wyhash) void {
+        switch (h.*) {
+            .dspark => |*x| for (x.layers[0..x.m.layers]) |l| hasher.update(std.mem.asBytes(&@as(u64, l.ring))),
+            .dflash2 => hasher.update(std.mem.asBytes(&[_]u64{ 0xdf1a52, dflash2.window, dflash2.layers_n })),
+        }
+    }
+
     pub fn snapBytes(h: *const Head, at: u32) u64 {
         return switch (h.*) {
             inline else => |*x| x.snapBytes(at),

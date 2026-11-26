@@ -23,6 +23,8 @@ pub const prompt_rows: u32 = be.prompt_rows;
 /// A request's last verify window: one row.
 pub const window_rows: u32 = be.window_rows;
 pub const explains_open = true;
+/// --drafter names a DFlash2 draft folder (dflash2.zig); without it the checkpoint's DSpark head drafts.
+pub const takes_drafter = true;
 /// Kept states land on the engine's chunk grid, which a fresh pass cuts at too, so a resumed pass is the fresh one's rows.
 pub const snap_grid: u32 = prompt_rows;
 pub const snap_lookahead: u32 = 0;
