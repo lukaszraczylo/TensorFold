@@ -322,3 +322,54 @@ extern "C" __global__ void __launch_bounds__(256) tf_ink2d_select(const int* __r
         __syncthreads();
     }
 }
+
+// The target head's NVFP4 copy for draft candidates: out[r][n] = sum_k a[r][k] . w[n][k], fp32, rows <= BLOCK, one warp a
+// weight row. Codes are e2m1 pairs [N][D/2] (low nibble the even element), scales e4m3 [N][D/16], one global scale gs.
+// The e2m1 and e4m3 grids and the block-16 layout are NVFP4's; the row-major packing is ours.
+extern "C" __global__ void __launch_bounds__(256) tf_ink2d_head4(const __nv_bfloat16* __restrict__ a, int rows,
+                                                                 const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
+                                                                 float gs, int N, float* __restrict__ out) {
+    __shared__ __align__(16) __nv_bfloat16 sa[BLOCK * D];
+    for (int i = threadIdx.x; i < rows * D; i += blockDim.x) sa[i] = a[i];
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n = blockIdx.x * 8 + warp;
+    if (n >= N) return;
+    const uint8_t* wc = codes + (long long)n * (D / 2);
+    const uint8_t* ws = scales + (long long)n * (D / 16);
+    const float grid[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    float acc[BLOCK];
+#pragma unroll
+    for (int r = 0; r < BLOCK; ++r) acc[r] = 0.f;
+#pragma unroll
+    for (int i = 0; i < D / 256; ++i) {
+        const int e0 = (i * 32 + lane) * 8;
+        const uint32_t word = *reinterpret_cast<const uint32_t*>(wc + e0 / 2);
+        const uint32_t sc = ws[e0 / 16];
+        const int ex = (sc >> 3) & 15, mant = sc & 7;
+        const float sv = (ex == 0 ? mant * (1.f / 8.f) * (1.f / 64.f) : (1.f + mant * (1.f / 8.f)) * exp2f((float)(ex - 7))) * gs;
+        float w[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const uint32_t nib = (word >> (4 * j)) & 15u;
+            const float v = grid[nib & 7];
+            w[j] = (nib & 8u ? -v : v) * sv;
+        }
+#pragma unroll
+        for (int r = 0; r < BLOCK; ++r) {
+            if (r >= rows) break;
+            const uint4 raw = *reinterpret_cast<const uint4*>(sa + r * D + e0);
+            const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
+            float s = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) s += w[j] * bf(h[j]);
+            acc[r] += s;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < BLOCK; ++r) {
+        float v = acc[r];
+        for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (lane == 0 && r < rows) out[(long long)r * N + n] = v;
+    }
+}

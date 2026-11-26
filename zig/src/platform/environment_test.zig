@@ -107,6 +107,7 @@ const valid = [_]Case{
     .{ .name = "TF_INK2_DRAFT8", .raw = "1", .n = 1 },
     .{ .name = "TF_INK2_DRAFT_LAYERS8", .raw = "0", .n = 0 },
     .{ .name = "TF_INK2_DFLASH2_CHANCES", .raw = "0", .n = 0 },
+    .{ .name = "TF_INK2_DFLASH2_HEAD4", .raw = "1", .n = 1 },
     .{ .name = "TF_INK2_KV8", .raw = "1", .n = 1 },
     .{ .name = "TF_INK2_PF_FP4", .raw = "1", .n = 1 },
     .{ .name = "TF_INK2_PF_ROWS", .raw = "1024", .n = 1024 },

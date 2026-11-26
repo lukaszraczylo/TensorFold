@@ -50,6 +50,7 @@ pub const Loaded = struct {
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     target: *be.Inkling,
+    draft_kind: ?[]const u8 = null,
 };
 
 const Owned = struct {
@@ -130,6 +131,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .ctx = own,
         .deinit = release,
         .target = &own.ib,
+        .draft_kind = if (flash_dir != null) "DFlash2" else null,
     };
 }
 
@@ -154,8 +156,12 @@ fn flashBytes(io: std.Io, dir: []const u8, streams: u32, rows: u32) !u64 {
     const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, dflash2.file_name });
     const file = try std.Io.Dir.cwd().statFile(io, path, .{});
     const taps = @as(u64, streams) * rows * dflash2.taps.len * dflash2.hidden * 2;
-    return file.size + @as(u64, streams) * dflash2.ring_bytes + taps + draft_scratch_bytes;
+    const head4: u64 = if (try platform.environment.read(bool, dflash2.head4_env, false)) head4_bytes else 0;
+    return file.size + @as(u64, streams) * dflash2.ring_bytes + taps + draft_scratch_bytes + head4;
 }
+
+/// The NVFP4 copy of the target's head (vocabulary x hidden x 9/16), rounded up.
+const head4_bytes: u64 = 280 << 20;
 
 /// The head's scratch buffers (drafter.zig) and a window's logits, with room to spare.
 const draft_scratch_bytes: u64 = 256 << 20;
