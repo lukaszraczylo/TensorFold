@@ -161,6 +161,7 @@ pub const Dflash2 = struct {
     from: cuda.DeviceBuffer,
     q8: bool,
     head4: ?Head4 = null,
+    head4_wanted: bool = false, // built on the first proposal, once the target's weights have settled
     vcap: bool = false, // chances on: `propose` reports each draft's own probability
     vcap_floor: ?f64 = null,
     bytes: u64 = 0,
@@ -243,9 +244,9 @@ pub const Dflash2 = struct {
         x.lane = try gpa.alloc(Lane, streams);
         @memset(x.lane, .{});
         try x.loadWeights(&ck);
-        if (try platform.environment.read(bool, head4_env, false)) x.head4 = try x.quantHead();
+        x.head4 = null;
+        x.head4_wanted = try platform.environment.read(bool, head4_env, false);
         try x.scratch();
-        if (x.head4 != null) try x.checkHead4();
         return x;
     }
 
@@ -281,6 +282,17 @@ pub const Dflash2 = struct {
         x.succ = try x.put(&.{succ[0 .. x.vocab * rank * bf16_bytes]});
     }
 
+    fn buildHead4(x: *Dflash2) !void {
+        var h = try x.quantHead();
+        x.head4 = h;
+        x.checkHead4() catch |e| {
+            x.head4 = null;
+            h.codes.free();
+            h.scales.free();
+            return e;
+        };
+    }
+
     /// The target's unembedding as `Head4`, quantised on the device as ModelOpt does (tf_ink2d_h4_quant). The target holds it
     /// bf16 or 8-bit; either is read as bf16 a tile of rows at a time. After tonyd2wild's patch 0018 (Apache-2.0).
     fn quantHead(x: *Dflash2) !Head4 {
@@ -299,6 +311,7 @@ pub const Dflash2 = struct {
         errdefer scales.free();
         var gs: f32 = 0;
         for ([_]bool{ false, true }) |quant| {
+            std.log.info("NVFP4 head pass {s}", .{if (quant) "quantise" else "amax"});
             var row0: usize = 0;
             while (row0 < n) : (row0 += engine.dq_tile_rows) {
                 const tile = @min(engine.dq_tile_rows, n - row0);
@@ -322,6 +335,7 @@ pub const Dflash2 = struct {
                     try go(x.k.h4_quant, s, .{ .x = @intCast((tile * (hidden / group) + 255) / 256) }, 256, &a);
                 }
                 try s.synchronize();
+                if (row0 == 0) std.log.info("NVFP4 head first tile done", .{});
             }
             if (!quant) {
                 var bits: u32 = 0;
@@ -517,6 +531,10 @@ pub const Dflash2 = struct {
 
     /// The `proposals` tokens after `anchor` (position `pos`, the pending token) into `out`, and each one's own probability.
     pub fn propose(x: *Dflash2, s: cuda.Stream, stream: u32, anchor: u32, pos: u64, out: *[proposals]u32, chain: *[proposals]f32) !void {
+        if (x.head4_wanted) {
+            x.head4_wanted = false;
+            x.buildHead4() catch |e| std.log.warn("Inkling 2 Mini DFlash2 NVFP4 head unavailable, drafting from the target head: {s}", .{@errorName(e)});
+        }
         const l = &x.lane[stream];
         if (l.end != pos) return error.DraftContextGap;
         var ids: [block]u32 = undefined;
