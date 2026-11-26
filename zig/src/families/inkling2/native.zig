@@ -12,6 +12,7 @@ const visits = @import("visits.zig");
 const weights = @import("weights.zig");
 const be = @import("backend.zig");
 const drafter = @import("drafter.zig");
+const dflash2 = @import("dflash2.zig");
 const prefill = @import("prefill.zig");
 
 pub const model_type = "inkling2_loop";
@@ -36,7 +37,7 @@ const ablit_env = "TF_INK2_ABLIT";
 /// The server's reading of the room left after the weights; null if unreadable.
 pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
 /// No `precision` field: the server refuses --precision for this family by name.
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 8, lanes_fixed: bool = false, room: ?Room = null };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, lanes: u32 = 8, lanes_fixed: bool = false, room: ?Room = null, drafter: ?[]const u8 = null };
 
 pub const Loaded = struct {
     backend: lanes.backend.Backend,
@@ -85,7 +86,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (kernels != null) return error.CapturedKernels;
     const rows = try prefill.chunkRows();
     const embed_host = try platform.environment.read(bool, embed_host_env, false);
-    const mtp = try platform.environment.read(bool, drafter.enable_env, false);
+    const flash_dir: ?[]const u8 = if (o.drafter) |d| (if (dflash2.isDflash2(gpa, io, d)) d else null) else null;
+    const mtp = flash_dir != null or try platform.environment.read(bool, drafter.enable_env, false);
     const kv8 = try platform.environment.read(bool, cache.kv8_env, false);
     const room: u64 = if (o.room) |r| r.read(r.ctx) orelse 0 else std.math.maxInt(u64);
     const own = try gpa.create(Owned);
@@ -97,7 +99,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     var n: u32 = @max(o.lanes, 1);
     while (true) {
         const wo: budget.Options = .{ .context = context, .streams = n, .chunk_rows = rows, .embed_host = embed_host, .kv8 = kv8 };
-        const draft_bytes: u64 = if (mtp) try draftBytes(gpa, io, dir, n, rows) else 0;
+        const draft_bytes: u64 = if (flash_dir) |fd| try flashBytes(io, fd, n, rows) else if (mtp) try draftBytes(gpa, io, dir, n, rows) else 0;
         own.w = weights.load(gpa, io, weights.deviceUploader(ctx.d), dir, wo, room -| draft_bytes) catch |e| {
             if (e != error.OverBudget or o.lanes_fixed or n == 1) return e;
             n -= 1;
@@ -115,7 +117,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.cache.deinit();
     own.c.init(gpa, io, ctx.d, &own.w, own.sched, &own.cache, co) catch |e| return if (e == error.FileNotFound) error.AblitFileMissing else e; // the only file `Ctx.init` reads
     errdefer own.c.deinit();
-    own.ib = try be.Inkling.init(gpa, &own.c, own.stream, n, context, if (mtp) .{ .io = io, .dir = dir } else null);
+    own.ib = try be.Inkling.init(gpa, &own.c, own.stream, n, context, if (flash_dir) |fd| .{ .io = io, .dir = fd, .dflash2 = true } else if (mtp) .{ .io = io, .dir = dir } else null);
     errdefer own.ib.deinit();
     return .{
         .backend = own.ib.backend(),
@@ -142,6 +144,15 @@ fn draftBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, streams: u32,
     const fold = @as(u64, cfg.text.unpadded_vocab) * m.rank * 2;
     const taps = @as(u64, streams) * rows * m.taps_n * cfg.text.hidden * 2;
     return file.size + fold + taps + draft_scratch_bytes;
+}
+
+/// What a DFlash2 draft model holds: its safetensors file, each stream's ring and tapped rows, and its scratch.
+fn flashBytes(io: std.Io, dir: []const u8, streams: u32, rows: u32) !u64 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, dflash2.file_name });
+    const file = try std.Io.Dir.cwd().statFile(io, path, .{});
+    const taps = @as(u64, streams) * rows * dflash2.taps.len * dflash2.hidden * 2;
+    return file.size + @as(u64, streams) * dflash2.ring_bytes + taps + draft_scratch_bytes;
 }
 
 /// The head's scratch buffers (drafter.zig) and a window's logits, with room to spare.

@@ -3,7 +3,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const cache = @import("cache.zig");
-const drafter = @import("drafter.zig");
+const draft_head = @import("draft_head.zig");
 const kernels = @import("kernels.zig");
 const visits = @import("visits.zig");
 
@@ -109,13 +109,13 @@ const Copy = struct {
     }
 };
 
-fn copyAll(d: *const cuda.Driver, s: cuda.Stream, c: *const cache.Cache, sched: *const visits.Schedule, draft: ?*const drafter.Drafter, slot: u32, k: *const Saved, out: bool) !void {
+fn copyAll(d: *const cuda.Driver, s: cuda.Stream, c: *const cache.Cache, sched: *const visits.Schedule, draft: ?*const draft_head.Head, slot: u32, k: *const Saved, out: bool) !void {
     try each(c, sched, slot, k.at, Copy{ .d = d, .s = s, .buf = k.buf.ptr, .out = out }, Copy.run);
     if (draft) |x| try x.each(slot, k.at, Copy{ .d = d, .s = s, .buf = (k.draft orelse return error.NoDraftState).ptr, .out = out }, Copy.run);
 }
 
 /// Copies `slot`'s state at `at` into buffers of its own, queued on `s` behind the chunk that ends there.
-pub fn save(gpa: Allocator, d: *const cuda.Driver, s: cuda.Stream, c: *const cache.Cache, sched: *const visits.Schedule, draft: ?*const drafter.Drafter, slot: u32, at: u32) !*Saved {
+pub fn save(gpa: Allocator, d: *const cuda.Driver, s: cuda.Stream, c: *const cache.Cache, sched: *const visits.Schedule, draft: ?*const draft_head.Head, slot: u32, at: u32) !*Saved {
     if (at == 0) return error.NotAtMark;
     const k = try gpa.create(Saved);
     errdefer gpa.destroy(k);
@@ -129,7 +129,7 @@ pub fn save(gpa: Allocator, d: *const cuda.Driver, s: cuda.Stream, c: *const cac
 }
 
 /// Makes `slot` hold `k`'s state, queued on `s` before the next chunk.
-pub fn restore(d: *const cuda.Driver, s: cuda.Stream, c: *const cache.Cache, sched: *const visits.Schedule, draft: ?*const drafter.Drafter, slot: u32, k: *const Saved) !void {
+pub fn restore(d: *const cuda.Driver, s: cuda.Stream, c: *const cache.Cache, sched: *const visits.Schedule, draft: ?*const draft_head.Head, slot: u32, k: *const Saved) !void {
     try copyAll(d, s, c, sched, draft, slot, k, false);
 }
 

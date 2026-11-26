@@ -9,6 +9,8 @@ const prof = @import("prof.zig");
 const ops = @import("ops.zig");
 const pre = @import("prefill.zig");
 const drafter_mod = @import("drafter.zig");
+const dflash2 = @import("dflash2.zig");
+const draft_head = @import("draft_head.zig");
 const snap = @import("snap.zig");
 const platform = @import("sys");
 
@@ -41,7 +43,7 @@ const Lane = struct {
 
 /// The draft head and what a window needs around it (TF_INK2_MTP).
 const Mtp = struct {
-    head: drafter_mod.Drafter,
+    head: draft_head.Head,
     taps: cuda.DeviceBuffer, // bf16 [slots][rows][taps][hidden]: the rows the last forward of a slot tapped
     rows: u32, // the engine's chunk rows
     row_bytes: u64,
@@ -55,7 +57,7 @@ const Mtp = struct {
 };
 
 /// Where the draft head's weights are read from.
-pub const DraftSource = struct { io: std.Io, dir: []const u8 };
+pub const DraftSource = struct { io: std.Io, dir: []const u8, dflash2: bool = false };
 
 /// Forward ms by window width on the GB10 (rowcost, DENSE8 and HEAD8, ctx 2048): what the round loop prices a window at.
 const window_costs = [_]lanes.config.Cost{
@@ -150,7 +152,10 @@ pub const Inkling = struct {
         const m = c.w.cfg.mtp orelse return error.NoDraftHead;
         c.rec = try engine.Rec.init(d, gpa, c.cache, &c.sched, &c.text);
         errdefer if (c.rec) |*r| r.deinit();
-        var head_run = try drafter_mod.Drafter.init(gpa, src.io, c, src.dir, streams, context);
+        var head_run: draft_head.Head = if (src.dflash2)
+            .{ .dflash2 = try dflash2.Dflash2.init(gpa, src.io, c, src.dir, streams) }
+        else
+            .{ .dspark = try drafter_mod.Drafter.init(gpa, src.io, c, src.dir, streams, context) };
         errdefer head_run.deinit();
         const row_bytes = @as(u64, m.taps_n) * c.text.hidden * 2;
         const chunk_rows = c.scratch.geometry.max_rows;
@@ -203,8 +208,8 @@ pub const Inkling = struct {
             .copy_drafts = false,
             .fixed_draft_block = true,
             .drafts = most_drafts,
-            .draft_probabilities = x.mtp.?.head.vcap and x.mtp.?.head.vcap_floor == null,
-            .draft_confidence = x.mtp.?.head.vcap_floor,
+            .draft_probabilities = x.mtp.?.head.vcap() and x.mtp.?.head.vcapFloor() == null,
+            .draft_confidence = x.mtp.?.head.vcapFloor(),
             .window_costs = &window_costs,
             .mtp_step_ms = draft_ms,
             .max_streams = @intCast(x.free.len),
@@ -280,7 +285,7 @@ pub const Inkling = struct {
         return l;
     }
 
-    pub fn draftHead(x: *const Inkling) ?*const drafter_mod.Drafter {
+    pub fn draftHead(x: *const Inkling) ?*const draft_head.Head {
         return if (x.mtp) |*m| &m.head else null;
     }
 
@@ -324,6 +329,7 @@ pub const Inkling = struct {
             s.reuse_failed = true;
             return 0;
         };
+        if (x.mtp) |*m| m.head.restored(l.slot, k.at);
         l.written = k.at;
         s.cached = k.at;
         return k.at;
@@ -573,7 +579,7 @@ pub const Inkling = struct {
     fn probabilities(ptr: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
         const x = self(ptr);
         const m = if (x.mtp) |*m| m else return false;
-        if (!m.head.vcap) return false;
+        if (!m.head.vcap()) return false;
         const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
         if (out.len > l.n_drafts) return false;
         var chance: f64 = 1;

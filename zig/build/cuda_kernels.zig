@@ -164,6 +164,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "inkling2_rows", .src = "inkling2/rows", .flags = glue }, // ours: Inkling 2's router row dots on prompt rows
     .{ .name = "inkling2_experts", .src = "inkling2/experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // ours: Inkling 2's grouped experts
     .{ .name = "inkling2_dspark", .src = "inkling2/dspark", .flags = glue }, // ours: Inkling 2's DSpark drafter glue
+    .{ .name = "inkling2_dflash", .src = "inkling2/dflash", .flags = glue }, // ours: Inkling 2 Mini's DFlash2 drafter (after MiaAI-Lab patch 0018)
     .{ .name = "inkling2_loop", .src = "inkling2/loop", .flags = &.{ "-O3", "--fmad=false" } }, // ours: Inkling 2 Mini's looped-engine kernels
     .{ .name = "inkling2_pf4", .src = "inkling2/prefill4", .flags = &.{"-O3"}, .arch_specific = true }, // ours: Inkling 2 Mini's NVFP4 prompt experts on the FP4 mma (sm_121a)
     .{ .name = "inkling2_vision", .src = "inkling2/vision", .flags = glue }, // ours: Inkling 2's vision tower glue and attention
