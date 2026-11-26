@@ -38,7 +38,7 @@ const Lane = struct {
     written: u64 = 0, // positions [0, written) are in the draft head's context
     drafts: [most_drafts]u32 = undefined, // the head's held drafts
     n_drafts: u32 = 0,
-    chain: [most_drafts]f32 = undefined, // the head's probability for each held draft (TF_INK2_VCAP)
+    chain: [most_drafts]f32 = undefined, // the head's probability for each held draft (TF_INK2_VCAP; DFlash2: its own)
 };
 
 /// The draft head and what a window needs around it (TF_INK2_MTP).
@@ -50,6 +50,7 @@ const Mtp = struct {
     logits: cuda.DeviceBuffer, // fp32 [mtp_rows][vocab]: a window's rows
     val: cuda.DeviceBuffer, // fp32 [mtp_rows]
     id: cuda.DeviceBuffer, // i32 [mtp_rows]
+    landing: lanes.draft_tree.Landing = .{}, // DFlash2: what landed, by the selector's own log-probability
 
     fn slotTaps(m: *const Mtp, slot: u32) u64 {
         return m.taps.ptr + @as(u64, slot) * m.rows * m.row_bytes;
@@ -541,6 +542,13 @@ pub const Inkling = struct {
             const n: u32 = @intCast(path.len);
             if (n > l.win_rows) return error.WindowTooWide;
             l.len = l.win_start + n;
+            if (x.mtp.?.head == .dflash2 and w.held > 0) {
+                const m = &x.mtp.?;
+                const sampled = w.stream.sampling != null;
+                const kept: usize = n -| 1;
+                for (l.chain[0..@min(kept, w.held)]) |p| m.landing.observe(sampled, ownLog(p), true);
+                if (kept < w.held) m.landing.observe(sampled, ownLog(l.chain[kept]), false);
+            }
             prof.at(prof.tag_keep);
             prof.window(0, n);
             if (n < l.win_rows) {
@@ -584,7 +592,7 @@ pub const Inkling = struct {
         if (out.len > l.n_drafts) return false;
         var chance: f64 = 1;
         for (out, l.chain[0..out.len]) |*o, p| {
-            chance *= p;
+            chance *= if (m.head == .dflash2) m.landing.chance(s.sampling != null, ownLog(p)) else p;
             o.* = chance;
         }
         return true;
@@ -598,6 +606,12 @@ pub const Inkling = struct {
         self(ptr).dropLane(s);
     }
 };
+
+/// A draft's log-probability under the selector, from the probability its head reported.
+fn ownLog(p: f32) f64 {
+    if (!(p > 0) or !std.math.isFinite(p)) return -20;
+    return @log(@min(@as(f64, p), 1));
+}
 
 const ts = std.testing;
 

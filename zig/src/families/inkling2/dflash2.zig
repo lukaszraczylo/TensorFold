@@ -10,6 +10,8 @@ const decode = @import("decode.zig");
 const engine = @import("engine.zig");
 const head = @import("head.zig");
 const platform = @import("sys");
+const ops = @import("ops.zig");
+const weights = @import("weights.zig");
 
 const Checkpoint = core.checkpoint.Checkpoint;
 
@@ -44,6 +46,10 @@ const f32_bytes = 4;
 pub const ring_bytes: usize = layers_n * 2 * window * kv_width * bf16_bytes;
 const walk_bytes = 2 * block * 4;
 pub const file_name = "model.safetensors";
+/// 0 keeps the block pass's linears in bf16; on (the default) they are 8-bit with block scales (drafts only, verify unchanged).
+pub const layers8_env = "TF_INK2_DRAFT_LAYERS8";
+/// 0 turns the calibrated lone-stream chances off (the depth rule prices the drafts); on by default.
+pub const chances_env = "TF_INK2_DFLASH2_CHANCES";
 
 const Layer = struct {
     qkv: cuda.DeviceBuffer, // bf16 [q | k | v][hidden]
@@ -141,7 +147,8 @@ pub const Dflash2 = struct {
     ring_ptr: cuda.DeviceBuffer, // u64, i64, i64: this call's ring, start and first position
     start: cuda.DeviceBuffer,
     from: cuda.DeviceBuffer,
-    vcap: bool = false,
+    q8: bool,
+    vcap: bool = false, // chances on: `propose` reports each draft's own probability
     vcap_floor: ?f64 = null,
     bytes: u64 = 0,
 
@@ -164,6 +171,26 @@ pub const Dflash2 = struct {
         }
         x.bytes += n;
         return b;
+    }
+
+    /// A block-pass weight: bf16 rows joined, or 8-bit with block scales (`k` inputs a row).
+    fn putW(x: *Dflash2, parts: []const []const u8, k: usize) !cuda.DeviceBuffer {
+        if (!x.q8) return x.put(parts);
+        var n: usize = 0;
+        for (parts) |p| n += p.len;
+        const host = try x.gpa.alloc(u8, n);
+        defer x.gpa.free(host);
+        var at: usize = 0;
+        for (parts) |p| {
+            @memcpy(host[at..][0..p.len], p);
+            at += p.len;
+        }
+        const rows = n / (k * bf16_bytes);
+        if (k % weights.q8_block != 0) return error.UnsupportedDFlash2Config;
+        const out = try x.gpa.alloc(u8, weights.q8Bytes(rows, k));
+        defer x.gpa.free(out);
+        weights.quantQ8(host, rows, k, out);
+        return x.put(&.{out});
     }
 
     fn zeroed(x: *Dflash2, n: usize) !cuda.DeviceBuffer {
@@ -197,7 +224,8 @@ pub const Dflash2 = struct {
         x.vocab = t.unpadded_vocab;
         x.bytes = 0;
         x.k = try Kernels.load(c.d);
-        x.vcap = false;
+        x.q8 = try platform.environment.read(bool, layers8_env, true);
+        x.vcap = try platform.environment.read(bool, chances_env, true);
         x.vcap_floor = null;
         x.lane = try gpa.alloc(Lane, streams);
         @memset(x.lane, .{});
@@ -213,13 +241,13 @@ pub const Dflash2 = struct {
             const v = try layerTensor(ck, i, "self_attn.v_proj.weight", &.{ kv_width, hidden });
             const gate = try layerTensor(ck, i, "mlp.gate_proj.weight", &.{ inter, hidden });
             const up = try layerTensor(ck, i, "mlp.up_proj.weight", &.{ inter, hidden });
-            l.qkv = try x.put(&.{ q, k, v });
+            l.qkv = try x.putW(&.{ q, k, v }, hidden);
             l.kv = try x.put(&.{ k, v });
-            l.o = try x.put(&.{try layerTensor(ck, i, "self_attn.o_proj.weight", &.{ hidden, q_width })});
-            l.gu = try x.put(&.{ gate, up });
-            l.down = try x.put(&.{try layerTensor(ck, i, "mlp.down_proj.weight", &.{ hidden, inter })});
-            l.a_proj = try x.put(&.{try layerTensor(ck, i, "attention_conv.kernel_projection.weight", &.{ dyn_width, hidden })});
-            l.m_proj = try x.put(&.{try layerTensor(ck, i, "mlp_conv.kernel_projection.weight", &.{ dyn_width, hidden })});
+            l.o = try x.putW(&.{try layerTensor(ck, i, "self_attn.o_proj.weight", &.{ hidden, q_width })}, q_width);
+            l.gu = try x.putW(&.{ gate, up }, hidden);
+            l.down = try x.putW(&.{try layerTensor(ck, i, "mlp.down_proj.weight", &.{ hidden, inter })}, inter);
+            l.a_proj = try x.putW(&.{try layerTensor(ck, i, "attention_conv.kernel_projection.weight", &.{ dyn_width, hidden })}, hidden);
+            l.m_proj = try x.putW(&.{try layerTensor(ck, i, "mlp_conv.kernel_projection.weight", &.{ dyn_width, hidden })}, hidden);
             l.in_norm = try x.put(&.{try layerTensor(ck, i, "input_layernorm.weight", &.{hidden})});
             l.post_norm = try x.put(&.{try layerTensor(ck, i, "post_attention_layernorm.weight", &.{hidden})});
             l.q_norm = try x.put(&.{try layerTensor(ck, i, "self_attn.q_norm.weight", &.{head_dim})});
@@ -297,7 +325,14 @@ pub const Dflash2 = struct {
     /// out bf16 [m, n] = round(a bf16 [m, k] . w bf16 [n, k]^T).
     fn gemm(x: *Dflash2, s: cuda.Stream, a: u64, lda: usize, w: u64, out: u64, m: usize, n: usize, k: usize) !void {
         try x.c.dense.rows(s, a, lda, w, x.tmp.ptr, n, m, n, k);
-        try @import("ops.zig").tobf(&x.c.ops, s, x.tmp.ptr, m, n, n, out, n, 0, n);
+        try ops.tobf(&x.c.ops, s, x.tmp.ptr, m, n, n, out, n, 0, n);
+    }
+
+    /// out bf16 [block, n] for the block pass: `w` as `putW` stored it.
+    fn lin(x: *Dflash2, s: cuda.Stream, a: u64, w: u64, out: u64, n: usize, k: usize) !void {
+        if (!x.q8) return x.gemm(s, a, k, w, out, block, n, k);
+        const seg: ops.DenseSeg = .{ .x = a, .w = w, .out = out, .n = @intCast(n), .block0 = 0 };
+        try ops.dense1Q8Rows(&x.c.ops, s, &.{seg}, k, false, 0, block);
     }
 
     fn normRows(x: *Dflash2, s: cuda.Stream, in: u64, w: u64, out: u64, rows: usize) !void {
@@ -369,9 +404,9 @@ pub const Dflash2 = struct {
         try decode.embedTokens(x.c, s, &ids, x.x.ptr);
         for (x.layers, 0..) |ly, li| {
             try x.normRows(s, x.x.ptr, ly.in_norm.ptr, x.y.ptr, block);
-            try x.gemm(s, x.y.ptr, hidden, ly.a_proj.ptr, x.dyn.ptr, block, dyn_width, hidden);
+            try x.lin(s, x.y.ptr, ly.a_proj.ptr, x.dyn.ptr, dyn_width, hidden);
             try x.conv(s, x.y.ptr, 0, ly.a_base.ptr, x.y2.ptr, false);
-            try x.gemm(s, x.y2.ptr, hidden, ly.qkv.ptr, x.qkv.ptr, block, qkv_width, hidden);
+            try x.lin(s, x.y2.ptr, ly.qkv.ptr, x.qkv.ptr, qkv_width, hidden);
             {
                 var a: cuda.Args = .{};
                 a.add(x.qkv.ptr);
@@ -393,12 +428,12 @@ pub const Dflash2 = struct {
                 for ([_]u64{ x.pm.ptr, x.pl.ptr, x.pacc.ptr, x.att.ptr }) |v| b.add(v);
                 try go(x.k.attn_merge, s, .{ .x = block, .y = q_heads }, head_dim, &b);
             }
-            try x.gemm(s, x.att.ptr, q_width, ly.o.ptr, x.a.ptr, block, hidden, q_width);
+            try x.lin(s, x.att.ptr, ly.o.ptr, x.a.ptr, hidden, q_width);
             try x.conv(s, x.a.ptr, 1, ly.a_base.ptr + 2 * hidden * bf16_bytes, x.x.ptr, true);
             try x.normRows(s, x.x.ptr, ly.post_norm.ptr, x.y.ptr, block);
-            try x.gemm(s, x.y.ptr, hidden, ly.m_proj.ptr, x.dyn.ptr, block, dyn_width, hidden);
+            try x.lin(s, x.y.ptr, ly.m_proj.ptr, x.dyn.ptr, dyn_width, hidden);
             try x.conv(s, x.y.ptr, 0, ly.m_base.ptr, x.y2.ptr, false);
-            try x.gemm(s, x.y2.ptr, hidden, ly.gu.ptr, x.gu.ptr, block, 2 * inter, hidden);
+            try x.lin(s, x.y2.ptr, ly.gu.ptr, x.gu.ptr, 2 * inter, hidden);
             {
                 var a: cuda.Args = .{};
                 a.add(x.gu.ptr);
@@ -406,7 +441,7 @@ pub const Dflash2 = struct {
                 a.add(@as(i32, inter));
                 try go(x.k.swiglu, s, .{ .x = block, .y = (inter + 1023) / 1024 }, 256, &a);
             }
-            try x.gemm(s, x.act.ptr, inter, ly.down.ptr, x.a.ptr, block, hidden, inter);
+            try x.lin(s, x.act.ptr, ly.down.ptr, x.a.ptr, hidden, inter);
             try x.conv(s, x.a.ptr, 1, ly.m_base.ptr + 2 * hidden * bf16_bytes, x.x.ptr, true);
         }
         try x.normRows(s, x.x.ptr, x.norm.ptr, x.y.ptr, block);
