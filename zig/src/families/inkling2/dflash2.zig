@@ -381,6 +381,11 @@ pub const Dflash2 = struct {
         const scales = try x.gpa.alloc(u8, n * hidden / group);
         defer x.gpa.free(scales);
         try head4Pack(rows, n, gs, codes, scales);
+        var nz_scales: usize = 0;
+        for (scales) |b| nz_scales += @intFromBool(b != 0);
+        var nz_codes: usize = 0;
+        for (codes) |b| nz_codes += @intFromBool(b != 0);
+        std.log.info("Inkling 2 Mini DFlash2 NVFP4 head: global scale {e}, {d} of {d} block scales and {d} of {d} code bytes nonzero, row 0 starts {d:.4} {d:.4} {d:.4}", .{ gs, nz_scales, scales.len, nz_codes, codes.len, bf32(rows[0]), bf32(rows[1]), bf32(rows[2]) });
         var out: Head4 = .{ .codes = try x.put(&.{codes}), .scales = undefined, .gs = gs };
         errdefer out.codes.free();
         out.scales = try x.put(&.{scales});
@@ -438,6 +443,7 @@ pub const Dflash2 = struct {
             same += @intFromBool(std.mem.indexOfMax(f32, g) == std.mem.indexOfMax(f32, w));
         }
         const rel = diff / @max(mag, 1e-30);
+        std.log.info("NVFP4 head row 0 got {d:.4} {d:.4} {d:.4} want {d:.4} {d:.4} {d:.4}", .{ got[0], got[1], got[2], want[0], want[1], want[2] });
         std.log.info("Inkling 2 Mini DFlash2 NVFP4 head: mean relative error {d:.4}, best token equal on {d} of {d} rows", .{ rel, same, @as(usize, proposals) });
         if (!(rel < head4_tolerance)) return error.DFlash2Head4Mismatch;
     }
