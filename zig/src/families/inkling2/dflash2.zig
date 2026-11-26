@@ -48,7 +48,7 @@ const walk_bytes = 2 * block * 4;
 pub const file_name = "model.safetensors";
 /// 0 keeps the block pass's linears in bf16; on (the default) they are 8-bit with block scales (drafts only, verify unchanged).
 pub const layers8_env = "TF_INK2_DRAFT_LAYERS8";
-/// 0 turns the calibrated lone-stream chances off (the depth rule prices the drafts); on by default.
+/// 1 prices drafts by the calibrated lone-stream chance of landing instead of the depth rule; off by default (slower on the dev pod).
 pub const chances_env = "TF_INK2_DFLASH2_CHANCES";
 
 const Layer = struct {
@@ -225,7 +225,7 @@ pub const Dflash2 = struct {
         x.bytes = 0;
         x.k = try Kernels.load(c.d);
         x.q8 = try platform.environment.read(bool, layers8_env, true);
-        x.vcap = try platform.environment.read(bool, chances_env, true);
+        x.vcap = try platform.environment.read(bool, chances_env, false);
         x.vcap_floor = null;
         x.lane = try gpa.alloc(Lane, streams);
         @memset(x.lane, .{});
