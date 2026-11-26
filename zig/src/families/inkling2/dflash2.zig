@@ -124,6 +124,7 @@ fn head4Scale(rows: []const u16) !f32 {
 }
 
 const pack_threads = 8;
+const head4_tolerance = 0.25;
 
 fn head4Rows(rows: []const u16, r0: usize, r1: usize, gs: f32, codes: []u8, scales: []u8) void {
     const e4 = e4m3Values();
@@ -316,6 +317,7 @@ pub const Dflash2 = struct {
         try x.loadWeights(&ck);
         if (try platform.environment.read(bool, head4_env, false)) x.head4 = try x.quantHead();
         try x.scratch();
+        if (x.head4 != null) try x.checkHead4();
         return x;
     }
 
@@ -383,6 +385,61 @@ pub const Dflash2 = struct {
         errdefer out.codes.free();
         out.scales = try x.put(&.{scales});
         return out;
+    }
+
+    fn head4Logits(x: *Dflash2, s: cuda.Stream, h: Head4, rows_ptr: u64, out: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(rows_ptr);
+        a.add(@as(i32, proposals));
+        a.add(h.codes.ptr);
+        a.add(h.scales.ptr);
+        a.add(h.gs);
+        a.add(@as(i32, @intCast(x.vocab)));
+        a.add(out);
+        try go(x.k.head4, s, .{ .x = @intCast((x.vocab + 7) / 8) }, 256, &a);
+    }
+
+    /// The NVFP4 head against the target's on fixed rows: the copy must keep the logits' shape (mean relative error under
+    /// `head4_tolerance`) and each row's best token, else the load fails rather than drafting from a wrong head.
+    fn checkHead4(x: *Dflash2) !void {
+        const h = x.head4.?;
+        var s = try cuda.Stream.init(x.c.d, true);
+        defer s.deinit();
+        var act: [proposals * hidden]u16 = undefined;
+        var seed: u32 = 12345;
+        for (&act) |*v| {
+            seed = seed *% 1664525 +% 1013904223;
+            const f: f32 = (@as(f32, @floatFromInt(seed >> 8)) / 8388608.0 - 1.0) * 4.0;
+            v.* = @truncate(@as(u32, @bitCast(f)) >> 16);
+        }
+        try x.y.uploadAsync(hidden * bf16_bytes, std.mem.sliceAsBytes(&act), s.handle);
+        const n = proposals * x.vocab;
+        var ref = try cuda.DeviceBuffer.alloc(x.c.d, n * f32_bytes);
+        defer ref.free();
+        try head.logitsRaw(x.c, s, x.y.ptr + hidden * bf16_bytes, proposals, ref.ptr);
+        try x.head4Logits(s, h, x.y.ptr + hidden * bf16_bytes, x.logits.ptr);
+        try s.synchronize();
+        const got = try x.gpa.alloc(f32, n);
+        defer x.gpa.free(got);
+        const want = try x.gpa.alloc(f32, n);
+        defer x.gpa.free(want);
+        try cuda.memory.download(x.c.d, x.logits.ptr, std.mem.sliceAsBytes(got));
+        try cuda.memory.download(x.c.d, ref.ptr, std.mem.sliceAsBytes(want));
+        var diff: f64 = 0;
+        var mag: f64 = 0;
+        var same: usize = 0;
+        for (0..proposals) |r| {
+            const g = got[r * x.vocab ..][0..x.vocab];
+            const w = want[r * x.vocab ..][0..x.vocab];
+            for (g, w) |a, b| {
+                diff += @abs(a - b);
+                mag += @abs(b);
+            }
+            same += @intFromBool(std.mem.indexOfMax(f32, g) == std.mem.indexOfMax(f32, w));
+        }
+        const rel = diff / @max(mag, 1e-30);
+        std.log.info("Inkling 2 Mini DFlash2 NVFP4 head: mean relative error {d:.4}, best token equal on {d} of {d} rows", .{ rel, same, @as(usize, proposals) });
+        if (!(rel < head4_tolerance)) return error.DFlash2Head4Mismatch;
     }
 
     fn scratch(x: *Dflash2) !void {
@@ -576,17 +633,7 @@ pub const Dflash2 = struct {
         const was = x.c.window;
         x.c.window = true;
         defer x.c.window = was;
-        if (x.head4) |h| {
-            var a: cuda.Args = .{};
-            a.add(x.y.ptr + hidden * bf16_bytes);
-            a.add(@as(i32, proposals));
-            a.add(h.codes.ptr);
-            a.add(h.scales.ptr);
-            a.add(h.gs);
-            a.add(@as(i32, @intCast(x.vocab)));
-            a.add(x.logits.ptr);
-            try go(x.k.head4, s, .{ .x = @intCast((x.vocab + 7) / 8) }, 256, &a);
-        } else try head.logitsRaw(x.c, s, x.y.ptr + hidden * bf16_bytes, proposals, x.logits.ptr);
+        if (x.head4) |h| try x.head4Logits(s, h, x.y.ptr + hidden * bf16_bytes, x.logits.ptr) else try head.logitsRaw(x.c, s, x.y.ptr + hidden * bf16_bytes, proposals, x.logits.ptr);
         const chunks = (x.vocab + chunk_cols - 1) / chunk_cols;
         {
             var a: cuda.Args = .{};
