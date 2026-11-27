@@ -75,6 +75,21 @@ const window_costs = [_]lanes.config.Cost{
 };
 /// One head block (context write, 3 layers, 7 Markov steps) in ms (draftacc).
 const draft_ms = 10.5;
+/// A DFlash2 block pass costs this flat ms a round at every depth, where DSpark pays `draft_ms` a draft.
+const dflash2_round_ms = 7.5;
+const dflash2_costs = blk: {
+    var t: [window_costs.len]lanes.config.Cost = undefined;
+    for (&t, window_costs) |*d, w| d.* = .{ .width = w.width, .ms = w.ms + dflash2_round_ms };
+    break :blk t;
+};
+
+/// How the round loop prices a window and a draft: from the wall clock (`timed`), or from the tables alone.
+const Pricing = struct { costs: []const lanes.config.Cost, step_ms: f64, timed: bool };
+
+fn pricing(untimed: bool) Pricing {
+    if (untimed) return .{ .costs = &dflash2_costs, .step_ms = 0, .timed = false };
+    return .{ .costs = &window_costs, .step_ms = draft_ms, .timed = true };
+}
 
 /// The slot's pick, as the device reported it: a row without a finite top value is an error.
 fn checkPick(id: u32, val: f32, vocab: u32) !u32 {
@@ -202,6 +217,7 @@ pub const Inkling = struct {
     /// head's block of drafts; a stream a slot.
     pub fn facts(x: *const Inkling) lanes.Model {
         if (x.mtp == null) return .{ .exact_width = window_rows, .gpu_tokens = false, .mtp = false, .speculate = false, .max_streams = @intCast(x.free.len) };
+        const price = pricing(!x.mtp.?.head.timed());
         return .{
             .exact_width = mtp_rows,
             .gpu_tokens = false,
@@ -213,8 +229,9 @@ pub const Inkling = struct {
             .drafts = most_drafts,
             .draft_probabilities = x.mtp.?.head.vcap() and x.mtp.?.head.vcapFloor() == null,
             .draft_confidence = x.mtp.?.head.vcapFloor(),
-            .window_costs = &window_costs,
-            .mtp_step_ms = draft_ms,
+            .window_costs = price.costs,
+            .mtp_step_ms = price.step_ms,
+            .timed = price.timed,
             .max_streams = @intCast(x.free.len),
         };
     }
@@ -692,6 +709,29 @@ test "the landing table learns from rounds where every held draft landed" {
         const got = landingTotals(&l);
         try ts.expectEqual(k.offered, got[0]);
         try ts.expectEqual(k.landed, got[1]);
+    }
+}
+
+test "an untimed DFlash2 prices a round at its flat block cost and a draft at nothing" {
+    const timed = pricing(false);
+    try ts.expect(timed.timed);
+    try ts.expectEqual(draft_ms, timed.step_ms);
+    try ts.expectEqual(@intFromPtr(&window_costs), @intFromPtr(timed.costs.ptr));
+
+    const flat = pricing(true);
+    try ts.expect(!flat.timed);
+    try ts.expectEqual(@as(f64, 0), flat.step_ms);
+    for (flat.costs, window_costs) |f, w| {
+        try ts.expectEqual(w.width, f.width);
+        try ts.expectApproxEqAbs(w.ms + dflash2_round_ms, f.ms, 1e-9);
+    }
+
+    for ([_]Pricing{ timed, flat }) |p| {
+        var cfg = try lanes.Config.init(ts.allocator, .{ .exact_width = mtp_rows, .mtp = true, .speculate = true, .window_costs = p.costs, .mtp_step_ms = p.step_ms, .timed = p.timed }, mtp_rows, mtp_rows - 1);
+        defer cfg.deinit(ts.allocator);
+        try ts.expectEqual(p.timed, cfg.timed);
+        try ts.expectEqual(p.step_ms, cfg.mtp_step_ms);
+        try ts.expectEqual(@as(?f64, p.costs[4].ms), cfg.family_costs.get(5));
     }
 }
 

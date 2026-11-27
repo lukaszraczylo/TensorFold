@@ -51,6 +51,8 @@ pub const file_name = "model.safetensors";
 pub const layers8_env = "TF_INK2_DRAFT_LAYERS8";
 /// 1 prices drafts by the calibrated lone-stream chance of landing instead of the depth rule; off by default (slower on the dev pod).
 pub const chances_env = "TF_INK2_DFLASH2_CHANCES";
+/// 0 prices a round from the cost tables alone (a block pass costs the same at every depth); 1, the default, times every round.
+pub const timed_env = "TF_INK2_DRAFT_TIMED";
 
 const Layer = struct {
     qkv: cuda.DeviceBuffer, // bf16 [q | k | v][hidden]
@@ -151,6 +153,7 @@ pub const Dflash2 = struct {
     q8: bool,
     vcap: bool = false, // chances on: `propose` reports each draft's own probability
     vcap_floor: ?f64 = null,
+    draft_timed: bool = true,
     bytes: u64 = 0,
 
     fn tensor(ck: *Checkpoint, name: []const u8, shape: []const usize) ![]const u8 {
@@ -228,6 +231,7 @@ pub const Dflash2 = struct {
         x.q8 = try platform.environment.read(bool, layers8_env, true);
         x.vcap = try platform.environment.read(bool, chances_env, false);
         x.vcap_floor = null;
+        x.draft_timed = try platform.environment.read(bool, timed_env, true);
         x.lane = try gpa.alloc(Lane, streams);
         @memset(x.lane, .{});
         try x.loadWeights(&ck);

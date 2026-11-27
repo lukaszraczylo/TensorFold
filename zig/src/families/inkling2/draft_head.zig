@@ -51,6 +51,14 @@ pub const Head = union(enum) {
         };
     }
 
+    /// Whether the round loop prices rounds by the wall clock: always for DSpark, TF_INK2_DRAFT_TIMED for DFlash2.
+    pub fn timed(h: *const Head) bool {
+        return switch (h.*) {
+            .dspark => true,
+            .dflash2 => |*x| x.draft_timed,
+        };
+    }
+
     pub fn vcapFloor(h: *const Head) ?f64 {
         return switch (h.*) {
             inline else => |*x| x.vcap_floor,
