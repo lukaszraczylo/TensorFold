@@ -35,10 +35,12 @@ const Lane = struct {
     rule: ?cuda.sample.Rule = null, // set when the stream samples
     win_start: u64 = 0, // the cache length the last verify window began at
     win_rows: u32 = 0, // its rows
+    win_held: u32 = 0, // the held drafts it verified; the next `draft` scores them against what landed
     written: u64 = 0, // positions [0, written) are in the draft head's context
     drafts: [most_drafts]u32 = undefined, // the head's held drafts
     n_drafts: u32 = 0,
     chain: [most_drafts]f32 = undefined, // the head's probability for each held draft (TF_INK2_VCAP; DFlash2: its own)
+    block: [most_drafts]u32 = undefined, // the head's last proposal, past the held drafts too
 };
 
 /// The draft head and what a window needs around it (TF_INK2_MTP).
@@ -512,6 +514,7 @@ pub const Inkling = struct {
         @memcpy(o.drafts, ids[1..rows]);
         l.win_start = l.len;
         l.win_rows = @intCast(rows);
+        l.win_held = @intCast(w.held);
         l.len += rows;
     }
 
@@ -542,13 +545,6 @@ pub const Inkling = struct {
             const n: u32 = @intCast(path.len);
             if (n > l.win_rows) return error.WindowTooWide;
             l.len = l.win_start + n;
-            if (x.mtp.?.head == .dflash2 and w.held > 0) {
-                const m = &x.mtp.?;
-                const sampled = w.stream.sampling != null;
-                const kept: usize = n -| 1;
-                for (l.chain[0..@min(kept, w.held)]) |p| m.landing.observe(sampled, ownLog(p), true);
-                if (kept < w.held) m.landing.observe(sampled, ownLog(l.chain[kept]), false);
-            }
             prof.at(prof.tag_keep);
             prof.window(0, n);
             if (n < l.win_rows) {
@@ -574,10 +570,19 @@ pub const Inkling = struct {
                 try x.absorb(l, @intCast(l.written - l.win_start), @intCast(at - l.written), l.written);
             }
             l.n_drafts = 0;
-            if (r.depth == 0) continue;
+            if (r.depth == 0) {
+                l.win_held = 0;
+                continue;
+            }
             const pending = if (r.first) |feed| try x.value(feed) else r.follow[r.follow.len - 1];
+            // `keep` runs only for a rejection, so the landing table learns here, from every round
+            if (m.head == .dflash2 and l.win_held > 0 and at > l.win_start) {
+                observeRound(&m.landing, r.stream.sampling != null, &l.chain, &l.block, l.win_held, @intCast(at - l.win_start - 1), pending);
+            }
+            l.win_held = 0;
             var block: [most_drafts]u32 = undefined;
             try m.head.propose(x.s, l.slot, pending, at, &block, &l.chain);
+            l.block = block;
             l.n_drafts = @min(r.depth, most_drafts);
             @memcpy(l.drafts[0..l.n_drafts], block[0..l.n_drafts]);
         }
@@ -606,6 +611,15 @@ pub const Inkling = struct {
         self(ptr).dropLane(s);
     }
 };
+
+/// One round's outcome for the landing table: the `kept` drafts landed, the first one past them did not when a draft was
+/// rejected, and when all `held` landed it did exactly when it is the target's next token `next`.
+fn observeRound(landing: *lanes.draft_tree.Landing, sampled: bool, chain: []const f32, block: []const u32, held: usize, kept: usize, next: u32) void {
+    for (chain[0..@min(kept, held)]) |p| landing.observe(sampled, ownLog(p), true);
+    if (kept < held) {
+        landing.observe(sampled, ownLog(chain[kept]), false);
+    } else if (held < most_drafts) landing.observe(sampled, ownLog(chain[held]), next == block[held]);
+}
 
 /// A draft's log-probability under the selector, from the probability its head reported.
 fn ownLog(p: f32) f64 {
@@ -650,6 +664,35 @@ test "keep takes a prefix of the window's rows" {
     try admitPath(&.{ 0, 1, 2 }, mtp_rows);
     try ts.expectError(error.WindowTooWide, admitPath(&.{ 0, 2 }, mtp_rows));
     try ts.expectError(error.WindowTooWide, admitPath(&.{ 0, 1, 2, 3, 4, 5, 6, 7, 8 }, mtp_rows));
+}
+
+/// Offered drafts and landed ones the table holds, over every bin.
+fn landingTotals(l: *const lanes.draft_tree.Landing) [2]f64 {
+    var t: [2]f64 = .{ 0, 0 };
+    for (l.counts[0]) |bins| {
+        t[0] += bins[0];
+        t[1] += bins[1];
+    }
+    return t;
+}
+
+test "the landing table learns from rounds where every held draft landed" {
+    const chain = [most_drafts]f32{ 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3 };
+    const block = [most_drafts]u32{ 10, 11, 12, 13, 14, 15, 16 };
+    const cases = [_]struct { held: usize, kept: usize, next: u32, offered: f64, landed: f64 }{
+        .{ .held = 3, .kept = 3, .next = 13, .offered = 4, .landed = 4 }, // all landed, the next token is the fourth draft
+        .{ .held = 3, .kept = 3, .next = 99, .offered = 4, .landed = 3 }, // all landed, the fourth draft would have missed
+        .{ .held = 3, .kept = 1, .next = 99, .offered = 2, .landed = 1 }, // the second draft was rejected
+        .{ .held = 3, .kept = 0, .next = 99, .offered = 1, .landed = 0 }, // the first draft was rejected
+        .{ .held = most_drafts, .kept = most_drafts, .next = 99, .offered = most_drafts, .landed = most_drafts }, // no draft past the block
+    };
+    for (cases) |k| {
+        var l: lanes.draft_tree.Landing = .{};
+        observeRound(&l, false, &chain, &block, k.held, k.kept, k.next);
+        const got = landingTotals(&l);
+        try ts.expectEqual(k.offered, got[0]);
+        try ts.expectEqual(k.landed, got[1]);
+    }
 }
 
 test "draft depth 0 only without the draft head" {
